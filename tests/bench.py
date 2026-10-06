@@ -1,6 +1,6 @@
 """Wall-clock benchmark: shgrep CLI against ug (and optionally tgrep --no-index) on one root.
 
-Usage: python tests/bench.py ROOT [--shgrep dist/shgrep.exe] [--ug ug] [--tgrep PATH] [--runs 5]
+Usage: python tests/bench.py ROOT [--shgrep dist/shgrep.exe] [--rg rg] [--ug ug] [--tgrep PATH] [--runs 5]
 
 Each workload runs once to warm the file cache, then --runs times; the median wall time is reported.
 CONTRACT: flags are chosen so every tool selects the same files: recursive, hidden files skipped, binary
@@ -57,8 +57,18 @@ def ug_cmd(exe, root, patterns, literal, files, pattern_file):
     return cmd + ["-f", pattern_file, root]
 
 
+def rg_cmd(exe, root, patterns, literal, files, pattern_file):
+    # --no-require-git: honor .gitignore outside git repos, as shgrep does.
+    cmd = [exe, "--no-messages", "--no-require-git"]
+    if literal:
+        cmd.append("-F")
+    if files:
+        cmd.append("-l")
+    return cmd + ["-f", pattern_file, root]
+
+
 def tgrep_cmd(exe, root, patterns, literal, files, pattern_file):
-    cmd = [exe, "--no-index", "--no-messages"]
+    cmd = [exe, "--no-index", "--no-messages", "--no-require-git"]
     if literal:
         cmd.append("-F")
     if files:
@@ -77,10 +87,11 @@ def main():
     parser.add_argument("root")
     parser.add_argument("--shgrep", default=os.path.join("dist", "shgrep.exe"))
     parser.add_argument("--ug", default="ug")
+    parser.add_argument("--rg", default="rg")
     parser.add_argument("--tgrep")
     parser.add_argument("--runs", type=int, default=5)
     args = parser.parse_args()
-    tools = [("shgrep", args.shgrep, shgrep_cmd), ("ug", args.ug, ug_cmd)]
+    tools = [("shgrep", args.shgrep, shgrep_cmd), ("rg", args.rg, rg_cmd), ("ug", args.ug, ug_cmd)]
     if args.tgrep:
         tools.append(("tgrep", args.tgrep, tgrep_cmd))
 

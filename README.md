@@ -8,31 +8,26 @@ if you used rg, ug or tgrep you already know how this works. regex by default, `
 
 ## benchmarks
 
-my machine: Ryzen 5 5600, 12 threads, windows 11, warm cache. big folder = 80 MB, 6,920 files, median of 5 runs. small repo = this repo, 865 files. didnt test ripgrep yet, dont @ me
+my machine: Ryzen 5 5600, 12 threads, windows 11, warm cache. big folder = 80 MB, 6,920 files, median of 5 runs. small repo = this repo, 865 files. all tools set to skip the same stuff (gitignore, hidden, binary). run it yourself with `tests/bench.py`, dont trust me
 
-| what | shgrep | them |
-| --- | --- | --- |
-| big folder, 1 literal | **94 ms** | ug 412 ms |
-| big folder, 1 regex | **115 ms** | ug 336 ms |
-| big folder, 100 literals | **103 ms** | ug 319 ms |
-| big folder, 1000 literals | **119 ms** | ug 320 ms |
-| big folder, 100 regexes | **191 ms** | ug 416 ms |
-| big folder, common word, files only | **94 ms** | ug 240 ms |
-| big folder, common regex, files only | **95 ms** | ug 303 ms |
-| big folder, just walking dirs | **36 ms** | ug 55 ms |
-| big folder, backreference | 901 ms | ug -P 896 ms |
-| small repo, 1 literal | 56 ms | tgrep 50 ms |
-| small repo, 1 regex | 56 ms | tgrep 52 ms |
-| small repo, 40 regexes | 52 ms | tgrep 51.5 ms |
-| find 1 mp3 on all of C: | **6.2 s** | ug 24.4 s |
-| find 1 mp3 on all of C:, shgrep day one | ~5 min | lol |
-| small repo, before skipping binaries early | 895 ms | now 51 ms |
-| big folder, before relative file opens | 336 ms | now 96 ms |
-| 40 regexes, first call vs cached | 100 ms | 52 ms |
-| files ug skips that we search (Latin-1) | 63 | |
-| files ug finds that we miss | 0 | |
+| test | **shgrep** | rg 15.1 | ug | tgrep |
+| --- | --- | --- | --- | --- |
+| big folder, 1 literal | 85 ms | **82 ms** | 246 ms | 1187 ms |
+| big folder, 1 regex | 86 ms | **73 ms** | 283 ms | 1196 ms |
+| big folder, 100 literals | **85 ms** | 87 ms | 251 ms | 1179 ms |
+| big folder, 1000 literals | 97 ms | **73 ms** | 283 ms | 1231 ms |
+| big folder, 100 regexes | 163 ms | **69 ms** | 283 ms | 1182 ms |
+| big folder, common word, files only | **66 ms** | 81 ms | 224 ms | 1239 ms |
+| big folder, common regex, files only | **77 ms** | 81 ms | 250 ms | 1403 ms |
+| big folder, just walking dirs | **8 ms** | 22 ms | 55 ms (older run) | 32 ms |
+| big folder, backreference | 606 ms | **106 ms** (-P) | 896 ms (-P, older run) | 108 ms (-P) |
+| big folder, files found with "return" | 3712 | 3712 | 3649 (skips Latin-1) | 3712 |
+| small repo, 1 literal | 56 ms | not tested | not tested | **50 ms** |
+| small repo, 1 regex | 56 ms | not tested | not tested | **52 ms** |
+| small repo, 40 regexes | 52 ms | not tested | not tested | **51.5 ms** |
+| find 1 mp3 on all of C: | **6.2 s** | not tested | 24.4 s | not tested |
 
-1000 patterns cost 25 ms more than 1. thats hyperscan. ug times jumped around between runs (266 to 412 ms same search) so dont take the multipliers too serious. tgrep rows were before the relative open fix.
+honest take: rg is the real boss. we beat it on listing files and walking dirs, tie on plain literals, and it beats us on regex-heavy stuff and backreferences. part of that is the CLI recompiling patterns every run (the MCP server caches them, the CLI doesnt), part is Chimera being slow when the pattern has no literal to grab onto. ug and tgrep (`--no-index`) are just slower here. tgrep with its index wasnt tested.
 
 ## build
 
