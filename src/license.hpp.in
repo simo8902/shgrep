@@ -1,0 +1,5 @@
+#pragma once
+
+namespace shgrep {
+inline constexpr char hyperscan_license[] = R"SHGREP_HS(@HYPERSCAN_LICENSE_TEXT@)SHGREP_HS";
+}
