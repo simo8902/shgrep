@@ -13,6 +13,9 @@
 #include <chrono>
 #include <cctype>
 #include <condition_variable>
+#include <cstdlib>
+#include <cstring>
+#include <cwchar>
 #include <cwctype>
 #include <exception>
 #include <fstream>
@@ -145,7 +148,7 @@ bool equals_folded(std::string_view a, std::string_view b) {
 }
 struct Request {
     bool file_only = false, binary = false, insensitive = false, line = true;
-    bool no_ignore = false, hidden = false, word = false;
+    bool no_ignore = false, hidden = false, word = false, sniff_all = false;
     // output: "lines" (path:line:text), "files" (paths with a match), "count" (path:N), or "json".
     std::string mode = "regex", output = "lines", exact_name, substring, name_glob, path_filter;
     std::vector<std::string> patterns, includes, excludes, extensions, type_globs;
@@ -244,6 +247,7 @@ Request parse_request(const std::string& tool, const Json& args, const SearchCon
         throw std::runtime_error("output must be lines, files, count, or json");
     }
     r.word = boolean(args, "word", false);
+    r.sniff_all = boolean(args, "sniff_all", false);
     if (r.word && r.binary) throw std::runtime_error("word is supported by search only");
     uint32_t context_lines = bounded(args, "context_lines", 0, 0, 100);
     r.before_lines = bounded(args, "before_lines", context_lines, 0, 100);
@@ -414,17 +418,11 @@ bool ignored_path(const IgnoreScope* scope, std::string_view relative, bool dire
         bool matched = false;
         if (rule.has_slash) matched = ignore_glob(rule.pattern, scoped);
         else {
-            size_t begin = 0;
-            while (begin <= scoped.size()) {
-                size_t end = scoped.find('/', begin);
-                if (end == std::string_view::npos) end = scoped.size();
-                if (ignore_glob(rule.pattern, scoped.substr(begin, end - begin))) {
-                    matched = true;
-                    break;
-                }
-                if (end == scoped.size()) break;
-                begin = end + 1;
-            }
+            // CONTRACT: like Git, a pattern without a slash matches the entry's own name only. Ignored parent
+            // directories are never entered by the walker, so matching parent components here would wrongly
+            // override a later directory-only negation such as "pcre" followed by "!pcre/".
+            const size_t slash = scoped.rfind('/');
+            matched = ignore_glob(rule.pattern, slash == std::string_view::npos ? scoped : scoped.substr(slash + 1));
         }
         if (matched) ignored = !rule.negated;
     }
@@ -446,6 +444,26 @@ bool extension_passes(const Request& r, std::string_view name) {
 bool type_passes(const Request& r, const std::string& name) {
     if (r.type_globs.empty()) return true;
     for (const auto& glob : r.type_globs) if (glob_match(glob, name)) return true;
+    return false;
+}
+
+// PERF: on Windows the open is the expensive step of reading a file (antivirus filters run there), so text
+// search skips files whose extension is an unambiguous binary format without opening them. Ambiguous ones
+// (.bin, .dat, ...) are not listed; they still get the NUL probe. Request.sniff_all turns this off.
+bool binary_extension(std::string_view name) {
+    static constexpr std::string_view extensions[] = {
+        "exe", "dll", "sys", "ocx", "obj", "o", "lib", "a", "so", "dylib", "pdb", "ilk", "exp", "idb", "pch",
+        "ipch", "iobj", "ipdb", "winmd", "node", "class", "jar", "pyc", "pyo", "pyd", "wasm",
+        "zip", "7z", "rar", "gz", "tgz", "bz2", "xz", "zst", "lz4", "cab", "msi", "nupkg", "whl", "iso",
+        "png", "jpg", "jpeg", "gif", "bmp", "ico", "tif", "tiff", "webp", "psd", "dds", "tga", "heic",
+        "mp3", "wav", "ogg", "flac", "aac", "m4a", "mp4", "mkv", "avi", "mov", "wmv", "webm",
+        "ttf", "otf", "woff", "woff2", "eot", "pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx",
+        "sqlite", "sqlite3", "mdb", "accdb", "fbx", "blend", "spv", "pak", "bnk"};
+    const size_t dot = name.find_last_of('.');
+    if (dot == std::string_view::npos || dot + 1 == name.size() || name.size() - dot - 1 > 8) return false;
+    const std::string_view ext = name.substr(dot + 1);
+    for (std::string_view candidate : extensions)
+        if (equals_folded(ext, candidate)) return true;
     return false;
 }
 
@@ -544,6 +562,142 @@ CompileSpec compile_spec(const Request& r) {
     return spec;
 }
 
+bool env_off(const wchar_t* name) {
+    wchar_t value[4] = {};
+    return GetEnvironmentVariableW(name, value, 4) == 1 && value[0] == L'0';
+}
+
+// PERF: compiled Hyperscan databases persist across processes in %LOCALAPPDATA%\shgrep\db-cache, so a CLI
+// run does not pay the compile again (about 85 ms for 100 regexes). Owner-approved 2026-10-07.
+// CONTRACT: only compiled patterns are stored, never file contents or results, so freshness is unaffected.
+// Each file carries its full key (cache format, Hyperscan version, ISA build, every compile input) and is used
+// only on an exact key match; hs_deserialize_database also rejects other versions and CPUs. Writes go to a
+// temporary file and are renamed into place. SHGREP_DB_CACHE=0 disables the cache.
+constexpr size_t db_cache_files = 64;
+constexpr auto db_cache_min_compile = std::chrono::milliseconds(5);
+constexpr char db_cache_magic[8] = {'S', 'H', 'G', 'D', 'B', '0', '0', '1'};
+
+const std::wstring& db_cache_dir() {
+    static const std::wstring dir = [] {
+        if (env_off(L"SHGREP_DB_CACHE")) return std::wstring();
+        wchar_t base[MAX_PATH] = {};
+        const DWORD length = GetEnvironmentVariableW(L"LOCALAPPDATA", base, MAX_PATH);
+        if (length == 0 || length >= MAX_PATH) return std::wstring();
+        return std::wstring(base, length) + L"\\shgrep\\db-cache";
+    }();
+    return dir;
+}
+
+std::string db_cache_key(const CompileSpec& spec) {
+    if (db_cache_dir().empty()) return {};
+    std::string key = "shgrep-db-1|";
+    key += hs_version();
+#if defined(SHGREP_HS_AVX512)
+    key += "|avx512|";
+#elif defined(SHGREP_HS_AVX2)
+    key += "|avx2|";
+#else
+    key += "|sse|";
+#endif
+    key += spec.binary ? 'b' : 't';
+    key += spec.regex ? 'r' : 'l';
+    key += spec.insensitive ? 'i' : 's';
+    key += spec.literal_api ? 'a' : 'x';
+    key += spec.som ? 'o' : 'n';
+    for (const auto& p : spec.patterns) {
+        key += '|';
+        key += std::to_string(p.size());
+        key += ':';
+        key += p;
+    }
+    return key;
+}
+
+std::wstring db_cache_path(const std::string& key) {
+    uint64_t hash = 1469598103934665603ull; // FNV-1a; the full key inside the file settles collisions
+    for (unsigned char c : key) {
+        hash ^= c;
+        hash *= 1099511628211ull;
+    }
+    wchar_t name[32] = {};
+    swprintf_s(name, L"\\%016llx.hsdb", static_cast<unsigned long long>(hash));
+    return db_cache_dir() + name;
+}
+
+hs_database_t* load_cached_database(const std::string& key) {
+    Handle file(CreateFileW(db_cache_path(key).c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE, nullptr,
+                            OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, nullptr));
+    if (!file) return nullptr;
+    LARGE_INTEGER size{};
+    if (!GetFileSizeEx(file.h, &size) || size.QuadPart < 16 || size.QuadPart > (256ll << 20)) return nullptr;
+    std::string data(static_cast<size_t>(size.QuadPart), '\0');
+    for (size_t done = 0; done < data.size();) {
+        DWORD got = 0;
+        const auto want = static_cast<DWORD>(std::min<size_t>(data.size() - done, 1u << 20));
+        if (!ReadFile(file.h, data.data() + done, want, &got, nullptr) || got == 0) return nullptr;
+        done += got;
+    }
+    uint64_t key_length = 0;
+    std::memcpy(&key_length, data.data() + 8, sizeof(key_length));
+    if (std::memcmp(data.data(), db_cache_magic, sizeof(db_cache_magic)) != 0 || key_length != key.size() ||
+        16 + key_length > data.size() || data.compare(16, key.size(), key) != 0) return nullptr;
+    const size_t offset = 16 + key.size();
+    hs_database_t* db = nullptr;
+    if (hs_deserialize_database(data.data() + offset, data.size() - offset, &db) != HS_SUCCESS) return nullptr;
+    return db;
+}
+
+void store_cached_database(const std::string& key, const hs_database_t* db) {
+    char* serialized = nullptr;
+    size_t length = 0;
+    if (hs_serialize_database(db, &serialized, &length) != HS_SUCCESS) return;
+    const std::unique_ptr<char, decltype(&std::free)> owned(serialized, &std::free);
+    const std::wstring& dir = db_cache_dir();
+    CreateDirectoryW(dir.substr(0, dir.rfind(L'\\')).c_str(), nullptr);
+    CreateDirectoryW(dir.c_str(), nullptr);
+    const std::wstring path = db_cache_path(key);
+    const std::wstring temp = path + L"." + std::to_wstring(GetCurrentProcessId()) + L"." +
+                              std::to_wstring(GetCurrentThreadId()) + L".tmp";
+    bool written = false;
+    {
+        Handle file(CreateFileW(temp.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr));
+        if (file) {
+            auto write_all = [&](const char* p, size_t n) {
+                while (n) {
+                    DWORD put = 0;
+                    const auto want = static_cast<DWORD>(std::min<size_t>(n, 1u << 20));
+                    if (!WriteFile(file.h, p, want, &put, nullptr) || put == 0) return false;
+                    p += put;
+                    n -= put;
+                }
+                return true;
+            };
+            const uint64_t key_length = key.size();
+            std::string header(db_cache_magic, sizeof(db_cache_magic));
+            header.append(reinterpret_cast<const char*>(&key_length), sizeof(key_length));
+            header += key;
+            written = write_all(header.data(), header.size()) && write_all(serialized, length);
+        }
+    }
+    if (!written || !MoveFileExW(temp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING)) {
+        DeleteFileW(temp.c_str());
+        return;
+    }
+    // Keep the newest db_cache_files databases.
+    WIN32_FIND_DATAW found{};
+    HANDLE search = FindFirstFileW((dir + L"\\*.hsdb").c_str(), &found);
+    if (search == INVALID_HANDLE_VALUE) return;
+    std::vector<std::pair<uint64_t, std::wstring>> files;
+    do {
+        files.emplace_back((static_cast<uint64_t>(found.ftLastWriteTime.dwHighDateTime) << 32) |
+                               found.ftLastWriteTime.dwLowDateTime, found.cFileName);
+    } while (FindNextFileW(search, &found));
+    FindClose(search);
+    if (files.size() <= db_cache_files) return;
+    std::sort(files.begin(), files.end());
+    for (size_t i = 0; i + db_cache_files < files.size(); ++i) DeleteFileW((dir + L"\\" + files[i].second).c_str());
+}
+
 struct Database {
     hs_database_t* db = nullptr;
     hs_scratch_t* scratch = nullptr; // prototype for hs_clone_scratch; never scanned with
@@ -575,13 +729,25 @@ struct Database {
         std::vector<unsigned> flags(count, common), ids(count);
         std::vector<size_t> lens;
         for (unsigned i = 0; i < count; ++i) ids[i] = i;
+        if (spec.literal_api)
+            for (const auto& p : spec.patterns) lengths.push_back(static_cast<uint32_t>(p.size()));
+        const std::string cache_key = db_cache_key(spec);
+        if (!cache_key.empty()) db = load_cached_database(cache_key);
+        if (db) {
+            if (hs_alloc_scratch(db, &scratch) != HS_SUCCESS) {
+                hs_free_database(db);
+                db = nullptr;
+                throw std::runtime_error("Hyperscan scratch allocation failed");
+            }
+            return;
+        }
+        const auto compile_start = Clock::now();
         hs_compile_error_t* error = nullptr;
         hs_error_t rc;
         if (spec.literal_api) {
             for (const auto& p : spec.patterns) {
                 ptrs.push_back(p.data());
                 lens.push_back(p.size());
-                lengths.push_back(static_cast<uint32_t>(p.size()));
             }
             rc = hs_compile_lit_multi(ptrs.data(), flags.data(), ids.data(), lens.data(), count, mode, nullptr, &db, &error);
         } else {
@@ -611,6 +777,7 @@ struct Database {
             throw std::runtime_error(message);
         }
         if (error) hs_free_compile_error(error);
+        if (!cache_key.empty() && Clock::now() - compile_start >= db_cache_min_compile) store_cached_database(cache_key, db);
         if (hs_alloc_scratch(db, &scratch) != HS_SUCCESS) {
             hs_free_database(db);
             db = nullptr;
@@ -788,7 +955,7 @@ std::string hex(const std::string& s) {
     for (unsigned char c : s) { out.push_back(digits[c >> 4]); out.push_back(digits[c & 15]); }
     return out;
 }
-bool valid_utf8(const std::string& s) {
+bool valid_utf8(std::string_view s) {
     if (s.empty()) return true;
     return MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, s.data(), static_cast<int>(s.size()), nullptr, 0) != 0;
 }
@@ -828,7 +995,7 @@ void append_codepoint(DecodedText& out, uint32_t cp, uint32_t raw_end) {
     out.boundaries.emplace_back(static_cast<uint32_t>(out.text.size()), raw_end);
 }
 
-DecodedText decode_text(const std::string& raw) {
+DecodedText decode_text(std::string_view raw) {
     DecodedText out;
     const auto byte = [&](size_t i) { return static_cast<unsigned char>(raw[i]); };
     const bool utf16le = raw.size() >= 2 && byte(0) == 0xff && byte(1) == 0xfe;
@@ -861,7 +1028,7 @@ DecodedText decode_text(const std::string& raw) {
         return out;
     }
     out.bom = raw.size() >= 3 && byte(0) == 0xef && byte(1) == 0xbb && byte(2) == 0xbf ? 3 : 0;
-    std::string source = raw.substr(out.bom);
+    std::string source(raw.substr(out.bom));
     if (valid_utf8(source)) {
         out.text = std::move(source);
         return out;
@@ -1045,7 +1212,22 @@ struct MemoryBudget {
 // SAFETY: Hyperscan scratch is not thread-safe, so each worker owns a clone of the database prototype.
 struct Worker {
     std::vector<char> buffer;
-    std::string raw;
+    // PERF: the whole-file read buffer is allocated without zero-filling (std::string::resize would memset it).
+    std::unique_ptr<char[]> raw;
+    size_t raw_capacity = 0;
+    char* raw_buffer(size_t bytes) {
+        if (bytes > raw_capacity || !raw) {
+            raw = std::make_unique_for_overwrite<char[]>(std::max<size_t>(bytes, 1));
+            raw_capacity = std::max<size_t>(bytes, 1);
+        }
+        return raw.get();
+    }
+    void trim_raw() {
+        if (raw_capacity > retained_text_capacity) {
+            raw.reset();
+            raw_capacity = 0;
+        }
+    }
     hs_scratch_t* scratch = nullptr;
 #if defined(SHGREP_CHIMERA)
     ch_scratch_t* chimera_scratch = nullptr;
@@ -1156,6 +1338,39 @@ std::string render_lines(const Request& r, const std::string& display, std::stri
     return out;
 }
 
+// PERF: one SSE2 pass (baseline x64) finds NUL bytes and any byte >= 0x80, so pure-ASCII text, the common
+// case for source code, needs neither UTF-8 validation nor decoding.
+struct ByteScan {
+    bool nul = false, non_ascii = false;
+};
+ByteScan scan_bytes(std::string_view s) {
+    const char* p = s.data();
+    const size_t n = s.size();
+    const __m128i zero = _mm_setzero_si128();
+    int high = 0, nul = 0;
+    size_t i = 0;
+    for (; i + 16 <= n; i += 16) {
+        const __m128i v = _mm_loadu_si128(reinterpret_cast<const __m128i*>(p + i));
+        high |= _mm_movemask_epi8(v);
+        nul |= _mm_movemask_epi8(_mm_cmpeq_epi8(v, zero));
+    }
+    for (; i < n; ++i) {
+        const auto c = static_cast<unsigned char>(p[i]);
+        high |= c & 0x80;
+        nul |= c == 0;
+    }
+    return {nul != 0, high != 0};
+}
+
+// The text Hyperscan scans: the raw read buffer itself (zero-copy) or a decoded copy, with offsets mapped back
+// to the file either way.
+struct TextView {
+    std::string_view text;
+    const DecodedText* decoded = nullptr; // null on the zero-copy path
+    uint32_t bom = 0;
+    uint64_t raw_offset(uint64_t at, bool end) const { return decoded ? decoded->raw_offset(at, end) : bom + at; }
+};
+
 void scan_text(const ScanShared& s, Worker& w, HANDLE h, uint64_t file_size, const std::string& display,
                uint32_t remaining, std::string& file_state, std::vector<Candidate>& items) {
     const Request& r = s.r;
@@ -1198,21 +1413,21 @@ void scan_text(const ScanShared& s, Worker& w, HANDLE h, uint64_t file_size, con
         Worker& worker;
         uint64_t bytes;
         ~Reservation() {
-            if (worker.raw.capacity() > retained_text_capacity) std::string().swap(worker.raw);
+            worker.trim_raw();
             if (bytes) memory.release(bytes);
         }
     } reservation{s.memory, w, charge};
 
-    std::string& raw = w.raw;
-    raw.resize(static_cast<size_t>(file_size));
-    std::copy(w.buffer.begin(), w.buffer.begin() + head, raw.begin());
+    const auto size = static_cast<size_t>(file_size);
+    char* raw = w.raw_buffer(size);
+    std::copy(w.buffer.data(), w.buffer.data() + head, raw);
     size_t read = head;
     bool read_failed = false;
-    while (read < raw.size()) {
+    while (read < size) {
         if (const char* why = s.control.interrupted()) { file_state = why; break; }
         DWORD got = 0;
-        DWORD want = static_cast<DWORD>(std::min<size_t>(w.buffer.size(), raw.size() - read));
-        if (!ReadFile(h, raw.data() + read, want, &got, nullptr) || got == 0) {
+        DWORD want = static_cast<DWORD>(std::min<size_t>(w.buffer.size(), size - read));
+        if (!ReadFile(h, raw + read, want, &got, nullptr) || got == 0) {
             read_failed = true;
             break;
         }
@@ -1225,15 +1440,40 @@ void scan_text(const ScanShared& s, Worker& w, HANDLE h, uint64_t file_size, con
         static_cast<uint64_t>(current_size.QuadPart) != file_size)) read_failed = true;
     if (read_failed) { ++out.errors; return; }
     if (file_state != "complete") return;
-    DecodedText decoded = decode_text(raw);
-    if (decoded.text.find('\0') != std::string::npos) { ++out.skipped_binary; return; }
+
+    // PERF: zero-copy path. BOM-less or UTF-8-BOM text that is pure ASCII or valid UTF-8 is exactly what
+    // decode_text would produce, so Hyperscan scans the read buffer in place. UTF-16 and invalid UTF-8 are
+    // decoded into a copy as before.
+    const std::string_view file_bytes(raw, read);
+    std::optional<DecodedText> decoded;
+    TextView view;
+    bool zero_copy = false;
+    if (!utf16) {
+        const uint32_t bom = read >= 3 && static_cast<unsigned char>(raw[0]) == 0xef &&
+                                     static_cast<unsigned char>(raw[1]) == 0xbb &&
+                                     static_cast<unsigned char>(raw[2]) == 0xbf ? 3u : 0u;
+        const std::string_view body = file_bytes.substr(bom);
+        const ByteScan scanned = scan_bytes(body);
+        if (scanned.nul) { ++out.skipped_binary; return; }
+        if (!scanned.non_ascii || valid_utf8(body)) {
+            view.text = body;
+            view.bom = bom;
+            zero_copy = true;
+        }
+    }
+    if (!zero_copy) {
+        decoded.emplace(decode_text(file_bytes));
+        if (decoded->text.find('\0') != std::string::npos) { ++out.skipped_binary; return; }
+        view.text = decoded->text;
+        view.decoded = &*decoded;
+    }
 
     const bool files_only = r.output == "files", count_only = r.output == "count";
     // PERF: files output stops each file at its first match.
     Collector collect{{}, 0, files_only ? 1u : r.max_per_file, remaining};
     collect.count_only = count_only;
     collect.word = r.word;
-    collect.text = decoded.text;
+    collect.text = view.text;
     collect.som = s.database->som;
     collect.lengths = s.database->lengths.empty() ? nullptr : &s.database->lengths;
     if (!count_only) collect.events.reserve(std::min(collect.max_per_file, collect.remaining));
@@ -1242,14 +1482,14 @@ void scan_text(const ScanShared& s, Worker& w, HANDLE h, uint64_t file_size, con
     collect.per_line = r.output == "lines";
 #if defined(SHGREP_CHIMERA)
     if (s.database->chimera) {
-        ch_error_t rc = ch_scan(s.database->chimera, decoded.text.data(), static_cast<unsigned>(decoded.text.size()), 0,
+        ch_error_t rc = ch_scan(s.database->chimera, view.text.data(), static_cast<unsigned>(view.text.size()), 0,
                                 w.chimera_scratch, chimera_match, chimera_error, &collect);
         if (rc != CH_SUCCESS && rc != CH_SCAN_TERMINATED) throw std::runtime_error("Chimera text scan failed");
         if (collect.pcre_limit) ++out.errors;
     } else
 #endif
     {
-        hs_error_t rc = hs_scan(s.database->db, decoded.text.data(), static_cast<unsigned>(decoded.text.size()), 0,
+        hs_error_t rc = hs_scan(s.database->db, view.text.data(), static_cast<unsigned>(view.text.size()), 0,
                                 w.scratch, Collector::callback, &collect);
         if (rc != HS_SUCCESS && rc != HS_SCAN_TERMINATED) throw std::runtime_error("Hyperscan text scan failed");
     }
@@ -1266,7 +1506,7 @@ void scan_text(const ScanShared& s, Worker& w, HANDLE h, uint64_t file_size, con
     }
     if (r.output == "lines") {
         if (!collect.events.empty())
-            add_text_candidate(items, display, render_lines(r, display, decoded.text, collect.events),
+            add_text_candidate(items, display, render_lines(r, display, view.text, collect.events),
                                static_cast<uint32_t>(collect.events.size()));
         return;
     }
@@ -1281,8 +1521,8 @@ void scan_text(const ScanShared& s, Worker& w, HANDLE h, uint64_t file_size, con
         size_t cursor = 0;
         uint64_t line_number = 1;
         for (size_t i : order) {
-            size_t target = static_cast<size_t>(std::min<uint64_t>(collect.events[i].from, decoded.text.size()));
-            line_number += std::count(decoded.text.begin() + cursor, decoded.text.begin() + target, '\n');
+            size_t target = static_cast<size_t>(std::min<uint64_t>(collect.events[i].from, view.text.size()));
+            line_number += std::count(view.text.begin() + cursor, view.text.begin() + target, '\n');
             cursor = target;
             line_numbers[i] = line_number;
         }
@@ -1290,29 +1530,29 @@ void scan_text(const ScanShared& s, Worker& w, HANDLE h, uint64_t file_size, con
     for (size_t index = 0; index < collect.events.size(); ++index) {
         if (const char* why = s.control.interrupted()) { file_state = why; break; }
         const auto& event = collect.events[index];
-        if (event.from > event.to || event.to > decoded.text.size()) {
+        if (event.from > event.to || event.to > view.text.size()) {
             ++out.errors;
             continue;
         }
         size_t start = static_cast<size_t>(event.from > r.context_before ? event.from - r.context_before : 0);
-        size_t end = static_cast<size_t>(std::min<uint64_t>(decoded.text.size(), event.to + r.context_after));
-        while (start < event.from && start < decoded.text.size() &&
-               (static_cast<unsigned char>(decoded.text[start]) & 0xc0) == 0x80) ++start;
-        while (end < decoded.text.size() &&
-               (static_cast<unsigned char>(decoded.text[end]) & 0xc0) == 0x80) ++end;
+        size_t end = static_cast<size_t>(std::min<uint64_t>(view.text.size(), event.to + r.context_after));
+        while (start < event.from && start < view.text.size() &&
+               (static_cast<unsigned char>(view.text[start]) & 0xc0) == 0x80) ++start;
+        while (end < view.text.size() &&
+               (static_cast<unsigned char>(view.text[end]) & 0xc0) == 0x80) ++end;
         bool context_truncated = end - start > 2048;
         if (context_truncated) {
             end = start + 2048;
-            while (end > event.to && end < decoded.text.size() &&
-                   (static_cast<unsigned char>(decoded.text[end]) & 0xc0) == 0x80) --end;
+            while (end > event.to && end < view.text.size() &&
+                   (static_cast<unsigned char>(view.text[end]) & 0xc0) == 0x80) --end;
         }
-        uint64_t from = decoded.raw_offset(event.from, false);
-        uint64_t to = decoded.raw_offset(event.to, true);
+        uint64_t from = view.raw_offset(event.from, false);
+        uint64_t to = view.raw_offset(event.to, true);
         Json::Object item{{"pattern_id", static_cast<int64_t>(event.id)},
             {"path", display}, {"byte_start", from},
             {"byte_end", to}, {"binary", false},
-            {"context", decoded.text.substr(start, end - start)},
-            {"context_start", decoded.raw_offset(start, false)},
+            {"context", std::string(view.text.substr(start, end - start))},
+            {"context_start", view.raw_offset(start, false)},
             {"context_match_start", event.from - start},
             {"context_match_end", event.to - start},
             {"context_truncated", context_truncated}};
@@ -1489,6 +1729,7 @@ std::string render_footer(const Request& r, const Footer& f, const Json::Array& 
 struct DirEntry {
     std::wstring name;
     DWORD attributes = 0;
+    uint64_t size = 0;
 };
 
 // PERF: one handle per directory and 64 KiB batches of FILE_FULL_DIR_INFO supply names and attributes
@@ -1508,7 +1749,8 @@ bool list_directory(HANDLE directory, std::vector<uint64_t>& buffer, std::vector
         for (;;) {
             const auto* info = reinterpret_cast<const FILE_FULL_DIR_INFO*>(cursor);
             std::wstring_view name(info->FileName, info->FileNameLength / sizeof(wchar_t));
-            if (name != L"." && name != L"..") entries.push_back({std::wstring(name), info->FileAttributes});
+            if (name != L"." && name != L"..")
+                entries.push_back({std::wstring(name), info->FileAttributes, static_cast<uint64_t>(info->EndOfFile.QuadPart)});
             if (info->NextEntryOffset == 0) break;
             cursor += info->NextEntryOffset;
         }
@@ -1637,6 +1879,12 @@ void visit_directory(const Request& r, const DirectoryTask& task, unsigned worke
             children.push_back({join_path(task.path, entry.name), b.relative, scope, std::make_shared<Handle>(child)});
             continue;
         }
+        if (!r.file_only && !r.binary) {
+            // PERF: skip text-search files that cannot match without paying for the open. Empty files are
+            // known from the listing; binary extensions are listed in binary_extension.
+            if (entry.size == 0) { ++out.files; continue; }
+            if (!r.sniff_all && binary_extension(b.name)) { ++out.skipped_binary; continue; }
+        }
         on_file(worker, task.handle->h, entry.name, join_path(task.path, entry.name));
     }
 }
@@ -1746,6 +1994,8 @@ Json run_tool(const std::string& name, const Json& arguments,
     // PERF: one worker per logical processor across all processor groups, by the owner's decision.
     // Concurrent MCP requests each get their own full pool.
     const DWORD processors = GetActiveProcessorCount(ALL_PROCESSOR_GROUPS);
+    // PERF: measured 12/18/24 workers on a 12-thread CPU with a warm cache: more workers than logical
+    // processors did not hide open latency and was up to 6 ms slower.
     const unsigned worker_count = processors == 0 ? 1u : static_cast<unsigned>(processors);
     std::vector<std::unique_ptr<Worker>> workers;
     for (unsigned i = 0; i < worker_count; ++i) {
@@ -1905,6 +2155,9 @@ Json tool_definitions() {
     search_props.emplace("word", field("boolean", "Like rg -w: the match must not touch a letter, digit, or '_' on "
                                                   "either side. Default false."));
     search_props.emplace("line_numbers", field("boolean", "Default true. false is rg -N."));
+    search_props.emplace("sniff_all", field("boolean", "Default false: files with binary extensions (.exe, .dll, "
+                                                       ".png, .zip, .pdf, ...) are skipped without being opened. "
+                                                       "true opens and NUL-checks every file."));
     search_props.emplace("max_file_bytes", field("integer", "Text files larger than this are not searched and are "
                                                             "reported as skipped. 1-268435456, default 67108864."));
 

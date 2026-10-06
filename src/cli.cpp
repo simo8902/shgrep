@@ -255,6 +255,7 @@ int run_cli(int argc, wchar_t** argv) {
             if (option == L"--files-with-matches" || option == L"-l") { args["output"] = "files"; continue; }
             if (option == L"--count" || option == L"-c") { args["output"] = "count"; continue; }
             if (option == L"--no-line-number" || option == L"-N") { args["line_numbers"] = false; continue; }
+            if (option == L"--sniff-all") { args["sniff_all"] = true; continue; }
             if (option == L"--line-numbers") { args["line_numbers"] = true; continue; }
             if (option == L"--no-ignore") { args["no_ignore"] = true; continue; }
             if (option == L"--hidden") { args["hidden"] = true; continue; }

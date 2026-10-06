@@ -1,6 +1,7 @@
 """Wall-clock benchmark: shgrep CLI against ug (and optionally tgrep --no-index) on one root.
 
-Usage: python tests/bench.py ROOT [--shgrep dist/shgrep.exe] [--rg rg] [--ug ug] [--tgrep PATH] [--runs 5]
+Usage: python tests/bench.py ROOT [--shgrep dist/shgrep.exe] [--rg rg] [--ug ug] [--tgrep PATH]
+                               [--tgrep-index DIR] [--runs 5]
 
 Each workload runs once to warm the file cache, then --runs times; the median wall time is reported.
 CONTRACT: flags are chosen so every tool selects the same files: recursive, hidden files skipped, binary
@@ -76,6 +77,17 @@ def tgrep_cmd(exe, root, patterns, literal, files, pattern_file):
     return cmd + ["-f", pattern_file, root]
 
 
+def tgrep_index_cmd(index_dir):
+    def build(exe, root, patterns, literal, files, pattern_file):
+        cmd = [exe, "--index-path", index_dir, "--no-messages", "--no-require-git"]
+        if literal:
+            cmd.append("-F")
+        if files:
+            cmd.append("-l")
+        return cmd + ["-f", pattern_file, root]
+    return build
+
+
 def timed(cmd):
     start = time.perf_counter()
     done = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -89,11 +101,18 @@ def main():
     parser.add_argument("--ug", default="ug")
     parser.add_argument("--rg", default="rg")
     parser.add_argument("--tgrep")
+    parser.add_argument("--tgrep-index", help="index directory; builds a tgrep index there and adds an indexed column")
     parser.add_argument("--runs", type=int, default=5)
     args = parser.parse_args()
     tools = [("shgrep", args.shgrep, shgrep_cmd), ("rg", args.rg, rg_cmd), ("ug", args.ug, ug_cmd)]
     if args.tgrep:
         tools.append(("tgrep", args.tgrep, tgrep_cmd))
+    if args.tgrep and args.tgrep_index:
+        start = time.perf_counter()
+        built = subprocess.run([args.tgrep, "index", "--force", "--index-path", args.tgrep_index, "--no-require-git",
+                                args.root], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        print(f"tgrep index build: {(time.perf_counter() - start) * 1000:.0f} ms (exit {built.returncode})")
+        tools.append(("tgrep idx", args.tgrep, tgrep_index_cmd(args.tgrep_index)))
 
     print(f"root: {args.root}  runs: {args.runs} (median, ms)")
     print(f"{'workload':<26}" + "".join(f"{name:>10}" for name, _, _ in tools) + "   lines out")

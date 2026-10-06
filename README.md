@@ -1,37 +1,40 @@
 # shgrep
 
-grep but stupid fast. windows only. made for AI agents but you can use it too i guess.
+grep but fast, windows only, built for AI agents. runs on Intel Hyperscan 5.4.2. one exe: CLI + MCP server. no index, every search reads whats on disk right now.
 
-runs on Intel Hyperscan 5.4.2 (the regex engine firewalls use). one exe, works as a CLI and as an MCP server. no index, no cache, every search reads whats actually on disk right now. you edit a file, search again, its there. wild right
-
-if you used rg, ug or tgrep you already know how this works. regex by default, `path:line:text` output, `-l -c -w -t -C` etc.
+works like rg: regex by default, `path:line:text`, `-l -c -w -t -C`.
 
 ## benchmarks
 
-my machine: Ryzen 5 5600, 12 threads, windows 11, warm cache. big folder = 80 MB, 6,920 files, median of 5 runs. small repo = this repo, 865 files. all tools set to skip the same stuff (gitignore, hidden, binary). run it yourself with `tests/bench.py`, dont trust me
+Ryzen 5 5600, windows 11, warm cache, median of 5. big = 80 MB, 6,920 files. small = this repo. same skip rules for everyone. tgrep idx = tgrep with its trigram index (built in 0.9 s big / 0.15 s small, can go stale). rerun with `tests/bench.py`.
 
-| test | **shgrep** | rg 15.1 | ug | tgrep |
-| --- | --- | --- | --- | --- |
-| big folder, 1 literal | 85 ms | **82 ms** | 246 ms | 1187 ms |
-| big folder, 1 regex | 86 ms | **73 ms** | 283 ms | 1196 ms |
-| big folder, 100 literals | **85 ms** | 87 ms | 251 ms | 1179 ms |
-| big folder, 1000 literals | 97 ms | **73 ms** | 283 ms | 1231 ms |
-| big folder, 100 regexes | 163 ms | **69 ms** | 283 ms | 1182 ms |
-| big folder, common word, files only | **66 ms** | 81 ms | 224 ms | 1239 ms |
-| big folder, common regex, files only | **77 ms** | 81 ms | 250 ms | 1403 ms |
-| big folder, just walking dirs | **8 ms** | 22 ms | 55 ms (older run) | 32 ms |
-| big folder, backreference | 606 ms | **106 ms** (-P) | 896 ms (-P, older run) | 108 ms (-P) |
-| big folder, files found with "return" | 3712 | 3712 | 3649 (skips Latin-1) | 3712 |
-| small repo, 1 literal | 56 ms | not tested | not tested | **50 ms** |
-| small repo, 1 regex | 56 ms | not tested | not tested | **52 ms** |
-| small repo, 40 regexes | 52 ms | not tested | not tested | **51.5 ms** |
-| find 1 mp3 on all of C: | **6.2 s** | not tested | 24.4 s | not tested |
+| test | **shgrep** | rg 15.1 | ug | tgrep | tgrep idx |
+| --- | --- | --- | --- | --- | --- |
+| big, 1 literal | 71 ms | 97 ms | 301 ms | 1197 ms | **9 ms** |
+| big, 1 regex | 66 ms | 70 ms | 323 ms | 1227 ms | **8 ms** |
+| big, 100 literals | 64 ms | 71 ms | 317 ms | 1174 ms | **10 ms** |
+| big, 1000 literals | 62 ms | 71 ms | 252 ms | 1239 ms | **26 ms** |
+| big, 100 regexes | 63 ms | 71 ms | 311 ms | 1166 ms | **9 ms** |
+| big, common word, files only | **56 ms** | 77 ms | 211 ms | 1210 ms | 262 ms |
+| big, common regex, files only | **67 ms** | 82 ms | 310 ms | 1317 ms | 573 ms |
+| big, backreference | 623 ms | **125 ms** | 252 ms | 179 ms | n/a |
+| big, walk dirs only | **9 ms** | 23 ms | 47 ms | 35 ms | n/a |
+| small, 1 literal | 18 ms | 20 ms | 46 ms | 54 ms | **6 ms** |
+| small, 1 regex | 22 ms | 19 ms | 53 ms | 59 ms | **7 ms** |
+| small, 100 literals | 23 ms | 26 ms | 61 ms | 60 ms | **8 ms** |
+| small, 1000 literals | 22 ms | 26 ms | 54 ms | 74 ms | **19 ms** |
+| small, 100 regexes | 19 ms | 21 ms | 91 ms | 62 ms | **8 ms** |
+| small, common word, files only | **19 ms** | 21 ms | 62 ms | 69 ms | 51 ms |
+| small, common regex, files only | **21 ms** | 24 ms | 42 ms | 85 ms | 86 ms |
+| small, backreference | 416 ms | **25 ms** | 63 ms | 1134 ms | n/a |
+| small, walk dirs only | **5 ms** | 14 ms | 14 ms | 21 ms | n/a |
+| find 1 mp3 on all of C: | **1.28 s** | 2.89 s | 10.41 s | 5.06 s | n/a |
 
-honest take: rg is the real boss. we beat it on listing files and walking dirs, tie on plain literals, and it beats us on regex-heavy stuff and backreferences. part of that is the CLI recompiling patterns every run (the MCP server caches them, the CLI doesnt), part is Chimera being slow when the pattern has no literal to grab onto. ug and tgrep (`--no-index`) are just slower here. tgrep with its index wasnt tested.
+short version: without an index we now beat rg on basically everything except backreferences (Chimera is slow there) and 1 regex on the small repo. indexed tgrep still wins rare matches but chokes on common ones and can be stale. 100-regex numbers use the on-disk pattern cache (first run pays ~85 ms compile).
 
 ## build
 
-you need VS 2026 Build Tools dev powershell, CMake, Ninja, Ragel 6.9, Python, Boost headers, OpenSSL. CMake 3.31 doesnt know VS 2026 so its Ninja.
+VS 2026 Build Tools dev powershell, CMake, Ninja, Ragel 6.9, Python, Boost headers, OpenSSL.
 
 ```powershell
 & 'C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools\Common7\Tools\Launch-VsDevShell.ps1' -Arch amd64 -HostArch amd64
@@ -40,88 +43,38 @@ cmake --build build-ninja --target shgrep
 cmake --install build-ninja --prefix "$PWD\dist" --component shgrep
 ```
 
-- builds hyperscan for AVX2 (`-DSHGREP_HS_ARCH=AVX2`). `AVX512` if you have it, `SSE` if your pc is ancient. hyperscan's cmake gives MSVC no cpu flags at all so normally you get the slow path and nobody tells you. fixed. old cpu gets an error, not a crash
-- backreferences and lookaround use Chimera (hyperscan + PCRE). needs PCRE 8.41+ in `libs/pcre-8.45/` or `-DSHGREP_PCRE_SOURCE=DIR`. no PCRE = still builds, those patterns just fail
-- `libs/` has only the parts of Hyperscan 5.4.2 and PCRE 8.45 the build needs, plus small cmake fixes marked `COMPAT`
-- ship `dist/shgrep.exe` alone, everything is static. `shgrep.exe --license` for the hyperscan license
+- hyperscan built for AVX2 (`-DSHGREP_HS_ARCH=AVX2|AVX512|SSE`). old cpu = error, not crash
+- backreferences/lookaround via Chimera, needs PCRE 8.41+ in `libs/pcre-8.45/`
+- `libs/` = only the parts of Hyperscan 5.4.2 and PCRE 8.45 the build needs
+- ship `dist/shgrep.exe` alone, its all static
 
 ## MCP
 
-run `shgrep.exe --root C:\work`. requests can narrow roots, never widen them. stdout is JSON-RPC only, logs on stderr.
+`shgrep.exe --root C:\work`. tools: `search` (text), `search_bytes` (hex/raw bytes), `find_files` (names only, never opens files).
 
-| tool | for | rg version |
-| --- | --- | --- |
-| `search` | text in code | `rg PATTERN` |
-| `search_bytes` | raw bytes in any file | they cant |
-| `find_files` | files by name, never opens them | `rg --files` |
+main `search` args: `pattern`/`patterns`, `mode` (`regex` default, `literal` = `-F`), `case_insensitive`, `word`, `output` (`lines`, `files`, `count`, `json`), `context_lines`/`before_lines`/`after_lines`, `types`, `include`/`exclude` (globs must match the WHOLE name or path, so use `*parser*` not `parser`), `max_results` (100), `max_matches_per_file` (20), `hidden`, `no_ignore`, `sniff_all`.
 
-| `search` arg | rg | default |
-| --- | --- | --- |
-| `pattern` / `patterns` | `PATTERN` / `-e` | required, many patterns still one pass |
-| `mode: "literal"` | `-F` | `"regex"`, PCRE syntax, ^ and $ per line, backrefs and lookaround ok |
-| `case_insensitive` | `-i` | false |
-| `word` | `-w` | false |
-| `output: "files"` / `"count"` | `-l` / `-c` | `"lines"` |
-| `context_lines` / `before_lines` / `after_lines` | `-C` / `-B` / `-A` | 0 |
-| `line_numbers: false` | `-N` | true |
-| `types` | `-t` | all |
-| `include` / `exclude` | `-g` / `-g !` | none |
-| `max_matches_per_file` | `-m` | 20 lines |
-| `hidden`, `no_ignore` | `--hidden`, `--no-ignore` | false |
-
-all tools also take `roots`, `extensions`, `path_filter`, `max_results` (100, counts lines, or files for files/count/find_files), `max_output_bytes` (65536), `timeout_ms` (30000, find_files 300000). `find_files` wants `exact_name`, `substring` or `glob`. `search_bytes` takes hex like `"4d5a"` or byte regex and returns JSON.
-
-globs match the WHOLE path or WHOLE filename, case-insensitive. `"*parser*"` works, `"parser.cpp"` only matches exactly `parser.cpp`. this already broke one of our tests. file types: `asm bat c cmake cpp cs css go h html java js json lua make md msbuild proto ps py rust sh sql toml ts txt xml yaml`, plus `python`, `rs`, `csharp`, `powershell`.
-
-### output
-
-```
-C:\work\src\net.cpp-41-    // reconnect
-C:\work\src\net.cpp:42:    retry_connect(socket);
---
-C:\work\src\net.cpp:97:    retry_connect(other);
-```
-
-`:` match, `-` context, `--` gap (only with context). lines over 400 bytes get cut around the match with `...`.
-
-finished clean? nothing extra printed. if results might be incomplete it says so, so your agent doesnt confidently lie about "no other usages":
-
-```
-No matches. Scanned 1,204 files in 85 ms. Roots: C:\work
-[status limit: stopped at max_results=100; more matches may exist. Narrow the search or raise max_results.]
-```
-
-| status | means |
-| --- | --- |
-| `limit` | hit `max_results` |
-| `per_file_limit` | a file had too many hits |
-| `output_limit` | hit `max_output_bytes` |
-| `partial_files` | some files unreadable or over `max_file_bytes` |
-| `timeout` / `cancelled` | stopped early, partial |
-
-`output: "json"` gives full objects (path, line, byte offsets, `pattern_id`, context) plus a `summary`.
+output is rg-style. if results might be incomplete you get one `[status ...]` line at the end so the agent doesnt lie about "no other usages".
 
 ## CLI
 
 ```powershell
 shgrep search "TODO|FIXME" -t cpp -C 2
 shgrep search -F "operator<<" --root C:\work -l
-shgrep search -e open -e close -w -c
 shgrep search_bytes --root .\dist --pattern 4d5a --include shgrep.exe
 shgrep find_files AISHITERU.mp3 --whole
 ```
 
-flags: `-F -E -i -w -e -l -c -A -B -C -N -m -t -g`, plus `--root DIR` (repeatable), `--whole` (entire drive), `--exclude`, `--extension`, `--path-filter`, `--hidden`, `--no-ignore`, `--max-results`, `--max-output-bytes`, `--timeout-ms`, `--max-file-bytes`, `--output MODE`, `--json`. no `--root` means current folder. exit codes: `0` ran, `2` bad args or broke, `3` timeout/cancel.
+flags: `-F -E -i -w -e -l -c -A -B -C -N -m -t -g --root --whole --hidden --no-ignore --json`. exit codes: `0` ran, `2` error, `3` timeout.
 
 ## how it works
 
-- one thread per logical cpu. every directory listed through one handle, no per-file metadata calls
-- respects `.gitignore` and `.ignore` (`*`, `?`, `**`, `/`, `!`). no `[...]` or backslash escapes yet
-- skips hidden stuff unless `hidden`
-- never follows junctions or symlinks. access denied folders get skipped quietly
-- files open relative to their parent folder handle, so you cant escape the root even by swapping in a junction mid-search. also way faster than the old path check
-- binary files get detected from the first 64 KiB and skipped without reading the rest. text: UTF-8, UTF-8 BOM, UTF-16 BOM. files over 64 MiB get reported as skipped (max 256 MiB)
-- all patterns compile into one hyperscan database, each file scanned once. block mode for text, 1 MiB streaming for `search_bytes`. literal compiler for literals. start-of-match tracking only when actually needed. patterns hyperscan refuses fall back to Chimera automatically. compiled databases are cached in the server, file contents and results never are
+- one thread per cpu, each folder listed with one call, files opened relative to the parent folder (fast, and cant escape the root)
+- respects `.gitignore`/`.ignore`, skips hidden, never follows symlinks/junctions
+- skips empty files and obvious binaries (`.exe .dll .png .zip ...`) without opening them, everything else gets a NUL check on the first 64 KiB
+- ASCII and valid UTF-8 files get scanned straight out of the read buffer, no copy, no decode. only UTF-16 and broken UTF-8 get decoded
+- all patterns go into one hyperscan database, every file scanned once. patterns hyperscan cant do fall back to Chimera (PCRE)
+- compiled patterns are cached in the server and on disk (`%LOCALAPPDATA%\shgrep\db-cache`, `SHGREP_DB_CACHE=0` to turn off), so the second CLI run with 100 regexes skips the compile. file contents and results are never cached
 
 ## does it work tho
 
