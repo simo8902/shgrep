@@ -1,27 +1,42 @@
 # shgrep
 
-ok so. it's grep. but it goes stupid fast. on windows. for AI agents. that's it. that's the readme. (no it's not keep scrolling)
+grep but stupid fast. windows only. made for AI agents but you can use it too i guess.
 
-it runs on **Intel Hyperscan 5.4.2**, the regex engine they built so firewalls could scan your whole internet connection without crying. we pointed it at your source code. it's a CLI AND an MCP server, one exe, zero index, zero cache. every search reads the actual bytes on disk RIGHT NOW. you edit a file, you search again, the new stuff is there. revolutionary concept apparently.
+runs on Intel Hyperscan 5.4.2 (the regex engine firewalls use). one exe, works as a CLI and as an MCP server. no index, no cache, every search reads whats actually on disk right now. you edit a file, search again, its there. wild right
 
-it acts like ripgrep / ugrep / tgrep: regex by default, `path:line:text` output, `-l -c -w -t -C` all there. you already know how to use it. you were born knowing.
+if you used rg, ug or tgrep you already know how this works. regex by default, `path:line:text` output, `-l -c -w -t -C` etc.
 
-## numbers bro
+## benchmarks
 
-80 MB of source, 6,920 files, one Ryzen 5 5600, median of 5 runs:
+my machine: Ryzen 5 5600, 12 threads, windows 11, warm cache. big folder = 80 MB, 6,920 files, median of 5 runs. small repo = this repo, 865 files. didnt test ripgrep yet, dont @ me
 
-| search | **shgrep** | ug |
+| what | shgrep | them |
 | --- | --- | --- |
-| 1 literal | **94 ms** | 412 ms |
-| 1,000 literals at once | **119 ms** | 320 ms |
-| 100 regexes at once | **191 ms** | 416 ms |
-| common regex, files only | **95 ms** | 303 ms |
+| big folder, 1 literal | **94 ms** | ug 412 ms |
+| big folder, 1 regex | **115 ms** | ug 336 ms |
+| big folder, 100 literals | **103 ms** | ug 319 ms |
+| big folder, 1000 literals | **119 ms** | ug 320 ms |
+| big folder, 100 regexes | **191 ms** | ug 416 ms |
+| big folder, common word, files only | **94 ms** | ug 240 ms |
+| big folder, common regex, files only | **95 ms** | ug 303 ms |
+| big folder, just walking dirs | **36 ms** | ug 55 ms |
+| big folder, backreference | 901 ms | ug -P 896 ms |
+| small repo, 1 literal | 56 ms | tgrep 50 ms |
+| small repo, 1 regex | 56 ms | tgrep 52 ms |
+| small repo, 40 regexes | 52 ms | tgrep 51.5 ms |
+| find 1 mp3 on all of C: | **6.2 s** | ug 24.4 s |
+| find 1 mp3 on all of C:, shgrep day one | ~5 min | lol |
+| small repo, before skipping binaries early | 895 ms | now 51 ms |
+| big folder, before relative file opens | 336 ms | now 96 ms |
+| 40 regexes, first call vs cached | 100 ms | 52 ms |
+| files ug skips that we search (Latin-1) | 63 | |
+| files ug finds that we miss | 0 | |
 
-2–4x faster than ug. 1000 patterns cost basically the same as 1. that's what hyperscan is FOR. one machine, warm cache, your mileage may vary, don't email me.
+1000 patterns cost 25 ms more than 1. thats hyperscan. ug times jumped around between runs (266 to 412 ms same search) so dont take the multipliers too serious. tgrep rows were before the relative open fix.
 
-## build it (yes you have to build it, it's C++, welcome)
+## build
 
-grab the Visual Studio 2026 Build Tools Developer PowerShell, plus CMake, Ninja, Ragel 6.9, Python, Boost headers, and OpenSSL. CMake 3.31 doesn't know VS 2026 exists yet so we use Ninja inside the MSVC environment. don't ask. it works.
+you need VS 2026 Build Tools dev powershell, CMake, Ninja, Ragel 6.9, Python, Boost headers, OpenSSL. CMake 3.31 doesnt know VS 2026 so its Ninja.
 
 ```powershell
 & 'C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools\Common7\Tools\Launch-VsDevShell.ps1' -Arch amd64 -HostArch amd64
@@ -30,47 +45,40 @@ cmake --build build-ninja --target shgrep
 cmake --install build-ninja --prefix "$PWD\dist" --component shgrep
 ```
 
-**AVX2 by default** (`-DSHGREP_HS_ARCH=AVX2`). got AVX-512BW? `AVX512`. computer from 2012? `SSE`, grandpa. fun fact: hyperscan's own CMake gives MSVC zero CPU flags, so a normal build quietly ships the slow SSSE3 paths and nobody tells you. we fixed it. if your CPU can't do AVX2 you get a polite error instead of a crash. we're not monsters.
+- builds hyperscan for AVX2 (`-DSHGREP_HS_ARCH=AVX2`). `AVX512` if you have it, `SSE` if your pc is ancient. hyperscan's cmake gives MSVC no cpu flags at all so normally you get the slow path and nobody tells you. fixed. old cpu gets an error, not a crash
+- backreferences and lookaround use Chimera (hyperscan + PCRE). needs PCRE 8.41+ in `libs/pcre-8.45/` or `-DSHGREP_PCRE_SOURCE=DIR`. no PCRE = still builds, those patterns just fail
+- `libs/` has only the parts of Hyperscan 5.4.2 and PCRE 8.45 the build needs, plus small cmake fixes marked `COMPAT`
+- ship `dist/shgrep.exe` alone, everything is static. `shgrep.exe --license` for the hyperscan license
 
-**backreferences and lookaround** go through **Chimera**, hyperscan's secret hyperscan+PCRE hybrid that nobody uses. it builds when PCRE 8.41+ source sits at `libs/pcre-8.45/` (or `-DSHGREP_PCRE_SOURCE=DIR`). PCRE gets built static with UTF-8, unicode properties and JIT. no PCRE? shgrep still builds, those patterns just get yelled at by hyperscan.
+## MCP
 
-`libs/` = the parts of Hyperscan 5.4.2 and PCRE 8.45 that actually build stuff, plus a few CMake fixes marked `COMPAT` so they behave on MSVC and as a subproject. docs and tests were left at home.
+run `shgrep.exe --root C:\work`. requests can narrow roots, never widen them. stdout is JSON-RPC only, logs on stderr.
 
-ship `dist/shgrep.exe`. just the exe. hyperscan and the MSVC runtime are linked static, only windows system DLLs remain. `shgrep.exe --license` prints the hyperscan license because lawyers.
-
-## MCP (the reason this exists)
-
-start it like `shgrep.exe --root C:\work`. requests can narrow the roots, never widen them. no escaping the sandbox lil bro. stdout is JSON-RPC only, logs go to stderr.
-
-| tool | use it for | rg/tgrep version |
+| tool | for | rg version |
 | --- | --- | --- |
 | `search` | text in code | `rg PATTERN` |
-| `search_bytes` | raw bytes in literally anything | — (they can't) |
-| `find_files` | files by name, never opens them | `rg --files` + filter |
+| `search_bytes` | raw bytes in any file | they cant |
+| `find_files` | files by name, never opens them | `rg --files` |
 
-`search` args, rg translation included:
-
-| arg | rg | default |
+| `search` arg | rg | default |
 | --- | --- | --- |
-| `pattern` / `patterns` | `PATTERN` / `-e` | required. many patterns = still one pass. flex. |
-| `mode: "literal"` | `-F` | `"regex"`: PCRE syntax, line anchors (^, $) work per line, backreferences and lookaround work too |
+| `pattern` / `patterns` | `PATTERN` / `-e` | required, many patterns still one pass |
+| `mode: "literal"` | `-F` | `"regex"`, PCRE syntax, ^ and $ per line, backrefs and lookaround ok |
 | `case_insensitive` | `-i` | false |
 | `word` | `-w` | false |
 | `output: "files"` / `"count"` | `-l` / `-c` | `"lines"` |
 | `context_lines` / `before_lines` / `after_lines` | `-C` / `-B` / `-A` | 0 |
 | `line_numbers: false` | `-N` | true |
-| `types` | `-t` | everything |
-| `include` / `exclude` | `-g` / `-g !` | — |
-| `max_matches_per_file` | `-m` | 20 matching lines |
+| `types` | `-t` | all |
+| `include` / `exclude` | `-g` / `-g !` | none |
+| `max_matches_per_file` | `-m` | 20 lines |
 | `hidden`, `no_ignore` | `--hidden`, `--no-ignore` | false |
 
-every tool also takes `roots`, `extensions`, `path_filter`, `max_results` (default 100; counts matching lines for lines output, files for files/count/find_files), `max_output_bytes` (default 65536), `timeout_ms` (default 30000, `find_files` gets 300000). `find_files` wants `exact_name`, `substring`, or `glob`. `search_bytes` eats hex literals (`"4d5a"`) or byte regexes and spits JSON.
+all tools also take `roots`, `extensions`, `path_filter`, `max_results` (100, counts lines, or files for files/count/find_files), `max_output_bytes` (65536), `timeout_ms` (30000, find_files 300000). `find_files` wants `exact_name`, `substring` or `glob`. `search_bytes` takes hex like `"4d5a"` or byte regex and returns JSON.
 
-globs are case-insensitive and match the WHOLE path or WHOLE filename. `"*parser*"` works. `"parser.cpp"` matches exactly `parser.cpp` and nothing else. this has already burned one test. don't be the second. file types: `asm bat c cmake cpp cs css go h html java js json lua make md msbuild proto ps py rust sh sql toml ts txt xml yaml`, plus aliases like `python`, `rs`, `csharp`, `powershell`.
+globs match the WHOLE path or WHOLE filename, case-insensitive. `"*parser*"` works, `"parser.cpp"` only matches exactly `parser.cpp`. this already broke one of our tests. file types: `asm bat c cmake cpp cs css go h html java js json lua make md msbuild proto ps py rust sh sql toml ts txt xml yaml`, plus `python`, `rs`, `csharp`, `powershell`.
 
-### what comes out
-
-default `lines` output, same shape rg uses, you'll feel at home:
+### output
 
 ```
 C:\work\src\net.cpp-41-    // reconnect
@@ -79,28 +87,26 @@ C:\work\src\net.cpp:42:    retry_connect(socket);
 C:\work\src\net.cpp:97:    retry_connect(other);
 ```
 
-`:` = match, `-` = context, `--` = gap (only when you asked for context). lines over 400 bytes get chopped around the match with `...` because nobody needs your minified JS.
+`:` match, `-` context, `--` gap (only with context). lines over 400 bytes get cut around the match with `...`.
 
-search finished clean with results? it prints NOTHING extra. like a real grep. if the list might be incomplete it TELLS you, so your agent doesn't hallucinate "there are no other usages" lmao:
+finished clean? nothing extra printed. if results might be incomplete it says so, so your agent doesnt confidently lie about "no other usages":
 
 ```
 No matches. Scanned 1,204 files in 85 ms. Roots: C:\work
 [status limit: stopped at max_results=100; more matches may exist. Narrow the search or raise max_results.]
 ```
 
-| status | translation |
+| status | means |
 | --- | --- |
-| `limit` | hit `max_results`, there's more |
-| `per_file_limit` | one file had too many hits |
+| `limit` | hit `max_results` |
+| `per_file_limit` | a file had too many hits |
 | `output_limit` | hit `max_output_bytes` |
-| `partial_files` | some files were unreadable or too fat (`max_file_bytes`) |
-| `timeout` / `cancelled` | ran out of time, results are partial |
+| `partial_files` | some files unreadable or over `max_file_bytes` |
+| `timeout` / `cancelled` | stopped early, partial |
 
-`output: "json"` = full objects with `results` (path, line, byte offsets, `pattern_id`, byte context), `skipped_files`, and a `summary` with the same statuses. for nerds.
+`output: "json"` gives full objects (path, line, byte offsets, `pattern_id`, context) plus a `summary`.
 
-## command line (for humans, allegedly)
-
-same flags as rg/ug. muscle memory works:
+## CLI
 
 ```powershell
 shgrep search "TODO|FIXME" -t cpp -C 2
@@ -110,26 +116,24 @@ shgrep search_bytes --root .\dist --pattern 4d5a --include shgrep.exe
 shgrep find_files AISHITERU.mp3 --whole
 ```
 
-flags: `-F` `-E` `-i` `-w` `-e` `-l` `-c` `-A` `-B` `-C` `-N` `-m` `-t` `-g`, plus `--root DIR` (stack em), `--whole` (your entire drive, go wild), `--exclude`, `--extension`, `--path-filter`, `--hidden`, `--no-ignore`, `--max-results`, `--max-output-bytes`, `--timeout-ms`, `--max-file-bytes`, `--output MODE`, `--json`. no `--root` = current folder. exit codes: `0` it ran, `2` you typed something wrong (or something broke), `3` timeout/cancel.
+flags: `-F -E -i -w -e -l -c -A -B -C -N -m -t -g`, plus `--root DIR` (repeatable), `--whole` (entire drive), `--exclude`, `--extension`, `--path-filter`, `--hidden`, `--no-ignore`, `--max-results`, `--max-output-bytes`, `--timeout-ms`, `--max-file-bytes`, `--output MODE`, `--json`. no `--root` means current folder. exit codes: `0` ran, `2` bad args or broke, `3` timeout/cancel.
 
-## how it actually works (the lore)
+## how it works
 
-- **threads:** one worker per logical CPU. all of them. every tool. each directory gets listed through one handle, names and attributes straight from the listing, zero per-file metadata calls.
-- **ignore files:** `.gitignore` and `.ignore` respected unless `no_ignore`. supports `*`, `?`, `**`, leading `/`, trailing `/`, `!`. no `[...]` classes or backslash escapes yet. it's on the list. the list is long.
-- **hidden stuff** (leading `.` or the windows hidden attribute) is skipped unless `hidden`.
-- **reparse points** (junctions, symlinks, the cursed ones) are never followed. folders that deny access get skipped quietly, other failures count as file errors.
-- **sandbox:** under each root, files and folders open by name RELATIVE to the parent's handle without following reparse points. you can't sneak out even if you swap a junction in mid-search. we tried. also it's faster: the old per-file path check cost ~30 µs a pop and choked on threads.
-- **binary files:** `search` sniffs the first 64 KiB for NUL bytes and bails without reading the rest. text gets decoded: UTF-8, UTF-8 BOM, UTF-16 BOM. broken UTF-8 gets patched up. text files over `max_file_bytes` (64 MiB default, max 256 MiB) get reported as skipped.
-- **hyperscan, done right:** all patterns go into one database, each file gets scanned once. text uses block mode, `search_bytes` streams 1 MiB chunks (matches across chunk edges still found). literals use hyperscan's literal compiler. start-of-match tracking only turns on when needed (json output, or `word` + regex) because it's expensive. regexes hyperscan refuses (backreferences, lookaround, `\b` in unicode mode) quietly fall over to Chimera, which prefilters with hyperscan and confirms with JIT PCRE. slower, but it works. compiled databases get cached in the server process. never file contents. never results. freshness or death.
+- one thread per logical cpu. every directory listed through one handle, no per-file metadata calls
+- respects `.gitignore` and `.ignore` (`*`, `?`, `**`, `/`, `!`). no `[...]` or backslash escapes yet
+- skips hidden stuff unless `hidden`
+- never follows junctions or symlinks. access denied folders get skipped quietly
+- files open relative to their parent folder handle, so you cant escape the root even by swapping in a junction mid-search. also way faster than the old path check
+- binary files get detected from the first 64 KiB and skipped without reading the rest. text: UTF-8, UTF-8 BOM, UTF-16 BOM. files over 64 MiB get reported as skipped (max 256 MiB)
+- all patterns compile into one hyperscan database, each file scanned once. block mode for text, 1 MiB streaming for `search_bytes`. literal compiler for literals. start-of-match tracking only when actually needed. patterns hyperscan refuses fall back to Chimera automatically. compiled databases are cached in the server, file contents and results never are
 
-## does it work tho 
+## does it work tho
 
 no one knows
 
-## want to flex on ug yourself:
+## flex on ug yourself
 
 ```powershell
 python tests/bench.py "C:\path\to\big\folder" --runs 5
 ```
-
-that's it. go search something.
