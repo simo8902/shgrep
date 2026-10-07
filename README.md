@@ -6,7 +6,7 @@ works like rg: regex by default, `path:line:text`, `-l -c -w -t -C`.
 
 ## benchmarks
 
-Ryzen 5 5600, windows 11, warm cache, median of 5. big = 80 MB, 6,920 files. small = this repo. same skip rules for everyone. tgrep idx = tgrep with its trigram index (built in 0.9 s big / 0.15 s small, can go stale). rerun with `tests/bench.py`.
+Ryzen 5 5600, windows 11, warm cache, median of 5. big = 80 MB, 6,920 files. small = this repo. same skip rules for everyone. tgrep idx = tgrep with its trigram index (built in 0.9 s big / 0.15 s small, can go stale). rerun with `src/tests/bench.py`.
 
 | test | **shgrep** | rg 15.1 | ug | tgrep | tgrep idx |
 | --- | --- | --- | --- | --- | --- |
@@ -44,8 +44,8 @@ cmake --install build-ninja --prefix "$PWD\dist" --component shgrep
 ```
 
 - hyperscan built for AVX2 (`-DSHGREP_HS_ARCH=AVX2|AVX512|SSE`). old cpu = error, not crash
-- backreferences/lookaround via Chimera, needs PCRE 8.41+ in `libs/pcre-8.45/`
-- `libs/` = only the parts of Hyperscan 5.4.2 and PCRE 8.45 the build needs
+- backreferences/lookaround via PCRE2 JIT (same engine as `rg -P`), source in `libs/pcre2-10.49/`
+- `libs/` = only the parts of Hyperscan 5.4.2 and PCRE2 10.49 the build needs
 - ship `dist/shgrep.exe` alone, its all static
 
 ## MCP
@@ -73,7 +73,7 @@ flags: `-F -E -i -w -e -l -c -A -B -C -N -m -t -g --root --whole --hidden --no-i
 - respects `.gitignore`/`.ignore`, skips hidden, never follows symlinks/junctions
 - skips empty files and obvious binaries (`.exe .dll .png .zip ...`) without opening them, everything else gets a NUL check on the first 64 KiB
 - ASCII and valid UTF-8 files get scanned straight out of the read buffer, no copy, no decode. only UTF-16 and broken UTF-8 get decoded
-- all patterns go into one hyperscan database, every file scanned once. patterns hyperscan cant do fall back to Chimera (PCRE)
+- all patterns go into one hyperscan database, every file scanned once. patterns hyperscan cant do fall back to PCRE2 JIT
 - compiled patterns are cached in the server and on disk (`%LOCALAPPDATA%\shgrep\db-cache`, `SHGREP_DB_CACHE=0` to turn off), so the second CLI run with 100 regexes skips the compile. file contents and results are never cached
 
 ## does it work tho
@@ -83,5 +83,5 @@ no one knows
 ## flex on ug yourself
 
 ```powershell
-python tests/bench.py "C:\path\to\big\folder" --runs 5
+python src/tests/bench.py "C:\path\to\big\folder" --runs 5
 ```

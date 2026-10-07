@@ -69,7 +69,7 @@ def main():
             assert anchored == f"{source}:2:other line\n", anchored
             cached = tool_text("search", {"pattern": "^other", "include": ["*source.cpp"]}, 30)
             assert cached == anchored, cached
-            # PCRE-only syntax falls back to Chimera.
+            # PCRE-only syntax falls back to PCRE2 JIT.
             first = f"{source}:1:first needle\n"
             second = f"{source}:2:other line\n"
             for request_id, pattern, expected in [(31, r"(e)\1", first), (32, r"first(?= needle)", first),

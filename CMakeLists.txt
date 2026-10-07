@@ -5,7 +5,7 @@ if(NOT WIN32 OR NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
     message(FATAL_ERROR "shgrep requires native Windows x64")
 endif()
 
-# The distributable executable links both project code and Hyperscan to the static MSVC runtime.
+# The distributable executable links project code, Hyperscan and PCRE2 to the static MSVC runtime.
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
 
@@ -25,26 +25,14 @@ if(NOT SHGREP_HS_ARCH STREQUAL "${SHGREP_HS_ARCH_CONFIGURED}")
     unset(HAVE_AVX512VBMI CACHE)
     set(SHGREP_HS_ARCH_CONFIGURED "${SHGREP_HS_ARCH}" CACHE INTERNAL "")
 endif()
-# Chimera (Hyperscan prefilter + PCRE confirmation) adds backreferences, lookaround and other PCRE-only syntax to
-# text search. It builds when PCRE 8.41+ source is present; Hyperscan's pcre.cmake builds it statically.
+# Chimera (Hyperscan + PCRE1) is no longer used; PCRE2 is linked directly below. Clear PCRE1 settings an older
+# configure may have cached, or Hyperscan's pcre.cmake would still try to build the removed PCRE1 tree.
+unset(PCRE_SOURCE CACHE)
+unset(SHGREP_PCRE_SOURCE CACHE)
+unset(CORRECT_PCRE_VERSION CACHE)
+unset(PCRE_CHECKED CACHE)
+
 set(SHGREP_HYPERSCAN_DIR "${CMAKE_CURRENT_SOURCE_DIR}/libs/hyperscan-5.4.2")
-set(SHGREP_DEFAULT_PCRE_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/libs/pcre-8.45")
-set(SHGREP_PCRE_SOURCE "${SHGREP_DEFAULT_PCRE_SOURCE}" CACHE PATH "PCRE 8.41+ source tree for Chimera")
-# A cached path from before the move to libs/ would silently disable Chimera; fall back to the default.
-if(NOT EXISTS "${SHGREP_PCRE_SOURCE}/pcre.h.generic" AND EXISTS "${SHGREP_DEFAULT_PCRE_SOURCE}/pcre.h.generic")
-    set(SHGREP_PCRE_SOURCE "${SHGREP_DEFAULT_PCRE_SOURCE}" CACHE PATH "PCRE 8.41+ source tree for Chimera" FORCE)
-endif()
-if(EXISTS "${SHGREP_PCRE_SOURCE}/pcre.h.generic")
-    set(PCRE_SOURCE "${SHGREP_PCRE_SOURCE}" CACHE PATH "" FORCE)
-    set(PCRE_SUPPORT_UTF ON CACHE BOOL "" FORCE)
-    set(PCRE_SUPPORT_UNICODE_PROPERTIES ON CACHE BOOL "" FORCE)
-    # PERF: Chimera studies every pattern with PCRE_STUDY_JIT_COMPILE.
-    set(PCRE_SUPPORT_JIT ON CACHE BOOL "" FORCE)
-    set(PCRE_STATIC_RUNTIME ON CACHE BOOL "" FORCE)
-    set(PCRE_BUILD_PCRECPP OFF CACHE BOOL "" FORCE)
-    set(PCRE_BUILD_PCREGREP OFF CACHE BOOL "" FORCE)
-    set(PCRE_BUILD_TESTS OFF CACHE BOOL "" FORCE)
-endif()
 set(SHGREP_SAVED_C_FLAGS "${CMAKE_C_FLAGS}")
 set(SHGREP_SAVED_CXX_FLAGS "${CMAKE_CXX_FLAGS}")
 if(MSVC AND SHGREP_HS_ARCH STREQUAL "AVX2")
@@ -58,6 +46,22 @@ add_subdirectory("${SHGREP_HYPERSCAN_DIR}" hyperscan-5.4.2 EXCLUDE_FROM_ALL)
 set(CMAKE_C_FLAGS "${SHGREP_SAVED_C_FLAGS}")
 set(CMAKE_CXX_FLAGS "${SHGREP_SAVED_CXX_FLAGS}")
 
+# PCRE2 with JIT runs the patterns Hyperscan rejects (backreferences, lookaround, \b in Unicode mode). It is the
+# engine ripgrep uses for -P. Built statically, 8-bit only, with Unicode support; no tools or tests.
+set(SHGREP_PCRE2_DIR "${CMAKE_CURRENT_SOURCE_DIR}/libs/pcre2-10.49" CACHE PATH "PCRE2 source tree")
+if(EXISTS "${SHGREP_PCRE2_DIR}/CMakeLists.txt")
+    set(BUILD_STATIC_LIBS ON CACHE BOOL "" FORCE)
+    set(PCRE2_BUILD_PCRE2_8 ON CACHE BOOL "" FORCE)
+    set(PCRE2_BUILD_PCRE2_16 OFF CACHE BOOL "" FORCE)
+    set(PCRE2_BUILD_PCRE2_32 OFF CACHE BOOL "" FORCE)
+    set(PCRE2_SUPPORT_JIT ON CACHE BOOL "" FORCE)
+    set(PCRE2_SUPPORT_UNICODE ON CACHE BOOL "" FORCE)
+    set(PCRE2_BUILD_PCRE2GREP OFF CACHE BOOL "" FORCE)
+    set(PCRE2_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+    set(PCRE2_SHOW_REPORT OFF CACHE BOOL "" FORCE)
+    add_subdirectory("${SHGREP_PCRE2_DIR}" pcre2 EXCLUDE_FROM_ALL)
+endif()
+
 file(READ "${SHGREP_HYPERSCAN_DIR}/COPYING" HYPERSCAN_LICENSE_TEXT)
 file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/generated")
 configure_file(src/license.hpp.in "${CMAKE_CURRENT_BINARY_DIR}/generated/license.hpp" @ONLY)
@@ -67,12 +71,11 @@ target_compile_features(shgrep PRIVATE cxx_std_20)
 target_include_directories(shgrep PRIVATE "${SHGREP_HYPERSCAN_DIR}/src" "${CMAKE_CURRENT_BINARY_DIR}/generated")
 # ntdll provides NtCreateFile for opening entries relative to their parent directory handle.
 target_link_libraries(shgrep PRIVATE hs ntdll)
-if(TARGET chimera)
-    target_link_libraries(shgrep PRIVATE chimera pcre)
-    target_include_directories(shgrep PRIVATE "${SHGREP_HYPERSCAN_DIR}/chimera")
-    target_compile_definitions(shgrep PRIVATE SHGREP_CHIMERA)
+if(TARGET pcre2-8-static)
+    target_link_libraries(shgrep PRIVATE pcre2-8-static)
+    target_compile_definitions(shgrep PRIVATE SHGREP_PCRE2 PCRE2_CODE_UNIT_WIDTH=8)
 else()
-    message(STATUS "shgrep: PCRE source not found at ${SHGREP_PCRE_SOURCE}; building without backreference/lookaround support")
+    message(STATUS "shgrep: PCRE2 not found at ${SHGREP_PCRE2_DIR}; building without backreference/lookaround support")
 endif()
 target_compile_definitions(shgrep PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
 if(NOT SHGREP_HS_ARCH STREQUAL "SSE")

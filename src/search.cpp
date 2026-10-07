@@ -4,8 +4,8 @@
 #include <winternl.h>
 #include <intrin.h>
 #include <hs.h>
-#if defined(SHGREP_CHIMERA)
-#include <ch.h>
+#if defined(SHGREP_PCRE2)
+#include <pcre2.h>
 #endif
 
 #include <algorithm>
@@ -703,17 +703,16 @@ struct Database {
     hs_scratch_t* scratch = nullptr; // prototype for hs_clone_scratch; never scanned with
     bool som = false, stream = false;
     std::vector<uint32_t> lengths;   // literal byte lengths by pattern id; empty for regex databases
-#if defined(SHGREP_CHIMERA)
-    // Set instead of db when Hyperscan rejected a text regex and Chimera accepted it.
-    ch_database_t* chimera = nullptr;
-    ch_scratch_t* chimera_scratch = nullptr; // prototype for ch_clone_scratch; never scanned with
+#if defined(SHGREP_PCRE2)
+    // Set instead of db when Hyperscan rejected a text regex and PCRE2 accepted it: one code per pattern.
+    std::vector<pcre2_code*> pcre;
+    std::vector<bool> pcre_jit;
 #endif
     ~Database() {
         if (scratch) hs_free_scratch(scratch);
         if (db) hs_free_database(db);
-#if defined(SHGREP_CHIMERA)
-        if (chimera_scratch) ch_free_scratch(chimera_scratch);
-        if (chimera) ch_free_database(chimera);
+#if defined(SHGREP_PCRE2)
+        for (pcre2_code* code : pcre) pcre2_code_free(code);
 #endif
     }
     Database(const Database&) = delete;
@@ -765,12 +764,12 @@ struct Database {
             if (error && error->expression >= 0) message = "pattern " + std::to_string(error->expression) + ": " + message;
             if (error) hs_free_compile_error(error);
             db = nullptr;
-#if defined(SHGREP_CHIMERA)
+#if defined(SHGREP_PCRE2)
             // CONTRACT: text regexes that Hyperscan rejects (backreferences, lookaround, \b under UCP, other
-            // PCRE-only syntax) fall back to Chimera: Hyperscan prefilter plus PCRE confirmation, block mode only.
-            // If PCRE rejects the pattern too, its message is reported.
+            // PCRE-only syntax) fall back to PCRE2 JIT, the engine ripgrep uses for -P. If PCRE2 rejects the
+            // pattern too, its message is reported.
             if (spec.regex && !spec.binary) {
-                compile_chimera(spec);
+                compile_pcre(spec);
                 return;
             }
 #endif
@@ -785,32 +784,29 @@ struct Database {
         }
     }
 
-#if defined(SHGREP_CHIMERA)
-    void compile_chimera(const CompileSpec& spec) {
-        const unsigned flags = CH_FLAG_UTF8 | CH_FLAG_UCP | CH_FLAG_MULTILINE | (spec.insensitive ? CH_FLAG_CASELESS : 0);
-        const auto count = static_cast<unsigned>(spec.patterns.size());
-        std::vector<const char*> ptrs;
-        std::vector<unsigned> pattern_flags(count, flags), ids(count);
-        for (unsigned i = 0; i < count; ++i) {
-            ptrs.push_back(spec.patterns[i].c_str());
-            ids[i] = i;
+#if defined(SHGREP_PCRE2)
+    void compile_pcre(const CompileSpec& spec) {
+        // CONTRACT: same line-oriented semantics as the Hyperscan path: UTF-8 with Unicode properties, ^ and $ at
+        // every line, '.' never crossing '\n'.
+        const uint32_t options = PCRE2_UTF | PCRE2_UCP | PCRE2_MULTILINE | (spec.insensitive ? PCRE2_CASELESS : 0);
+        for (size_t i = 0; i < spec.patterns.size(); ++i) {
+            int code = 0;
+            PCRE2_SIZE offset = 0;
+            pcre2_code* compiled = pcre2_compile(reinterpret_cast<PCRE2_SPTR>(spec.patterns[i].data()),
+                                                 spec.patterns[i].size(), options, &code, &offset, nullptr);
+            if (!compiled) {
+                for (pcre2_code* earlier : pcre) pcre2_code_free(earlier);
+                pcre.clear();
+                PCRE2_UCHAR message[256] = {};
+                pcre2_get_error_message(code, message, sizeof(message));
+                throw std::runtime_error("pattern " + std::to_string(i) + ": " +
+                                         reinterpret_cast<const char*>(message) + " at offset " + std::to_string(offset));
+            }
+            pcre.push_back(compiled);
+            // PERF: JIT-compile the complete-match path; a pattern JIT cannot handle runs on the interpreter.
+            pcre_jit.push_back(pcre2_jit_compile(compiled, PCRE2_JIT_COMPLETE) == 0);
         }
-        ch_compile_error_t* error = nullptr;
-        if (ch_compile_multi(ptrs.data(), pattern_flags.data(), ids.data(), count, CH_MODE_NOGROUPS, nullptr,
-                             &chimera, &error) != CH_SUCCESS) {
-            std::string message = error && error->message ? error->message : "Chimera compilation failed";
-            if (error && error->expression >= 0) message = "pattern " + std::to_string(error->expression) + ": " + message;
-            if (error) ch_free_compile_error(error);
-            chimera = nullptr;
-            throw std::runtime_error(message);
-        }
-        if (error) ch_free_compile_error(error);
-        if (ch_alloc_scratch(chimera, &chimera_scratch) != CH_SUCCESS) {
-            ch_free_database(chimera);
-            chimera = nullptr;
-            throw std::runtime_error("Chimera scratch allocation failed");
-        }
-        // Chimera always reports PCRE start and end offsets.
+        // PCRE2 always reports exact start and end offsets.
         som = true;
         lengths.clear();
     }
@@ -859,7 +855,7 @@ struct Collector {
     const std::vector<uint32_t>* lengths = nullptr;
     // Lines output keeps the first match per line, so max_per_file and max_results count lines like rg -m.
     bool per_line = false;
-    // Set when PCRE (Chimera) hit its match or recursion limit, so the file was not fully searched.
+    // Set when PCRE2 hit its match, depth or JIT stack limit, so the file was not fully searched.
     bool pcre_limit = false;
     std::string_view text;
     uint64_t line_end = 0, lines = 0;
@@ -900,18 +896,6 @@ struct Collector {
     }
 };
 
-#if defined(SHGREP_CHIMERA)
-ch_callback_t HS_CDECL chimera_match(unsigned int id, unsigned long long from, unsigned long long to, unsigned int,
-                                     unsigned int, const ch_capture_t*, void* context) {
-    return Collector::callback(id, from, to, 0, context) ? CH_CALLBACK_TERMINATE : CH_CALLBACK_CONTINUE;
-}
-
-// PCRE hit its match or recursion limit: record the file as incompletely searched and skip that pattern.
-ch_callback_t HS_CDECL chimera_error(ch_error_event_t, unsigned int, void*, void* context) {
-    static_cast<Collector*>(context)->pcre_limit = true;
-    return CH_CALLBACK_SKIP_PATTERN;
-}
-#endif
 bool seek(HANDLE h, uint64_t offset) {
     LARGE_INTEGER pos; pos.QuadPart = static_cast<LONGLONG>(offset);
     return SetFilePointerEx(h, pos, nullptr, FILE_BEGIN) != 0;
@@ -1229,16 +1213,21 @@ struct Worker {
         }
     }
     hs_scratch_t* scratch = nullptr;
-#if defined(SHGREP_CHIMERA)
-    ch_scratch_t* chimera_scratch = nullptr;
+#if defined(SHGREP_PCRE2)
+    // Worker-local PCRE2 state, created on first use.
+    pcre2_match_data* pcre_match = nullptr;
+    pcre2_match_context* pcre_context = nullptr;
+    pcre2_jit_stack* pcre_stack = nullptr;
 #endif
     Worker() = default;
     Worker(const Worker&) = delete;
     Worker& operator=(const Worker&) = delete;
     ~Worker() {
         if (scratch) hs_free_scratch(scratch);
-#if defined(SHGREP_CHIMERA)
-        if (chimera_scratch) ch_free_scratch(chimera_scratch);
+#if defined(SHGREP_PCRE2)
+        if (pcre_match) pcre2_match_data_free(pcre_match);
+        if (pcre_context) pcre2_match_context_free(pcre_context);
+        if (pcre_stack) pcre2_jit_stack_free(pcre_stack);
 #endif
     }
 };
@@ -1371,6 +1360,62 @@ struct TextView {
     uint64_t raw_offset(uint64_t at, bool end) const { return decoded ? decoded->raw_offset(at, end) : bom + at; }
 };
 
+#if defined(SHGREP_PCRE2)
+// Runs the PCRE2 fallback over one file and feeds matches to the collector in end-offset order, as Hyperscan
+// would. Lines and count output need only the first match on a line, so the search jumps to the next line after
+// each match; json output keeps every match up to the per-file limit. The full subject is always passed with a
+// start offset, so lookbehind still sees text before the starting point.
+void pcre_scan(const Database& db, Worker& w, std::string_view text, Collector& c, bool files_only) {
+    if (!w.pcre_match) {
+        w.pcre_match = pcre2_match_data_create(1, nullptr);
+        w.pcre_context = pcre2_match_context_create(nullptr);
+        // PERF: the default 32 KiB JIT stack fails on deep patterns; let it grow up to 8 MiB per worker.
+        w.pcre_stack = pcre2_jit_stack_create(32 * 1024, 8 * 1024 * 1024, nullptr);
+        if (!w.pcre_match || !w.pcre_context || !w.pcre_stack) throw std::runtime_error("PCRE2 allocation failed");
+        pcre2_jit_stack_assign(w.pcre_context, nullptr, w.pcre_stack);
+    }
+    const auto subject = reinterpret_cast<PCRE2_SPTR>(text.data());
+    const PCRE2_SIZE length = text.size();
+    const bool first_per_line = c.per_line || c.count_only;
+    const size_t cap = files_only ? 1 : first_per_line ? SIZE_MAX : static_cast<size_t>(c.max_per_file) + 1;
+    std::vector<Event> events;
+    for (size_t id = 0; id < db.pcre.size(); ++id) {
+        size_t kept = 0;
+        for (PCRE2_SIZE offset = 0; offset <= length && kept < cap;) {
+            // CONTRACT: text reaching here is valid UTF-8 (validated or decoded), so UTF checks are skipped.
+            const int rc = db.pcre_jit[id]
+                ? pcre2_jit_match(db.pcre[id], subject, length, offset, 0, w.pcre_match, w.pcre_context)
+                : pcre2_match(db.pcre[id], subject, length, offset, PCRE2_NO_UTF_CHECK, w.pcre_match, w.pcre_context);
+            if (rc == PCRE2_ERROR_NOMATCH) break;
+            if (rc < 0) {
+                c.pcre_limit = true;
+                break;
+            }
+            const PCRE2_SIZE* ovector = pcre2_get_ovector_pointer(w.pcre_match);
+            const PCRE2_SIZE from = std::min(ovector[0], ovector[1]), to = ovector[1];
+            events.push_back({static_cast<unsigned>(id), from, to});
+            ++kept;
+            if (first_per_line) {
+                const size_t newline = text.find('\n', from);
+                if (newline == std::string_view::npos) break;
+                offset = newline + 1;
+            } else if (to > offset) {
+                offset = to;
+            } else {
+                // Empty match: step over one UTF-8 character.
+                offset = to + 1;
+                while (offset < length && (static_cast<unsigned char>(text[offset]) & 0xc0) == 0x80) ++offset;
+            }
+        }
+    }
+    std::sort(events.begin(), events.end(), [](const Event& a, const Event& b) {
+        return a.to != b.to ? a.to < b.to : a.from < b.from;
+    });
+    for (const Event& event : events)
+        if (Collector::callback(event.id, event.from, event.to, 0, &c)) break;
+}
+#endif
+
 void scan_text(const ScanShared& s, Worker& w, HANDLE h, uint64_t file_size, const std::string& display,
                uint32_t remaining, std::string& file_state, std::vector<Candidate>& items) {
     const Request& r = s.r;
@@ -1480,11 +1525,9 @@ void scan_text(const ScanShared& s, Worker& w, HANDLE h, uint64_t file_size, con
     // PERF: the decoded file is one contiguous buffer, so block mode applies: no stream state, and end-anchored
     // patterns are resolved in the same call.
     collect.per_line = r.output == "lines";
-#if defined(SHGREP_CHIMERA)
-    if (s.database->chimera) {
-        ch_error_t rc = ch_scan(s.database->chimera, view.text.data(), static_cast<unsigned>(view.text.size()), 0,
-                                w.chimera_scratch, chimera_match, chimera_error, &collect);
-        if (rc != CH_SUCCESS && rc != CH_SCAN_TERMINATED) throw std::runtime_error("Chimera text scan failed");
+#if defined(SHGREP_PCRE2)
+    if (!s.database->pcre.empty()) {
+        pcre_scan(*s.database, w, view.text, collect, files_only);
         if (collect.pcre_limit) ++out.errors;
     } else
 #endif
@@ -2002,12 +2045,8 @@ Json run_tool(const std::string& name, const Json& arguments,
         auto worker = std::make_unique<Worker>();
         if (database) {
             worker->buffer.resize(1 << 20);
-            bool cloned = false;
-#if defined(SHGREP_CHIMERA)
-            if (database->chimera) cloned = ch_clone_scratch(database->chimera_scratch, &worker->chimera_scratch) == CH_SUCCESS;
-            else
-#endif
-            cloned = hs_clone_scratch(database->scratch, &worker->scratch) == HS_SUCCESS;
+            // PCRE2 databases have no Hyperscan scratch; their match state is created per worker on first use.
+            const bool cloned = !database->db || hs_clone_scratch(database->scratch, &worker->scratch) == HS_SUCCESS;
             if (!cloned) throw std::runtime_error("scratch allocation failed");
         }
         workers.push_back(std::move(worker));
@@ -2143,7 +2182,7 @@ Json tool_definitions() {
     search_props.emplace("mode", choice(Json::Array{"regex", "literal"},
         "Default \"regex\": PCRE syntax, Unicode classes work, ^ and $ match at every line and '.' never crosses a "
         "newline, as in rg. Patterns run on Hyperscan; backreferences, lookaround and \\b automatically use the "
-        "Hyperscan+PCRE hybrid (Chimera), which is slower. "
+        "PCRE2 JIT engine (as rg -P does), which is slower. "
         "\"literal\" is rg -F: exact text, no escaping needed."));
     search_props.emplace("output", choice(Json::Array{"lines", "files", "count", "json"},
         "Default \"lines\": rg/tgrep style \"path:line:text\", context lines as \"path-line-text\", \"--\" between "
