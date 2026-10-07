@@ -43,7 +43,7 @@ WORKLOADS = [
 ]
 
 # Footer lines shgrep appends to text output; not results.
-FOOTER_PREFIXES = ("No matches.", "Selection:", "Skipped oversized", "[status ")
+FOOTER_PREFIXES = ("No matches.", "Selection:", "Skipped oversized", "[status ", "[profile ")
 
 
 def shgrep_cmd(exe, root, patterns, literal, files, pattern_file):
@@ -135,6 +135,12 @@ def server_args(patterns, literal, output):
             "timeout_ms": 300000}
 
 
+def profile_of(text):
+    """The trailing diagnostic line a profile=true text search ends with, or None."""
+    last = text.rstrip("\n").rsplit("\n", 1)[-1]
+    return json.loads(last[len("[profile "):-1]) if last.startswith("[profile ") else None
+
+
 def result_lines(text):
     return sum(1 for line in text.splitlines() if not line.startswith(FOOTER_PREFIXES))
 
@@ -182,6 +188,48 @@ def breakdown(args, server, first_calls):
         print(f"  {name:<26}{first_calls.get(name, float('nan')):>8.0f}{ms:>8.1f}{internal:>10}"
               f"{s['files_scanned']:>9}{s['files_skipped_binary']:>8}{s['bytes_scanned'] / 2**20:>8.0f}{rate:>7.2f}")
     print("  first = first server call for that pattern set (compiled-pattern load/compile + scan).")
+
+    rows = []
+    for name, patterns, literal, files in WORKLOADS:
+        arguments = {**server_args(patterns, literal, "files" if files else "lines"), "profile": True}
+        samples, trips = [], []
+        for _ in range(args.runs):
+            start = time.perf_counter()
+            samples.append(profile_of(server.tool("search", arguments)))
+            trips.append((time.perf_counter() - start) * 1e6)
+        if not samples[0]:
+            print("\n  (this shgrep build ignores profile; rebuild to get the per-phase split)")
+            return
+        flat = [{**{k: v for k, v in s.items() if k != "request_us"},
+                 **{f"req_{k}": v for k, v in s.get("request_us", {}).items()}, "round_trip": trip}
+                for s, trip in zip(samples, trips)]
+        rows.append((name, {key: statistics.median(s[key] for s in flat) for key in flat[0]}))
+    p = rows[0][1]
+    print(f"\n  worker time per search, ms summed over {p['workers']:.0f} workers (median of --runs)")
+    print(f"  {'workload':<26}{'opened':>7}{'list':>7}{'dirOpen':>8}{'open':>7}{'read':>7}{'scan':>7}{'close':>7}"
+          f"{'other':>7}{'idle':>7}{'busy min/max':>14}")
+    for name, p in rows:
+        ms = lambda key: p[key] / 1000
+        print(f"  {name:<26}{p['files_opened']:>7.0f}{ms('list_us'):>7.1f}{ms('dir_open_us'):>8.1f}"
+              f"{ms('file_open_us'):>7.1f}{ms('read_us'):>7.1f}{ms('scan_us'):>7.1f}{ms('close_us'):>7.1f}"
+              f"{ms('file_other_us'):>7.1f}{ms('idle_us'):>7.1f}{ms('busy_min_us'):>8.1f}/{ms('busy_max_us'):<5.1f}")
+    print("\n  per opened file, us")
+    print(f"  {'workload':<26}{'open':>7}{'read':>7}{'scan':>7}{'close':>7}{'other':>7}")
+    for name, p in rows:
+        per = lambda key: p[key] / max(p["files_opened"], 1)
+        print(f"  {name:<26}{per('file_open_us'):>7.1f}{per('read_us'):>7.1f}{per('scan_us'):>7.1f}"
+              f"{per('close_us'):>7.1f}{per('file_other_us'):>7.1f}")
+    print("  open = NtCreateFile + size check; read = ReadFile incl. binary probe; scan = UTF-8 check + engine;\n"
+          "  other = path conversion, publishing, buffer release; idle = waiting for directory work.")
+    if "req_walk" in rows[0][1]:
+        print("\n  request wall time, ms (calling thread); worker start/finish offsets from walk start")
+        print(f"  {'workload':<26}{'trip':>7}{'compile':>8}{'roots':>7}{'setup':>7}{'walk':>7}{'finish':>7}"
+              f"{'lastStart':>10}{'1stDone':>8}{'lastDone':>9}{'slowFile':>9}")
+        for name, p in rows:
+            print(f"  {name:<26}{p['round_trip'] / 1000:>7.2f}{p['req_compile'] / 1000:>8.2f}{p['req_roots'] / 1000:>7.2f}"
+                  f"{p['req_setup'] / 1000:>7.2f}{p['req_walk'] / 1000:>7.2f}{p['req_finish'] / 1000:>7.2f}"
+                  f"{p.get('last_start_us', 0) / 1000:>10.2f}{p.get('first_finish_us', 0) / 1000:>8.2f}"
+                  f"{p.get('last_finish_us', 0) / 1000:>9.2f}{p.get('slowest_file_us', 0) / 1000:>9.2f}")
 
 
 def main():

@@ -49,10 +49,12 @@ void usage() {
           "\n"
           "Output (search): path:line:text lines, like rg/ug/tgrep\n"
           "  -l, --files-with-matches Print only paths of files with a match\n"
+          "  --files-without-match    Print only paths of searched files without a match\n"
           "  -c, --count              Print path:N matching lines per file\n"
+          "  --relative               Print paths relative to the single root\n"
           "  -A/-B/-C N               Lines of context after/before/around matches (max 100)\n"
           "  -N, --no-line-number     Omit line numbers\n"
-          "  --output MODE            lines, files, count, or json\n"
+          "  --output MODE            lines, files, files_without_match, count, or json\n"
           "  --json                   Structured JSON (byte offsets, pattern ids)\n"
           "\n"
           "Matching:\n"
@@ -60,6 +62,8 @@ void usage() {
           "  -E, --regex              Hyperscan regex; byte syntax for search_bytes\n"
           "  -i, --ignore-case        Case-insensitive matching\n"
           "  -w, --word-regexp        Whole-word matches\n"
+          "  -v, --invert-match       Print lines that match no pattern\n"
+          "  -U, --multiline          Matches may span lines\n"
           "  -e, --pattern TEXT       Add a pattern; repeat to search many in one pass\n"
           "\n"
           "Selection:\n"
@@ -164,8 +168,8 @@ void print_result(const std::string& name, const Json& result, const Json& reque
                 if (auto line = entry.get("line")) output += ":" + std::to_string(line->integer());
                 else output += "@" + std::to_string(item.at("byte_start").integer());
                 output += ":";
-                if (auto context = entry.get("context")) {
-                    const std::string& source = context->string();
+                if (auto text_context = entry.get("context")) {
+                    const std::string& source = text_context->string();
                     size_t position = 0;
                     if (auto match = entry.get("context_match_start"))
                         position = static_cast<size_t>(match->integer());
@@ -181,8 +185,8 @@ void print_result(const std::string& name, const Json& result, const Json& reque
                     if (end == std::string::npos) end = source.size();
                     while (end > begin && source[end - 1] == '\r') --end;
                     output += printable_line(source, begin, end);
-                } else if (auto context = entry.get("context_hex")) {
-                    output += " hex:" + context->string();
+                } else if (auto hex_context = entry.get("context_hex")) {
+                    output += " hex:" + hex_context->string();
                 }
                 if (multiple) output += " [pattern " + std::to_string(item.at("pattern_id").integer()) + "]";
             }
@@ -253,6 +257,10 @@ int run_cli(int argc, wchar_t** argv) {
             if (option == L"--ignore-case" || option == L"-i") { args["case_insensitive"] = true; continue; }
             if (option == L"--word-regexp" || option == L"-w") { args["word"] = true; continue; }
             if (option == L"--files-with-matches" || option == L"-l") { args["output"] = "files"; continue; }
+            if (option == L"--files-without-match") { args["output"] = "files_without_match"; continue; }
+            if (option == L"--invert-match" || option == L"-v") { args["invert"] = true; continue; }
+            if (option == L"--multiline" || option == L"-U") { args["multiline"] = true; continue; }
+            if (option == L"--relative") { args["paths"] = "relative"; continue; }
             if (option == L"--count" || option == L"-c") { args["output"] = "count"; continue; }
             if (option == L"--no-line-number" || option == L"-N") { args["line_numbers"] = false; continue; }
             if (option == L"--sniff-all") { args["sniff_all"] = true; continue; }

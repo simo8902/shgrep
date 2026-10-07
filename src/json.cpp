@@ -163,30 +163,38 @@ struct Parser {
         return n;
     }
 };
+bool needs_escape(unsigned char c) { return c == '"' || c == '\\' || c < 32; }
+// PERF: runs of bytes that need no escaping are appended at once; MCP text responses are hundreds of KB.
 void escape(const std::string& s, std::string& out) {
     constexpr char hex[] = "0123456789abcdef";
+    out.reserve(out.size() + s.size() + 2);
     out.push_back('"');
-    for (unsigned char c : s) {
+    size_t run = 0;
+    for (size_t i = 0; i < s.size(); ++i) {
+        const auto c = static_cast<unsigned char>(s[i]);
+        if (!needs_escape(c)) continue;
+        out.append(s, run, i - run);
+        run = i + 1;
         if (c == '"' || c == '\\') { out.push_back('\\'); out.push_back(static_cast<char>(c)); }
-        else if (c < 32) { out += "\\u00"; out.push_back(hex[c >> 4]); out.push_back(hex[c & 15]); }
-        else out.push_back(static_cast<char>(c));
+        else { out += "\\u00"; out.push_back(hex[c >> 4]); out.push_back(hex[c & 15]); }
     }
+    out.append(s, run, s.size() - run);
     out.push_back('"');
 }
 void dump_value(const Json& j, std::string& out) {
     if (std::holds_alternative<std::nullptr_t>(j.value)) out += "null";
-    else if (auto p = std::get_if<bool>(&j.value)) out += *p ? "true" : "false";
-    else if (auto p = std::get_if<int64_t>(&j.value)) out += std::to_string(*p);
-    else if (auto p = std::get_if<double>(&j.value)) {
+    else if (auto flag = std::get_if<bool>(&j.value)) out += *flag ? "true" : "false";
+    else if (auto integer = std::get_if<int64_t>(&j.value)) out += std::to_string(*integer);
+    else if (auto number = std::get_if<double>(&j.value)) {
         char buffer[64];
-        auto [end, ec] = std::to_chars(buffer, buffer + sizeof(buffer), *p);
+        auto [end, ec] = std::to_chars(buffer, buffer + sizeof(buffer), *number);
         if (ec != std::errc{}) throw std::runtime_error("cannot serialize JSON number");
         out.append(buffer, end);
     }
-    else if (auto p = std::get_if<std::string>(&j.value)) escape(*p, out);
-    else if (auto p = std::get_if<Json::Array>(&j.value)) {
+    else if (auto text = std::get_if<std::string>(&j.value)) escape(*text, out);
+    else if (auto array = std::get_if<Json::Array>(&j.value)) {
         out.push_back('[');
-        for (const auto& v : *p) { if (&v != &p->front()) out.push_back(','); dump_value(v, out); }
+        for (const auto& v : *array) { if (&v != &array->front()) out.push_back(','); dump_value(v, out); }
         out.push_back(']');
     } else {
         out.push_back('{');
@@ -205,4 +213,12 @@ Json Json::parse(const std::string& input) {
     return result;
 }
 std::string Json::dump() const { std::string out; dump_value(*this, out); return out; }
+size_t Json::escaped_size(std::string_view s) {
+    size_t size = s.size() + 2;
+    for (unsigned char c : s) {
+        if (c == '"' || c == '\\') size += 1;
+        else if (c < 32) size += 5;
+    }
+    return size;
+}
 }

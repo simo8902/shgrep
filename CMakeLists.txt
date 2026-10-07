@@ -66,11 +66,12 @@ file(READ "${SHGREP_HYPERSCAN_DIR}/COPYING" HYPERSCAN_LICENSE_TEXT)
 file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/generated")
 configure_file(src/license.hpp.in "${CMAKE_CURRENT_BINARY_DIR}/generated/license.hpp" @ONLY)
 
-add_executable(shgrep src/main.cpp src/cli.cpp src/json.cpp src/search.cpp)
+add_executable(shgrep src/main.cpp src/cli.cpp src/json.cpp src/search.cpp src/ignore.cpp src/files.cpp)
 target_compile_features(shgrep PRIVATE cxx_std_20)
 target_include_directories(shgrep PRIVATE "${SHGREP_HYPERSCAN_DIR}/src" "${CMAKE_CURRENT_BINARY_DIR}/generated")
-# ntdll provides NtCreateFile for opening entries relative to their parent directory handle.
-target_link_libraries(shgrep PRIVATE hs ntdll)
+# ntdll provides NtCreateFile for opening entries relative to their parent directory handle; bcrypt provides the
+# SHA-256 that read_file reports and edit_file/write_file check with expected_sha256.
+target_link_libraries(shgrep PRIVATE hs ntdll bcrypt)
 if(TARGET pcre2-8-static)
     target_link_libraries(shgrep PRIVATE pcre2-8-static)
     target_compile_definitions(shgrep PRIVATE SHGREP_PCRE2 PCRE2_CODE_UNIT_WIDTH=8)

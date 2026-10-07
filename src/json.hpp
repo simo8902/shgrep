@@ -4,6 +4,7 @@
 #include <map>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -36,5 +37,7 @@ struct Json {
     const Json* get(const std::string& key) const;
     std::string dump() const;
     static Json parse(const std::string& input);
+    // Length of Json(std::string(s)).dump() without building it.
+    static size_t escaped_size(std::string_view s);
 };
 }

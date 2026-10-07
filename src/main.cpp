@@ -1,6 +1,7 @@
 #include "json.hpp"
 #include "cli.hpp"
 #include "search.hpp"
+#include "files.hpp"
 
 #include <windows.h>
 #include <fcntl.h>
@@ -20,12 +21,14 @@
 namespace {
 using shgrep::Json;
 std::mutex output_mutex;
-void send(const Json& message) {
-    std::string line = message.dump() + "\n";
+// CONTRACT: line is one serialized JSON-RPC message without its newline.
+void send_line(std::string line) {
+    line.push_back('\n');
     std::lock_guard lock(output_mutex);
     std::fwrite(line.data(), 1, line.size(), stdout);
     std::fflush(stdout);
 }
+void send(const Json& message) { send_line(message.dump()); }
 Json error(const Json& id, int code, const std::string& message) {
     return Json::Object{{"jsonrpc", "2.0"}, {"id", id},
                         {"error", Json::Object{{"code", code}, {"message", message}}}};
@@ -33,13 +36,14 @@ Json error(const Json& id, int code, const std::string& message) {
 Json success(const Json& id, Json result) {
     return Json::Object{{"jsonrpc", "2.0"}, {"id", id}, {"result", std::move(result)}};
 }
-Json tool_response(const Json& id, Json& result, uint32_t max_bytes) {
+// Returns the serialized response, so the size check and the send share one dump.
+std::string tool_response(const Json& id, Json& result, uint32_t max_bytes) {
     // CONTRACT: text output (lines/files/count) is sent as-is so agents read grep-style lines, not JSON.
     if (const Json* text = result.get("text")) {
         std::string core = text->string(), marker;
         for (;;) {
-            Json response = success(id, Json::Object{{"content", Json::Array{Json::Object{{"type", "text"}, {"text", core + marker}}}}});
-            if (response.dump().size() <= max_bytes) return response;
+            std::string response = success(id, Json::Object{{"content", Json::Array{Json::Object{{"type", "text"}, {"text", core + marker}}}}}).dump();
+            if (response.size() <= max_bytes) return response;
             if (core.empty()) throw std::runtime_error("max_output_bytes cannot hold MCP response");
             size_t cut = core.size() >= 2 ? core.rfind('\n', core.size() - 2) : std::string::npos;
             core.resize(cut == std::string::npos ? 0 : cut + 1);
@@ -47,8 +51,8 @@ Json tool_response(const Json& id, Json& result, uint32_t max_bytes) {
         }
     }
     for (;;) {
-        Json response = success(id, Json::Object{{"content", Json::Array{Json::Object{{"type", "text"}, {"text", result.dump()}}}}});
-        if (response.dump().size() <= max_bytes) return response;
+        std::string response = success(id, Json::Object{{"content", Json::Array{Json::Object{{"type", "text"}, {"text", result.dump()}}}}}).dump();
+        if (response.size() <= max_bytes) return response;
         auto& object = std::get<Json::Object>(result.value);
         auto& items = std::get<Json::Array>(object.at("results").value);
         if (items.empty()) throw std::runtime_error("max_output_bytes cannot hold MCP response");
@@ -91,13 +95,18 @@ int wmain(int argc, wchar_t** argv) {
     DWORD console_mode = 0;
     if (argc == 1 && GetConsoleMode(GetStdHandle(STD_INPUT_HANDLE), &console_mode))
         return shgrep::run_cli(argc, argv);
-    if (argc > 1 && std::wstring(argv[1]) != L"--root") return shgrep::run_cli(argc, argv);
+    if (argc > 1 && std::wstring(argv[1]) != L"--root" && std::wstring(argv[1]) != L"--read-only")
+        return shgrep::run_cli(argc, argv);
     _setmode(_fileno(stdin), _O_BINARY);
     _setmode(_fileno(stdout), _O_BINARY);
     shgrep::SearchContext context;
     for (int i = 1; i < argc; ++i) {
         if (std::wstring(argv[i]) == L"--root" && i + 1 < argc) context.allowed_roots.emplace_back(argv[++i]);
-        else { std::fprintf(stderr, "usage: shgrep [--root DIRECTORY]... for MCP; shgrep --help for CLI\n"); return 2; }
+        else if (std::wstring(argv[i]) == L"--read-only") context.read_only = true;
+        else {
+            std::fprintf(stderr, "usage: shgrep [--root DIRECTORY]... [--read-only] for MCP; shgrep --help for CLI\n");
+            return 2;
+        }
     }
     if (context.allowed_roots.empty()) context.allowed_roots.push_back(std::filesystem::current_path());
     std::mutex active_mutex;
@@ -155,12 +164,12 @@ int wmain(int argc, wchar_t** argv) {
                                               {"capabilities", Json::Object{{"tools", Json::Object{}}}},
                                               {"serverInfo", Json::Object{{"name", "shgrep"}, {"version", "0.1.0"}}}}));
             } else if (name == "ping") send(success(id, Json::Object{}));
-            else if (name == "tools/list") send(success(id, Json::Object{{"tools", shgrep::tool_definitions()}}));
+            else if (name == "tools/list") send(success(id, Json::Object{{"tools", shgrep::tool_list(context)}}));
             else if (name == "tools/call") {
                 const Json* params = request.get("params");
                 if (!params || !params->get("name")) { send(error(id, -32602, "tool name required")); continue; }
                 std::string tool_name = params->get("name")->string();
-                if (tool_name != "search" && tool_name != "search_bytes" && tool_name != "find_files") {
+                if (!shgrep::tool_available(tool_name, context)) {
                     send(error(id, -32602, "unknown tool")); continue;
                 }
                 Json arguments = params->get("arguments") ? *params->get("arguments") : Json::Object{};
@@ -173,14 +182,17 @@ int wmain(int argc, wchar_t** argv) {
                     active.emplace(key, flag);
                 }
                 try { tasks.push_back(std::async(std::launch::async, [&, id, tool_name, arguments, flag, key] {
-                    uint32_t max_bytes = 65536;
+                    // CONTRACT: read_file returns whole files unless asked otherwise, so its cap defaults to its maximum.
+                    const bool whole_file = tool_name == "read_file";
+                    const uint32_t ceiling = whole_file ? shgrep::read_file_max_output : 1048576;
+                    uint32_t max_bytes = whole_file ? ceiling : 65536;
                     try {
                         if (const Json* limit = arguments.get("max_output_bytes")) {
                             int64_t requested = limit->integer();
-                            if (requested >= 512 && requested <= 1048576) max_bytes = static_cast<uint32_t>(requested);
+                            if (requested >= 512 && requested <= ceiling) max_bytes = static_cast<uint32_t>(requested);
                         }
                         Json result = shgrep::run_tool(tool_name, arguments, context, flag);
-                        send(tool_response(id, result, max_bytes));
+                        send_line(tool_response(id, result, max_bytes));
                     } catch (const std::exception& e) {
                         send(tool_error_response(id, e.what(), max_bytes));
                     }

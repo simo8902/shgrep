@@ -50,9 +50,18 @@ cmake --install build-ninja --prefix "$PWD\dist" --component shgrep
 
 ## MCP
 
-`shgrep.exe --root C:\work`. tools: `search` (text), `search_bytes` (hex/raw bytes), `find_files` (names only, never opens files).
+`shgrep.exe --root C:\work`. tools: `search` (text), `search_bytes` (hex/raw bytes), `find_files` (names only, never opens files), plus file tools:
 
-main `search` args: `pattern`/`patterns`, `mode` (`regex` default, `literal` = `-F`), `case_insensitive`, `word`, `output` (`lines`, `files`, `count`, `json`), `context_lines`/`before_lines`/`after_lines`, `types`, `include`/`exclude` (globs must match the WHOLE name or path, so use `*parser*` not `parser`), `max_results` (100), `max_matches_per_file` (20), `hidden`, `no_ignore`, `sniff_all`.
+- `read_file`: whole file by default, exact contents with `     42→text` line numbers, optional `offset`/`limit`, several files via `paths`. header says encoding (utf-8, utf-8-bom, utf-16le/be), line endings (lf/crlf/mixed), final newline, mtime, sha256. no line cutting. binary files refused (use `search_bytes`). hidden and gitignored files are readable when you name them
+- `list_dir`: files AND folders (`d sub/`, `f name SIZE`, `l link`), `depth`. lists everything, hidden and gitignored included; `hidden: false` / `no_ignore: false` filter like search
+- `file_info`: size, mtime, type, binary or not, lines, encoding, line endings, sha256
+- `edit_file`: exact-string replace, `edits: [{old_text, new_text, replace_all}]`. must match once unless `replace_all`. all edits or none, atomic (temp file + rename), LF old_text works on CRLF files, keeps encoding/BOM, returns a unified diff. `dry_run`, `expected_sha256`/`expected_mtime` guards
+- `write_file`: create or (with `overwrite: true`) replace, makes parent folders, atomic, `line_endings`/`encoding` default to the replaced file's
+- `move_file`, `create_directory`
+
+file tool paths are relative to the first `--root` or absolute inside a root. `..` cant leave the root, and a symlink/junction anywhere below the root is refused, not followed. `--read-only` hides the write tools (`edit_file`, `write_file`, `move_file`, `create_directory`).
+
+main `search` args: `pattern`/`patterns`, `mode` (`regex` default, `literal` = `-F`), `case_insensitive`, `word`, `output` (`lines`, `files`, `count`, `json`), `context_lines`/`before_lines`/`after_lines`, `types`, `include`/`exclude` (globs must match the WHOLE name or path, so use `*parser*` not `parser`), `max_results` (100), `max_matches_per_file` (20), `max_line_bytes` (400, `0` = never window long lines), `hidden`, `no_ignore`, `sniff_all`.
 
 output is rg-style. if results might be incomplete you get one `[status ...]` line at the end so the agent doesnt lie about "no other usages".
 

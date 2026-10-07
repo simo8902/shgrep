@@ -45,7 +45,7 @@ def main():
 
         try:
             assert call("initialize", {"protocolVersion": "2025-06-18"})["serverInfo"]["name"] == "shgrep"
-            assert len(call("tools/list", request_id=2)["tools"]) == 3
+            assert len(call("tools/list", request_id=2)["tools"]) == 10
             result = tool("search", {"patterns": ["needle", "other"], "line_numbers": True}, 3)
             assert {(item["pattern_id"], item["byte_start"]) for item in result["results"] if item["path"].endswith("source.cpp")} == {(0, 6), (1, 13)}
             # blob.bin is recognized as binary from its first block and skipped, not scanned.
