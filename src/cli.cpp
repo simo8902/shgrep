@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdio>
+#include <cstring>
 #include <filesystem>
 #include <memory>
 #include <stdexcept>
@@ -35,15 +36,16 @@ std::string utf8(const std::wstring& value) {
     return out;
 }
 void print(const std::string& value) { std::fwrite(value.data(), 1, value.size(), stdout); }
-void usage() {
-    print("shgrep: native filesystem search with Intel Hyperscan 5.4.2\n"
+std::string usage_text() {
+    return std::string("shgrep: native filesystem search with Intel Hyperscan 5.4.2\n"
           "\n"
           "Usage:\n"
-          "  shgrep search PATTERN [options]   Search file contents (regex by default)\n"
+          "  shgrep [search] [options] PATTERN [options]   Search file contents (regex by default)\n"
           "  shgrep search -e PATTERN [-e PATTERN...] [options]\n"
           "  shgrep search_bytes --pattern HEX [--pattern HEX...] [options]\n"
           "  shgrep find_files NAME [options]  Exact filename; wildcard NAME is a glob\n"
           "  shgrep find_files [--exact-name NAME | --substring TEXT | --glob GLOB] [options]\n"
+          "  shgrep index [--root DIR]...       Build the optional snapshot index (see --index)\n"
           "  shgrep [--root DIR]...   Start the MCP STDIO server\n"
           "  shgrep --license         Print the bundled Hyperscan license\n"
           "\n"
@@ -53,9 +55,14 @@ void usage() {
           "  -c, --count              Print path:N matching lines per file\n"
           "  --relative               Print paths relative to the single root\n"
           "  -A/-B/-C N               Lines of context after/before/around matches (max 100)\n"
+          "  --block                  Show each match inside its enclosing function (else class)\n"
+          "  --max-block-lines N      Longer blocks keep line context; default 200\n"
           "  -N, --no-line-number     Omit line numbers\n"
           "  --output MODE            lines, files, files_without_match, count, or json\n"
           "  --json                   Structured JSON (byte offsets, pattern ids)\n"
+          "  --color WHEN             auto (color in a console), always, never. `shgrep --color WHEN` alone\n"
+          "                           sets it for every command; with a command it applies to that run only\n"
+          "  --profile                JSON with per-worker phase timing (list, open, read, scan, close)\n"
           "\n"
           "Matching:\n"
           "  -F, --fixed-strings      Literal text (default for search: regex)\n"
@@ -65,6 +72,9 @@ void usage() {
           "  -v, --invert-match       Print lines that match no pattern\n"
           "  -U, --multiline          Matches may span lines\n"
           "  -e, --pattern TEXT       Add a pattern; repeat to search many in one pass\n"
+          "  --index                  Search through the snapshot index (shgrep index): no tree walk,\n"
+          "                           only candidate files; files added or edited since the build can be missed\n"
+          "  --backend NAME           Benchmarking: auto (default), hyperscan, teddy, dfa, cuda, hip\n"
           "\n"
           "Selection:\n"
           "  --root DIR               Search only inside this root; repeat for multiple roots\n"
@@ -233,25 +243,157 @@ void print_result(const std::string& name, const Json& result, const Json& reque
 }
 }
 
+namespace {
+// True when stdout is a console that takes ANSI sequences (enabling them if needed) and NO_COLOR is unset.
+bool terminal_colors() {
+    if (GetEnvironmentVariableW(L"NO_COLOR", nullptr, 0) > 0) return false;
+    HANDLE out = GetStdHandle(STD_OUTPUT_HANDLE);
+    DWORD mode = 0;
+    if (out == INVALID_HANDLE_VALUE || !GetConsoleMode(out, &mode)) return false;
+    return (mode & ENABLE_VIRTUAL_TERMINAL_PROCESSING) || SetConsoleMode(out, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
+}
+
+// The saved color default (`shgrep --color WHEN` alone): %LOCALAPPDATA%\shgrep\color.
+std::wstring color_setting_path() {
+    wchar_t base[MAX_PATH] = {};
+    const DWORD length = GetEnvironmentVariableW(L"LOCALAPPDATA", base, MAX_PATH);
+    if (length == 0 || length >= MAX_PATH) return {};
+    return std::wstring(base) + L"\\shgrep\\color";
+}
+
+std::wstring load_color_setting() {
+    const std::wstring path = color_setting_path();
+    if (path.empty()) return L"auto";
+    HANDLE file = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL,
+                              nullptr);
+    if (file == INVALID_HANDLE_VALUE) return L"auto";
+    char text[16] = {};
+    DWORD got = 0;
+    ReadFile(file, text, sizeof(text) - 1, &got, nullptr);
+    CloseHandle(file);
+    const std::string value(text, got);
+    if (value.rfind("always", 0) == 0) return L"always";
+    if (value.rfind("never", 0) == 0) return L"never";
+    return L"auto";
+}
+
+void save_color_setting(const std::wstring& mode) {
+    const std::wstring path = color_setting_path();
+    if (path.empty()) throw std::runtime_error("LOCALAPPDATA is not set");
+    CreateDirectoryW(path.substr(0, path.rfind(L'\\')).c_str(), nullptr);
+    HANDLE file = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) throw std::runtime_error("cannot save the color setting");
+    const std::string value = mode == L"always" ? "always\n" : mode == L"never" ? "never\n" : "auto\n";
+    DWORD put = 0;
+    const bool ok = WriteFile(file, value.data(), static_cast<DWORD>(value.size()), &put, nullptr) && put == value.size();
+    CloseHandle(file);
+    if (!ok) throw std::runtime_error("cannot save the color setting");
+}
+
+// CONTRACT: one color setting governs every command: the saved default or a run's --color.
+bool colors_for(const std::wstring& mode) {
+    return mode != L"never" && (terminal_colors() || mode == L"always");
+}
+
+bool starts_with(const std::string& text, size_t pos, const char* prefix) {
+    return text.compare(pos, std::strlen(prefix), prefix) == 0;
+}
+
+// Paints note and summary lines ("[status ...]", "[index ...]", "No matches...", "Indexed ...") light yellow.
+std::string paint_notes(const std::string& text) {
+    std::string out;
+    out.reserve(text.size() + 64);
+    size_t pos = 0;
+    while (pos < text.size()) {
+        size_t end = text.find('\n', pos);
+        end = end == std::string::npos ? text.size() : end + 1;
+        if (text[pos] == '[' || starts_with(text, pos, "No matches") || starts_with(text, pos, "No files matched") ||
+            starts_with(text, pos, "Selection: ") || starts_with(text, pos, "Skipped ") ||
+            starts_with(text, pos, "Indexed ") || starts_with(text, pos, "Index: ")) {
+            const size_t body = end > pos && text[end - 1] == '\n' ? end - 1 : end;
+            out += "\x1b[38;2;255;215;135m";  // light yellow #FFD787
+            out.append(text, pos, body - pos);
+            out += "\x1b[0m";
+            out.append(text, body, end - body);
+        } else {
+            out.append(text, pos, end - pos);
+        }
+        pos = end;
+    }
+    return out;
+}
+
+// --help: headings bold, commands light cyan, options light green.
+std::string paint_usage(const std::string& text) {
+    std::string out;
+    size_t pos = 0;
+    while (pos < text.size()) {
+        size_t end = text.find('\n', pos);
+        end = end == std::string::npos ? text.size() : end + 1;
+        const std::string line = text.substr(pos, end - pos);
+        const bool option = line.rfind("  -", 0) == 0, command = line.rfind("  shgrep", 0) == 0;
+        if (!line.empty() && line[0] != ' ' && line[0] != '\n') {
+            out += "\x1b[1m" + line.substr(0, line.size() - (line.back() == '\n')) + "\x1b[0m";
+            if (line.back() == '\n') out += '\n';
+        } else if (option || command) {
+            size_t gap = line.find("  ", 2);
+            if (gap == std::string::npos) gap = line.size() - (line.back() == '\n');
+            out += "  ";
+            out += option ? "\x1b[38;2;135;255;135m" : "\x1b[38;2;135;255;255m";  // light green / light cyan
+            out += line.substr(2, gap - 2);
+            out += "\x1b[0m";
+            out += line.substr(gap);
+        } else {
+            out += line;
+        }
+        pos = end;
+    }
+    return out;
+}
+
+void print_usage() {
+    const std::string text = usage_text();
+    print(colors_for(load_color_setting()) ? paint_usage(text) : text);
+}
+}
+
 int run_cli(int argc, wchar_t** argv) {
     SetConsoleOutputCP(CP_UTF8);
     try {
-        if (argc == 1) { usage(); return 0; }
+        if (argc == 1) { print_usage(); return 0; }
         std::wstring command = argv[1];
-        if (command == L"--help" || command == L"-h" || command == L"help") { usage(); return 0; }
+        if (command == L"--help" || command == L"-h" || command == L"help") { print_usage(); return 0; }
         if (command == L"--version") { print("shgrep 0.1.0 (Intel Hyperscan 5.4.2)\n"); return 0; }
         if (command == L"--license") { print(hyperscan_license); return 0; }
+        // `shgrep --color WHEN` alone saves WHEN as the default; --color with a search overrides it for that run.
+        if (argc == 3 && command == L"--color") {
+            const std::wstring mode = argv[2];
+            if (mode != L"auto" && mode != L"always" && mode != L"never")
+                throw std::runtime_error("--color must be auto, always, or never");
+            save_color_setting(mode);
+            print("color default saved: " + utf8(mode) + " (override per run with --color)\n");
+            return 0;
+        }
         std::string name;
+        int first_option = 2;
         if (command == L"search") name = "search";
         else if (command == L"search_bytes" || command == L"search-bytes") name = "search_bytes";
         else if (command == L"find_files" || command == L"find-files") name = "find_files";
-        else throw std::runtime_error("unknown command; run shgrep --help");
+        else if (command == L"index") name = "index";
+        else {
+            // Like rg: no command means search, and options may come before the pattern.
+            name = "search";
+            first_option = 1;
+        }
         Json::Object args;
         SearchContext context;
         bool json = false, whole_drive = false;
-        for (int i = 2; i < argc; ++i) {
+        std::wstring color_mode = load_color_setting();
+        for (int i = first_option; i < argc; ++i) {
             const std::wstring option = argv[i];
             if (option == L"--json") { json = true; continue; }
+            // Per-worker phase timing; it is part of the JSON result, so it implies --json.
+            if (option == L"--profile") { args["profile"] = true; json = true; continue; }
             if (option == L"--regex" || option == L"-E") { args["mode"] = "regex"; continue; }
             if (option == L"--fixed-strings" || option == L"-F") { args["mode"] = "literal"; continue; }
             if (option == L"--ignore-case" || option == L"-i") { args["case_insensitive"] = true; continue; }
@@ -267,6 +409,8 @@ int run_cli(int argc, wchar_t** argv) {
             if (option == L"--line-numbers") { args["line_numbers"] = true; continue; }
             if (option == L"--no-ignore") { args["no_ignore"] = true; continue; }
             if (option == L"--hidden") { args["hidden"] = true; continue; }
+            if (option == L"--index") { args["index"] = true; continue; }
+            if (option == L"--block") { args["block"] = true; continue; }
             if (option == L"--whole") { whole_drive = true; continue; }
             if (option == L"--find-files")
                 throw std::runtime_error("use: shgrep find_files NAME [--root DIR]");
@@ -297,6 +441,12 @@ int run_cli(int argc, wchar_t** argv) {
             else if (option == L"--exact-name") args["exact_name"] = utf8(value);
             else if (option == L"--substring") args["substring"] = utf8(value);
             else if (option == L"--glob") args["glob"] = utf8(value);
+            else if (option == L"--backend") args["backend"] = utf8(value);
+            else if (option == L"--color") {
+                if (value != L"auto" && value != L"always" && value != L"never")
+                    throw std::runtime_error("--color must be auto, always, or never");
+                color_mode = value;
+            }
             else {
                 std::string key;
                 if (option == L"--max-results") key = "max_results";
@@ -311,6 +461,7 @@ int run_cli(int argc, wchar_t** argv) {
                 else if (option == L"--before-context" || option == L"-B") key = "before_lines";
                 else if (option == L"--after-context" || option == L"-A") key = "after_lines";
                 else if (option == L"--max-count" || option == L"-m") key = "max_matches_per_file";
+                else if (option == L"--max-block-lines") key = "max_block_lines";
                 else throw std::runtime_error("unknown option: " + utf8(option));
                 size_t consumed = 0;
                 int64_t number = std::stoll(value, &consumed, 10);
@@ -329,10 +480,13 @@ int run_cli(int argc, wchar_t** argv) {
         SignalHandler handler;
         auto cancelled = std::shared_ptr<std::atomic_bool>(&cli_cancelled, [](std::atomic_bool*) {});
         if (json) args["output"] = "json";
+        // Like rg: colors when printing to a console (auto), on request (always), never into JSON.
+        const bool color = !json && colors_for(color_mode);
+        if (color) args["color"] = true;
         Json request(std::move(args));
         Json result = run_tool(name, request, context, cancelled);
         if (json) print(result.dump() + "\n");
-        else if (const Json* text = result.get("text")) print(text->string());
+        else if (const Json* text = result.get("text")) print(color ? paint_notes(text->string()) : text->string());
         else print_result(name, result, request, context);
         const std::string& status = result.object().at("summary").object().at("status").string();
         return status == "cancelled" || status == "timeout" ? 3 : 0;

@@ -76,6 +76,12 @@ shgrep find_files AISHITERU.mp3 --whole
 
 flags: `-F -E -i -w -e -l -c -A -B -C -N -m -t -g --root --whole --hidden --no-ignore --json`. exit codes: `0` ran, `2` error, `3` timeout.
 
+## optional index
+
+off unless you ask. `shgrep index --root C:\work` builds a trigram snapshot into `.shgrep\index` (one file per root). then `shgrep search --index ...` (MCP: `index: true`) skips the tree walk and opens only files that held the pattern's literal text at build time. like tgrep: postings carry position/next-byte masks so adjacent trigrams must line up, and regexes become AND/OR trigram plans (alternations and groups work). it's a snapshot: files added since the build aren't searched and edited files can be missed; the output says when it was built. not used with `--invert`, `--files-without-match`, `--hidden`, `--no-ignore` or `--sniff-all`, or for patterns without 3+ bytes of literal text. searches without `--index` don't change at all.
+
+live mode (MCP server only, like `tgrep serve`): `shgrep.exe --root C:\monorepo --live-index`. builds or loads the index in the background, watches the tree with `ReadDirectoryChangesW`, and before every search applies every change windows has reported, so edits are visible right away. searches use the index by default (`index: false` opts out) and walk normally while it builds or reconciles. the build spills sorted postings to disk (256 MiB budget), so monorepo size isn't capped.
+
 ## how it works
 
 - one thread per cpu, each folder listed with one call, files opened relative to the parent folder (fast, and cant escape the root)

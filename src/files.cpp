@@ -891,9 +891,9 @@ Json list_dir(const Json& args, const SearchContext& context, const std::shared_
     const Target target = resolve(context, args.get("path") ? string_arg(args, "path") : std::string("."));
     const auto depth = static_cast<uint32_t>(int_arg(args, "depth", 1, 1, 32));
     Listing s;
-    // CONTRACT: list_dir shows everything by default; hidden false and no_ignore false opt into search's filters.
-    s.hidden = bool_arg(args, "hidden", true);
-    s.no_ignore = bool_arg(args, "no_ignore", true);
+    // CONTRACT: list_dir applies search's filters by default; hidden true and no_ignore true opt out of them.
+    s.hidden = bool_arg(args, "hidden", false);
+    s.no_ignore = bool_arg(args, "no_ignore", false);
     s.max_entries = static_cast<uint64_t>(int_arg(args, "max_results", 500, 1, 10000));
     s.budget = Budget(max_output_arg(args));
     const auto timeout = int_arg(args, "timeout_ms", 30000, 1, 300000);
@@ -1532,6 +1532,7 @@ Json run_file_tool(const std::string& name, const Json& arguments, const SearchC
 // CONTRACT: these descriptions are the model's only documentation of the tools; every statement must match the
 // implementation. Update them with any behavior change.
 Json file_tool_definitions(bool read_only) {
+    // PERF: sent to the model with every session; keep only what an agent needs to call correctly.
     auto schema = [](Json::Object properties, Json::Array required = {}) -> Json {
         Json::Object out{{"type", "object"}, {"properties", std::move(properties)}, {"additionalProperties", false}};
         if (!required.empty()) out.emplace("required", std::move(required));
@@ -1543,114 +1544,71 @@ Json file_tool_definitions(bool read_only) {
     auto choice = [](Json::Array values, const char* description) -> Json {
         return Json::Object{{"type", "string"}, {"enum", std::move(values)}, {"description", description}};
     };
-    const char* path_text = "Relative to the first configured root (\"src/main.cpp\") or absolute inside a configured "
-                            "root.";
+    const char* path_text = "Relative to the first root, or absolute inside a root.";
     const Json path = field("string", path_text);
     const Json paths = Json::Object{{"type", "array"}, {"items", Json::Object{{"type", "string"}}},
-        {"description", "Up to 32 paths, read in one call, instead of path. An unreadable one is reported in place."}};
-    const Json max_output = field("integer", "Hard cap on the response size, 512-1048576, default 65536.");
-    const Json expected_sha256 = field("string", "The sha256 from read_file's header. The call fails, writing nothing, "
-                                                 "if the file's current bytes hash differently.");
-    const Json expected_mtime = field("string", "The mtime from read_file's header. The call fails, writing nothing, "
-                                                "if the file's modification time differs.");
-    const std::string common_paths =
-        " Paths: relative to the first configured root or absolute inside a configured root; '..' cannot leave the "
-        "root, and a symbolic link or junction anywhere below the root is refused, never followed.";
+        {"description", "Up to 32 paths instead of path."}};
+    const Json max_output = field("integer", "512-1048576, default 65536.");
+    const Json expected_sha256 = field("string", "Fail if the file's sha256 (from read_file) changed.");
+    const Json expected_mtime = field("string", "Fail if the file's mtime (from read_file) changed.");
+    const std::string common_paths = " Links are never followed.";
 
     Json::Array tools;
     tools.push_back(Json::Object{{"name", "read_file"}, {"description",
-        "Read a text file's exact and complete contents, with line numbers. By default the whole file is returned; "
-        "lines are never cut or abbreviated. Give path, or paths to read several files; offset (first line, from 1) "
-        "and limit (number of lines, default all) apply to each file. Each file starts with a header: [file PATH | "
-        "N lines, B bytes | ENCODING (utf-8, utf-8-bom, "
-        "utf-16le, utf-16be), LINE ENDINGS (lf, crlf, cr, mixed (...) or no line breaks), final newline or no final "
-        "newline | mtime T | sha256 H]. Each line reads \"    42\xE2\x86\x92text\" (line_numbers false drops the "
-        "prefix); the header names the line terminators, which are not shown. If limit or max_output_bytes ends a "
-        "file early, a \"[status ...]\" line gives the total line count and the offset to continue from. Hidden and "
-        ".gitignore'd files are readable: those filters apply only to tree walks. Binary files (a NUL byte) are "
-        "refused; use search_bytes. Files over 64 MiB are refused; use search." + common_paths},
+        "Read whole text files with line numbers (\"    42\xE2\x86\x92text\"). The header gives encoding, line endings, "
+        "mtime and sha256. Binary and >64 MiB files are refused." + common_paths},
         {"inputSchema", schema(Json::Object{{"path", path}, {"paths", paths},
-            {"offset", field("integer", "First line to show, counting from 1. Default 1.")},
-            {"limit", field("integer", "Number of lines to show per file. Default: every line from offset to the end.")},
-            {"line_numbers", field("boolean", "Default true: prefix each line with its number and \xE2\x86\x92.")},
-            {"max_output_bytes", field("integer", "Optional cap on the response size, 512-268435456. Default: the "
-                                                  "maximum, so whole files are returned.")}})}});
+            {"offset", field("integer", "First line, from 1.")},
+            {"limit", field("integer", "Lines per file.")},
+            {"line_numbers", field("boolean", "Default true.")},
+            {"max_output_bytes", field("integer", "Default: unlimited.")}})}});
     tools.push_back(Json::Object{{"name", "list_dir"}, {"description",
-        "List a folder's files AND subfolders (find_files never lists folders). One entry per line, relative to the "
-        "folder: \"d sub/\" for a directory, \"f name SIZE\" for a file (SIZE in bytes), \"l name\" for a symbolic "
-        "link or junction (listed, never entered). Entries are sorted by name, and each directory is followed by its "
-        "contents down to depth levels. Every entry is listed by default, hidden and .gitignore'd ones included; "
-        "hidden false or no_ignore false apply search's filters, and a final [not shown: ...] note counts what they "
-        "skipped. A final "
-        "\"[status ...]\" line means the listing is incomplete." + common_paths},
+        "List files and folders: \"d sub/\", \"f name SIZE\", \"l link\"." + common_paths},
         {"inputSchema", schema(Json::Object{
-            {"path", field("string", "Folder to list. Default: the first configured root. Relative to that root or "
-                                     "absolute inside a configured root.")},
-            {"depth", field("integer", "1-32, default 1: the folder's own entries; 2 adds their contents, and so on.")},
-            {"hidden", field("boolean", "Default true: hidden items are listed. false skips names starting with '.' "
-                                        "and items with the Windows hidden attribute.")},
-            {"no_ignore", field("boolean", "Default true: .gitignore/.ignore are not applied. false skips the items "
-                                           "they ignore.")},
-            {"max_results", field("integer", "Maximum entries listed, 1-10000, default 500.")},
-            {"timeout_ms", field("integer", "1-300000, default 30000. On expiry the partial listing has status "
-                                            "timeout.")},
+            {"path", field("string", "Folder; default the first root.")},
+            {"depth", field("integer", "1-32, default 1.")},
+            {"hidden", field("boolean", "Include hidden entries.")},
+            {"no_ignore", field("boolean", "Include .gitignore/.ignore'd entries.")},
+            {"max_results", field("integer", "Default 500.")},
+            {"timeout_ms", field("integer", "Default 30000.")},
             {"max_output_bytes", max_output}})}});
     tools.push_back(Json::Object{{"name", "file_info"}, {"description",
-        "Describe a file or folder without printing its contents: type (file, directory, or link: a symbolic link "
-        "or junction, reported but not followed), size, mtime and attributes; for a file up to 64 MiB also whether "
-        "it is binary, and for text its encoding, line count, line endings, final newline and sha256. Give path or "
-        "paths." + common_paths},
+        "Type, size, mtime, attributes; for text also encoding, lines, line endings and sha256." + common_paths},
         {"inputSchema", schema(Json::Object{{"path", path}, {"paths", paths}, {"max_output_bytes", max_output}})}});
     if (read_only) return tools;
 
     const Json edit_item = Json::Object{{"type", "object"}, {"additionalProperties", false},
         {"required", Json::Array{"old_text", "new_text"}},
         {"properties", Json::Object{
-            {"old_text", field("string", "Exact text to replace, including whitespace and indentation.")},
-            {"new_text", field("string", "Replacement text; may be empty to delete old_text.")},
-            {"replace_all", field("boolean", "Default false: old_text must match exactly once. true replaces every "
-                                             "occurrence.")}}}};
+            {"old_text", field("string", "Exact text; must match once unless replace_all.")},
+            {"new_text", field("string", "Replacement.")},
+            {"replace_all", field("boolean", "Replace every match.")}}}};
     tools.push_back(Json::Object{{"name", "edit_file"}, {"description",
-        "Replace exact text in a file. edits is a list of {old_text, new_text, replace_all}, applied in order, each "
-        "to the result of the one before. An old_text that is not found, or found more than once without "
-        "replace_all, fails the call: the error names the edit and how many times it matched (with line numbers). "
-        "All edits apply or none do, and the file is replaced atomically (temporary file + rename). old_text and "
-        "new_text may use \\n line breaks in a CRLF file: they are matched and written with the file's own line "
-        "endings, and the encoding and BOM are kept. Returns a unified diff. dry_run shows the diff without writing. "
-        "expected_sha256 or expected_mtime (from read_file's header) refuse the edit if the file changed after it "
-        "was read; the output gives the new values for the next edit. Refuses binary files, files with invalid "
-        "UTF-8 or UTF-16, read-only files and files over 64 MiB." + common_paths},
+        "Exact-text edits, applied in order, all or none, atomically; keeps encoding and line endings (\\n matches "
+        "CRLF). Returns a diff." + common_paths},
         {"inputSchema", schema(Json::Object{{"path", path},
-            {"edits", Json::Object{{"type", "array"}, {"items", edit_item},
-                {"description", "1-256 replacements, applied in order."}}},
-            {"dry_run", field("boolean", "Default false. true returns the diff and writes nothing.")},
+            {"edits", Json::Object{{"type", "array"}, {"items", edit_item}, {"description", "1-256 edits."}}},
+            {"dry_run", field("boolean", "Diff only, write nothing.")},
             {"expected_sha256", expected_sha256}, {"expected_mtime", expected_mtime},
             {"max_output_bytes", max_output}}, Json::Array{"path", "edits"})}});
     tools.push_back(Json::Object{{"name", "write_file"}, {"description",
-        "Create a file, or replace all of it, with content. Missing parent folders are created. An existing file is "
-        "replaced only when overwrite is true. The write is atomic (temporary file + rename). line_endings (lf or "
-        "crlf) converts every line break in content; encoding is utf-8, utf-8-bom, utf-16le or utf-16be. When "
-        "replacing a text file both default to what it used; for a new file the encoding defaults to utf-8 and "
-        "content's line breaks are kept as given. Returns the new line count, size, mtime and sha256." + common_paths},
+        "Create or replace a file atomically; creates parent folders." + common_paths},
         {"inputSchema", schema(Json::Object{{"path", path},
-            {"content", field("string", "The complete new file contents.")},
-            {"overwrite", field("boolean", "Default false: fail if the file exists. true replaces it.")},
-            {"line_endings", choice(Json::Array{"lf", "crlf"}, "Convert every line break in content to this. "
-                                    "Default: the replaced file's endings, or content as given for a new file.")},
+            {"content", field("string", "Full contents.")},
+            {"overwrite", field("boolean", "Replace an existing file.")},
+            {"line_endings", choice(Json::Array{"lf", "crlf"}, "Default: the replaced file's, else as given.")},
             {"encoding", choice(Json::Array{"utf-8", "utf-8-bom", "utf-16le", "utf-16be"},
-                                "Default: the replaced file's encoding, or utf-8 for a new file.")},
+                                "Default: the replaced file's, else utf-8.")},
             {"expected_sha256", expected_sha256}, {"expected_mtime", expected_mtime}},
             Json::Array{"path", "content"})}});
     tools.push_back(Json::Object{{"name", "move_file"}, {"description",
-        "Move or rename a file or folder within the roots, atomically. Missing parent folders of destination are "
-        "created. An existing destination file is replaced only when overwrite is true; a folder is never replaced. "
-        "Moves within one volume only." + common_paths},
+        "Move or rename a file or folder on one volume, atomically." + common_paths},
         {"inputSchema", schema(Json::Object{{"source", field("string", path_text)},
             {"destination", field("string", path_text)},
-            {"overwrite", field("boolean", "Default false: fail if destination exists.")}},
+            {"overwrite", field("boolean", "Replace an existing file.")}},
             Json::Array{"source", "destination"})}});
     tools.push_back(Json::Object{{"name", "create_directory"}, {"description",
-        "Create a folder and any missing parents, like mkdir -p; an existing folder is not an error." + common_paths},
+        "Create a folder and its parents (mkdir -p)." + common_paths},
         {"inputSchema", schema(Json::Object{{"path", path}}, Json::Array{"path"})}});
     return tools;
 }

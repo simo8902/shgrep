@@ -71,3 +71,6 @@ __pycache__/
 .serena/
 CLAUDE.md
 AGENTS.md
+references/
+traces/
+etw_mcp-0.9.6-py3-none-any.whl

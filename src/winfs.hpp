@@ -96,6 +96,7 @@ struct DirEntry {
     std::wstring name;
     DWORD attributes = 0;
     uint64_t size = 0;
+    uint64_t write_time = 0;  // FILETIME of the last write
 };
 
 // PERF: one handle per directory and 64 KiB batches of FILE_FULL_DIR_INFO supply names and attributes
@@ -116,7 +117,8 @@ inline bool list_directory(HANDLE directory, std::vector<uint64_t>& buffer, std:
             const auto* info = reinterpret_cast<const FILE_FULL_DIR_INFO*>(cursor);
             std::wstring_view name(info->FileName, info->FileNameLength / sizeof(wchar_t));
             if (name != L"." && name != L"..")
-                entries.push_back({std::wstring(name), info->FileAttributes, static_cast<uint64_t>(info->EndOfFile.QuadPart)});
+                entries.push_back({std::wstring(name), info->FileAttributes, static_cast<uint64_t>(info->EndOfFile.QuadPart),
+                                   static_cast<uint64_t>(info->LastWriteTime.QuadPart)});
             if (info->NextEntryOffset == 0) break;
             cursor += info->NextEntryOffset;
         }
@@ -129,7 +131,9 @@ inline bool list_directory(HANDLE directory, std::vector<uint64_t>& buffer, std:
 // rather than followed, and no path string is resolved again.
 // PERF: this replaces a GetFinalPathNameByHandleW check per file and directory, which measured ~30 us per call
 // and did not scale across threads (+90 ms per 6,000 files on 12 threads).
-inline HANDLE open_relative(HANDLE parent, std::wstring_view name, bool directory, bool& denied) {
+// `result`, when given, receives the NTSTATUS of the open.
+inline HANDLE open_relative(HANDLE parent, std::wstring_view name, bool directory, bool& denied,
+                            NTSTATUS* result = nullptr) {
     constexpr ULONG file_open = 0x00000001;              // FILE_OPEN
     constexpr ULONG directory_file = 0x00000001;         // FILE_DIRECTORY_FILE
     constexpr ULONG sequential_only = 0x00000004;        // FILE_SEQUENTIAL_ONLY
@@ -153,6 +157,7 @@ inline HANDLE open_relative(HANDLE parent, std::wstring_view name, bool director
                                          FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, file_open,
                                          options, nullptr, 0);
     denied = status == access_denied;
+    if (result) *result = status;
     return status >= 0 ? handle : INVALID_HANDLE_VALUE;
 }
 }

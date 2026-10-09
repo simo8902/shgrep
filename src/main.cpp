@@ -92,10 +92,13 @@ bool read_line(std::string& line) {
 }
 
 int wmain(int argc, wchar_t** argv) {
+    // MCP clients start the server with stdin as a pipe; a person at a console gets the CLI, even for
+    // `shgrep --root DIR PATTERN`.
     DWORD console_mode = 0;
-    if (argc == 1 && GetConsoleMode(GetStdHandle(STD_INPUT_HANDLE), &console_mode))
-        return shgrep::run_cli(argc, argv);
-    if (argc > 1 && std::wstring(argv[1]) != L"--root" && std::wstring(argv[1]) != L"--read-only")
+    const bool interactive = GetConsoleMode(GetStdHandle(STD_INPUT_HANDLE), &console_mode) != 0;
+    if (argc == 1 && interactive) return shgrep::run_cli(argc, argv);
+    if (argc > 1 && (interactive || (std::wstring(argv[1]) != L"--root" && std::wstring(argv[1]) != L"--read-only" &&
+                                     std::wstring(argv[1]) != L"--live-index")))
         return shgrep::run_cli(argc, argv);
     _setmode(_fileno(stdin), _O_BINARY);
     _setmode(_fileno(stdout), _O_BINARY);
@@ -103,12 +106,16 @@ int wmain(int argc, wchar_t** argv) {
     for (int i = 1; i < argc; ++i) {
         if (std::wstring(argv[i]) == L"--root" && i + 1 < argc) context.allowed_roots.emplace_back(argv[++i]);
         else if (std::wstring(argv[i]) == L"--read-only") context.read_only = true;
+        else if (std::wstring(argv[i]) == L"--live-index") context.live_index = true;
         else {
-            std::fprintf(stderr, "usage: shgrep [--root DIRECTORY]... [--read-only] for MCP; shgrep --help for CLI\n");
+            std::fprintf(stderr, "usage: shgrep [--root DIRECTORY]... [--read-only] [--live-index] for MCP; "
+                                 "shgrep --help for CLI\n");
             return 2;
         }
     }
     if (context.allowed_roots.empty()) context.allowed_roots.push_back(std::filesystem::current_path());
+    // The build and the watchers run in the background; searches walk until each root's index is ready.
+    if (context.live_index) shgrep::start_live_indexes(context);
     std::mutex active_mutex;
     std::map<std::string, std::shared_ptr<std::atomic_bool>> active;
     std::vector<std::future<void>> tasks;
