@@ -6,31 +6,29 @@ works like rg: regex by default, `path:line:text`, `-l -c -w -t -C`.
 
 ## benchmarks
 
-Ryzen 5 5600, windows 11, warm cache, median of 5. big = 80 MB, 6,920 files. small = this repo. same skip rules for everyone. tgrep idx = tgrep with its trigram index (built in 0.9 s big / 0.15 s small, can go stale). rerun with `src/tests/bench.py`.
+Ryzen 5 5600 (12 threads), windows 11, warm cache, median of 7 runs. repo: 80 MB, 6,920 files (a C++ game engine). same skip rules for every tool. CLI times include process start (~4 ms for shgrep). `idx` columns are snapshot indexes built before the run: they can be stale, plain shgrep never is. rerun with `python src/tests/bench.py ROOT --runs 7 --index --tgrep PATH --tgrep-index --rg PATH`.
 
-| test | **shgrep** | rg 15.1 | ug | tgrep | tgrep idx |
-| --- | --- | --- | --- | --- | --- |
-| big, 1 literal | 71 ms | 97 ms | 301 ms | 1197 ms | **9 ms** |
-| big, 1 regex | 66 ms | 70 ms | 323 ms | 1227 ms | **8 ms** |
-| big, 100 literals | 64 ms | 71 ms | 317 ms | 1174 ms | **10 ms** |
-| big, 1000 literals | 62 ms | 71 ms | 252 ms | 1239 ms | **26 ms** |
-| big, 100 regexes | 63 ms | 71 ms | 311 ms | 1166 ms | **9 ms** |
-| big, common word, files only | **56 ms** | 77 ms | 211 ms | 1210 ms | 262 ms |
-| big, common regex, files only | **67 ms** | 82 ms | 310 ms | 1317 ms | 573 ms |
-| big, backreference | 623 ms | **125 ms** | 252 ms | 179 ms | n/a |
-| big, walk dirs only | **9 ms** | 23 ms | 47 ms | 35 ms | n/a |
-| small, 1 literal | 18 ms | 20 ms | 46 ms | 54 ms | **6 ms** |
-| small, 1 regex | 22 ms | 19 ms | 53 ms | 59 ms | **7 ms** |
-| small, 100 literals | 23 ms | 26 ms | 61 ms | 60 ms | **8 ms** |
-| small, 1000 literals | 22 ms | 26 ms | 54 ms | 74 ms | **19 ms** |
-| small, 100 regexes | 19 ms | 21 ms | 91 ms | 62 ms | **8 ms** |
-| small, common word, files only | **19 ms** | 21 ms | 62 ms | 69 ms | 51 ms |
-| small, common regex, files only | **21 ms** | 24 ms | 42 ms | 85 ms | 86 ms |
-| small, backreference | 416 ms | **25 ms** | 63 ms | 1134 ms | n/a |
-| small, walk dirs only | **5 ms** | 14 ms | 14 ms | 21 ms | n/a |
-| find 1 mp3 on all of C: | **1.28 s** | 2.89 s | 10.41 s | 5.06 s | n/a |
+| test | shgrep | shgrep idx | rg | ug | tgrep | tgrep idx |
+| --- | --- | --- | --- | --- | --- | --- |
+| 1 literal, no match | 39 ms | **6 ms** | 87 ms | 226 ms | 1220 ms | 10 ms |
+| 1 regex, no match | 40 ms | **8 ms** | 67 ms | 192 ms | 1211 ms | **8 ms** |
+| 100 literals, no match | 36 ms | **10 ms** | 71 ms | 181 ms | 1200 ms | 11 ms |
+| 1000 literals, no match | 35 ms | **17 ms** | 68 ms | 185 ms | 1312 ms | 28 ms |
+| 100 regexes, no match | 39 ms | **6 ms** | 77 ms | 265 ms | 1251 ms | 10 ms |
+| common literal, files only | 39 ms | **38 ms** | 76 ms | 198 ms | 1303 ms | 293 ms |
+| common regex, files only | **38 ms** | 42 ms | 79 ms | 227 ms | 1403 ms | 551 ms |
 
-short version: without an index we now beat rg on basically everything except backreferences (Chimera is slow there) and 1 regex on the small repo. indexed tgrep still wins rare matches but chokes on common ones and can be stale. 100-regex numbers use the on-disk pattern cache (first run pays ~85 ms compile).
+shgrep, shgrep idx, rg, tgrep and tgrep idx list the same files. ug lists 63 fewer on the common-word tests (probably its binary detection; not investigated). shgrep's output lines also include its `[index ...]` notes.
+
+live index through MCP (`--live-index`, round trip per search, median of 21, no process start), same repo. edits are applied before each search, and a file created right before a search is found by it:
+
+| test | walk | live index |
+| --- | --- | --- |
+| no match | 27.4 ms | **0.3 ms** |
+| rare word | 26.3 ms | **3.0 ms** |
+| common word | 29.4 ms | 28.5 ms |
+
+short version: no index, shgrep is ~2x rg and ~30x unindexed tgrep. with the index it beats indexed tgrep everywhere, by 7-13x on common words, where tgrep has to decode postings for most files. common words gain nothing from any index; the cost there is opening the files. backreferences/lookaround go to PCRE2 and are not in this table.
 
 ## build
 
