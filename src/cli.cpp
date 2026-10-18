@@ -47,7 +47,7 @@ std::string usage_text() {
           "  shgrep find_files [--exact-name NAME | --substring TEXT | --glob GLOB] [options]\n"
           "  shgrep index [--root DIR]...       Build the optional snapshot index (see --index)\n"
           "  shgrep [--root DIR]...   Start the MCP STDIO server\n"
-          "  shgrep --license         Print the bundled Hyperscan license\n"
+          "  shgrep --license         Print bundled dependency licenses\n"
           "\n"
           "Output (search): path:line:text lines, like rg/ug/tgrep\n"
           "  -l, --files-with-matches Print only paths of files with a match\n"
@@ -89,9 +89,9 @@ std::string usage_text() {
           "  --max-file-bytes N       Text file size limit, default 67108864\n"
           "\n"
           "Limits:\n"
-          "  --max-results N          Default 100 (matches; files for -l/-c/find_files)\n"
-          "  -m, --max-matches-per-file N  Default 20\n"
-          "  --max-output-bytes N     Default 65536\n"
+          "  --max-results N          Optional result limit; default unlimited\n"
+          "  -m, --max-matches-per-file N  Optional per-file limit; default unlimited\n"
+          "  --max-output-bytes N     Optional byte cap; default unlimited\n"
           "  --timeout-ms N           Default 30000; find_files defaults to 300000\n"
           "  --context-bytes N        JSON context bytes on each side, default 80\n"
           "\n"
@@ -364,7 +364,7 @@ int run_cli(int argc, wchar_t** argv) {
         std::wstring command = argv[1];
         if (command == L"--help" || command == L"-h" || command == L"help") { print_usage(); return 0; }
         if (command == L"--version") { print("shgrep 0.1.0 (Intel Hyperscan 5.4.2)\n"); return 0; }
-        if (command == L"--license") { print(hyperscan_license); return 0; }
+        if (command == L"--license") { print(hyperscan_license); print("\nSolidLSP\n"); print(solidlsp_license); return 0; }
         // `shgrep --color WHEN` alone saves WHEN as the default; --color with a search overrides it for that run.
         if (argc == 3 && command == L"--color") {
             const std::wstring mode = argv[2];
@@ -483,6 +483,7 @@ int run_cli(int argc, wchar_t** argv) {
         // Like rg: colors when printing to a console (auto), on request (always), never into JSON.
         const bool color = !json && colors_for(color_mode);
         if (color) args["color"] = true;
+        if (name == "search") args["operation"] = "text";
         Json request(std::move(args));
         Json result = run_tool(name, request, context, cancelled);
         if (json) print(result.dump() + "\n");

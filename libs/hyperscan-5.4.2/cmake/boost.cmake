@@ -9,7 +9,7 @@ if (HAVE_LIBCPP)
 else ()
     set(BOOST_MINVERSION 1.57.0)
 endif ()
-set(BOOST_NO_BOOST_CMAKE ON)
+set(Boost_NO_BOOST_CMAKE ON)
 
 unset(Boost_INCLUDE_DIR CACHE)
 # we might have boost in tree, so provide a hint and try again

@@ -37,13 +37,13 @@ Json success(const Json& id, Json result) {
     return Json::Object{{"jsonrpc", "2.0"}, {"id", id}, {"result", std::move(result)}};
 }
 // Returns the serialized response, so the size check and the send share one dump.
-std::string tool_response(const Json& id, Json& result, uint32_t max_bytes) {
+std::string tool_response(const Json& id, Json& result, uint32_t max_bytes, bool uncapped) {
     // CONTRACT: text output (lines/files/count) is sent as-is so agents read grep-style lines, not JSON.
     if (const Json* text = result.get("text")) {
         std::string core = text->string(), marker;
         for (;;) {
             std::string response = success(id, Json::Object{{"content", Json::Array{Json::Object{{"type", "text"}, {"text", core + marker}}}}}).dump();
-            if (response.size() <= max_bytes) return response;
+            if (uncapped || response.size() <= max_bytes) return response;
             if (core.empty()) throw std::runtime_error("max_output_bytes cannot hold MCP response");
             size_t cut = core.size() >= 2 ? core.rfind('\n', core.size() - 2) : std::string::npos;
             core.resize(cut == std::string::npos ? 0 : cut + 1);
@@ -52,7 +52,7 @@ std::string tool_response(const Json& id, Json& result, uint32_t max_bytes) {
     }
     for (;;) {
         std::string response = success(id, Json::Object{{"content", Json::Array{Json::Object{{"type", "text"}, {"text", result.dump()}}}}}).dump();
-        if (response.size() <= max_bytes) return response;
+        if (uncapped || response.size() <= max_bytes) return response;
         auto& object = std::get<Json::Object>(result.value);
         auto& items = std::get<Json::Array>(object.at("results").value);
         if (items.empty()) throw std::runtime_error("max_output_bytes cannot hold MCP response");
@@ -63,14 +63,14 @@ std::string tool_response(const Json& id, Json& result, uint32_t max_bytes) {
         if (summary.at("status").string() == "complete") summary["status"] = "output_limit";
     }
 }
-Json tool_error_response(const Json& id, std::string message, uint32_t max_bytes) {
-    if (message.size() > 1024) message.resize(1024);
+Json tool_error_response(const Json& id, std::string message, uint32_t max_bytes, bool uncapped) {
+    if (!uncapped && message.size() > 1024) message.resize(1024);
     for (;;) {
         while (!message.empty() && !MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS,
                message.data(), static_cast<int>(message.size()), nullptr, 0)) message.pop_back();
         Json response = success(id, Json::Object{{"isError", true},
             {"content", Json::Array{Json::Object{{"type", "text"}, {"text", message}}}}});
-        if (response.dump().size() <= max_bytes || message.empty()) return response;
+        if (uncapped || response.dump().size() <= max_bytes || message.empty()) return response;
         message.resize(message.size() / 2);
     }
 }
@@ -169,7 +169,7 @@ int wmain(int argc, wchar_t** argv) {
                 }
                 send(success(id, Json::Object{{"protocolVersion", protocol},
                                               {"capabilities", Json::Object{{"tools", Json::Object{}}}},
-                                              {"serverInfo", Json::Object{{"name", "shgrep"}, {"version", "0.1.0"}}}}));
+                                              {"serverInfo", Json::Object{{"name", "shgrep"}, {"version", "0.3.0"}}}}));
             } else if (name == "ping") send(success(id, Json::Object{}));
             else if (name == "tools/list") send(success(id, Json::Object{{"tools", shgrep::tool_list(context)}}));
             else if (name == "tools/call") {
@@ -189,19 +189,18 @@ int wmain(int argc, wchar_t** argv) {
                     active.emplace(key, flag);
                 }
                 try { tasks.push_back(std::async(std::launch::async, [&, id, tool_name, arguments, flag, key] {
-                    // CONTRACT: read_file returns whole files unless asked otherwise, so its cap defaults to its maximum.
-                    const bool whole_file = tool_name == "read_file";
-                    const uint32_t ceiling = whole_file ? shgrep::read_file_max_output : 1048576;
-                    uint32_t max_bytes = whole_file ? ceiling : 65536;
+                    const bool uncapped = !arguments.get("max_output_bytes");
+                    const uint32_t ceiling = 1048576;
+                    uint32_t max_bytes = 65536;
                     try {
                         if (const Json* limit = arguments.get("max_output_bytes")) {
                             int64_t requested = limit->integer();
                             if (requested >= 512 && requested <= ceiling) max_bytes = static_cast<uint32_t>(requested);
                         }
                         Json result = shgrep::run_tool(tool_name, arguments, context, flag);
-                        send_line(tool_response(id, result, max_bytes));
+                        send_line(tool_response(id, result, max_bytes, uncapped));
                     } catch (const std::exception& e) {
-                        send(tool_error_response(id, e.what(), max_bytes));
+                        send(tool_error_response(id, e.what(), max_bytes, uncapped));
                     }
                     std::lock_guard lock(active_mutex);
                     active.erase(key);

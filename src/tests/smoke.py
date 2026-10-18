@@ -23,6 +23,8 @@ def main():
         )
 
         def call(method, params=None, request_id=1):
+            if method == "tools/call" and params and params.get("name") == "search":
+                params = {**params, "arguments": {"operation": "text", **params.get("arguments", {})}}
             message = {"jsonrpc": "2.0", "id": request_id, "method": method}
             if params is not None:
                 message["params"] = params

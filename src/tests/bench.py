@@ -161,7 +161,7 @@ def live(args):
                 return message
 
     def search(pattern, **extra):
-        arguments = {"pattern": pattern, "mode": "literal", "output": "files", "max_results": 10000,
+        arguments = {"operation": "text", "pattern": pattern, "mode": "literal", "output": "files", "max_results": 10000,
                      "max_output_bytes": 1048576, **extra}
         message = call("tools/call", {"name": "search", "arguments": arguments})
         return "".join(part.get("text", "") for part in message["result"]["content"])

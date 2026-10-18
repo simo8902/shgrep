@@ -2,6 +2,7 @@
 #include "backend.hpp"
 #include "dfa.hpp"
 #include "files.hpp"
+#include "lsp.hpp"
 #include "ignore.hpp"
 #include "teddy.hpp"
 #include "winfs.hpp"
@@ -147,10 +148,11 @@ struct Request {
     std::string mode = "regex", output = "lines", exact_name, substring, name_glob, path_filter;
     std::vector<std::string> patterns, includes, excludes, extensions, type_globs;
     std::vector<fs::path> roots;
-    uint32_t max_results = 100, max_per_file = 20, max_output = 65536, timeout_ms = 30000;
+    uint32_t max_results = UINT32_MAX, max_per_file = UINT32_MAX, timeout_ms = 30000;
+    size_t max_output = SIZE_MAX;
     uint32_t context_before = 80, context_after = 80;
     uint32_t before_lines = 0, after_lines = 0;
-    uint32_t max_line_bytes = 400;  // lines output: longer lines show a window around the match; 0 shows them whole
+    uint32_t max_line_bytes = 400;  // lines output: optional window around the match; 0 shows whole lines
     uint64_t max_file_bytes = 67108864;
     Backend backend = Backend::automatic;
     // Set by run_tool, not parsed: directories, in walk path form, that are never entered (the pattern cache).
@@ -308,16 +310,16 @@ Request parse_request(const std::string& tool, const Json& args, const SearchCon
     uint32_t context_lines = bounded(args, "context_lines", 0, 0, 100);
     r.before_lines = bounded(args, "before_lines", context_lines, 0, 100);
     r.after_lines = bounded(args, "after_lines", context_lines, 0, 100);
-    r.max_line_bytes = bounded(args, "max_line_bytes", 400, 0, 1048576);
+    r.max_line_bytes = bounded(args, "max_line_bytes", 0, 0, 1048576);
     for (const auto& type : strings(args, "types", 32, 32)) append_type_globs(type, r.type_globs);
     r.insensitive = boolean(args, "case_insensitive", false);
     r.line = boolean(args, "line_numbers", !r.binary && !r.file_only);
     r.no_ignore = boolean(args, "no_ignore", false);
     r.hidden = boolean(args, "hidden", false);
     r.max_file_bytes = bounded(args, "max_file_bytes", 67108864, 1, 268435456);
-    r.max_results = bounded(args, "max_results", 100, 1, 10000);
-    r.max_per_file = bounded(args, "max_matches_per_file", 20, 1, 10000);
-    r.max_output = bounded(args, "max_output_bytes", 65536, 512, 1048576);
+    r.max_results = bounded(args, "max_results", UINT32_MAX, 1, 10000);
+    r.max_per_file = bounded(args, "max_matches_per_file", UINT32_MAX, 1, 10000);
+    r.max_output = args.get("max_output_bytes") ? bounded(args, "max_output_bytes", 65536, 512, 1048576) : SIZE_MAX;
     r.timeout_ms = bounded(args, "timeout_ms", r.file_only ? 300000 : 30000, 1, 300000);
     uint32_t context_bytes = bounded(args, "context_bytes", 80, 0, 1024);
     r.context_before = bounded(args, "context_before_bytes", context_bytes, 0, 1024);
@@ -4932,7 +4934,64 @@ void start_live_indexes(const SearchContext& context) {
 
 Json run_tool(const std::string& name, const Json& arguments,
               const SearchContext& context, const std::shared_ptr<std::atomic_bool>& cancelled) {
+    // All ten tools share a read/write gate: an in-process refactor cannot race a navigation snapshot.
+    std::unique_lock<std::shared_timed_mutex> writer(workspace_operation_mutex(), std::defer_lock);
+    std::shared_lock<std::shared_timed_mutex> reader(workspace_operation_mutex(), std::defer_lock);
+    const auto deadline = Clock::now() + std::chrono::milliseconds(bounded(arguments, "timeout_ms", name == "find_files" ? 300000 : 30000, 1, 300000));
+    for (;;) {
+        const bool acquired = is_write_tool(name) ? writer.try_lock_for(std::chrono::milliseconds(10))
+                                                 : reader.try_lock_for(std::chrono::milliseconds(10));
+        if (acquired) break;
+        if (cancelled && cancelled->load()) throw std::runtime_error("request cancelled while waiting for workspace access");
+        if (Clock::now() >= deadline) throw std::runtime_error("request timed out waiting for workspace access");
+    }
     if (is_file_tool(name)) return run_file_tool(name, arguments, context, cancelled);
+    if (name == "find_files") {
+        reject_unknown_arguments(name, arguments);
+        const std::string operation = text(arguments, "operation", "filesystem");
+        if (operation != "filesystem") {
+            if (operation != "symbols" && operation != "lsp") throw std::runtime_error("find_files operation must be filesystem, symbols, or lsp");
+            static const std::set<std::string> semantic_args{"operation", "path", "name_path", "pattern", "substring_matching", "include_kinds", "exclude_kinds", "timeout_ms"};
+            for (const auto& [key, value] : arguments.object()) { (void)value;
+                if (!semantic_args.contains(key)) throw std::runtime_error(key + " is a filesystem filter; use operation=filesystem");
+            }
+            Json::Object query = arguments.object();
+            const Json response = lsp_query(operation == "lsp" ? "files" : "symbols", query, context, cancelled);
+            if (operation == "lsp") return Json::Object{{"text", response.dump() + "\n"}};
+            Json::Array files;
+            std::set<std::string> seen;
+            for (const auto& item : response.get("results")->array()) {
+                const std::string root = item.get("root") ? item.get("root")->string() : "";
+                const std::string path = item.get("path")->string();
+                if (seen.insert(root + "\n" + path).second) files.push_back(Json::Object{{"root", root}, {"path", path}});
+            }
+            return Json::Object{{"text", Json(Json::Object{{"files", std::move(files)}, {"backend", "lsp"}}).dump() + "\n"}};
+        }
+        for (const char* key : {"path", "name_path", "pattern", "substring_matching", "include_kinds", "exclude_kinds"})
+            if (arguments.get(key)) throw std::runtime_error(std::string(key) + " requires find_files operation=symbols or lsp");
+    }
+    if (name == "search") {
+        reject_unknown_arguments(name, arguments);
+        const std::string operation = text(arguments, "operation", "symbols");
+        if (operation == "text") {
+            for (const char* key : {"path", "name_path", "include_body", "include_info", "include_kinds", "exclude_kinds", "depth", "substring_matching", "line", "column", "include_declaration"})
+                if (arguments.get(key)) throw std::runtime_error(std::string(key) + " is only supported by LSP navigation");
+        }
+        if (operation != "text") {
+            if (operation != "symbols" && operation != "definition" && operation != "references" && operation != "declaration" &&
+                operation != "type_definition" && operation != "implementation" && operation != "hover")
+                throw std::runtime_error("unknown search operation");
+            static const std::set<std::string> navigation_args{
+                "operation", "path", "name_path", "pattern", "patterns", "include_body", "substring_matching",
+                "line", "column", "include_declaration", "timeout_ms", "include_info", "include_kinds", "exclude_kinds", "depth"};
+            for (const auto& [key, value] : arguments.object()) {
+                (void)value;
+                if (!navigation_args.contains(key))
+                    throw std::runtime_error(key + " is a text-search option; use operation=text or omit it for LSP");
+            }
+            return Json::Object{{"text", lsp_query(operation, arguments, context, cancelled).dump() + "\n"}};
+        }
+    }
     // CONTRACT: CLI only (`shgrep index`); tool_list never offers it, so MCP clients cannot reach it.
     if (name == "index") return build_index(context, cancelled);
     if (name != "search" && name != "search_bytes" && name != "find_files") throw std::runtime_error("unknown tool");
@@ -4987,11 +5046,9 @@ Json run_tool(const std::string& name, const Json& arguments,
     // JSON output is escaped twice (result object, then MCP text), so it gets half the budget; text output is
     // escaped once and keeps room for the footer.
     const bool text_output = r.output != "json";
-    // PERF: publish never holds more than max_results items, so the shared vectors never reallocate under its
-    // lock. Json's move is not noexcept (MSVC std::map), so each regrowth deep-copied every result while all
-    // workers waited.
-    if (text_output) out.blocks.reserve(r.max_results);
-    else out.results.reserve(r.max_results);
+    // Reserve a modest starting batch; the default result count is unbounded.
+    if (text_output) out.blocks.reserve(std::min<uint32_t>(r.max_results, 100));
+    else out.results.reserve(std::min<uint32_t>(r.max_results, 100));
     const size_t content_budget = text_output ? (r.max_output > 1024 ? r.max_output - 768 : r.max_output / 2)
                                               : (r.max_output >= 1024 ? (r.max_output - 512) / 2 : r.max_output / 2);
     // PERF: one worker per logical processor across all processor groups, by the owner's decision.
@@ -5208,20 +5265,33 @@ Json tool_definitions() {
         {"path_filter", field("string", "Substring of the relative path.")},
         {"no_ignore", field("boolean", "Include .gitignore/.ignore'd files.")},
         {"hidden", field("boolean", "Include hidden files.")},
-        {"max_results", field("integer", "1-10000, default 100.")},
+        {"max_results", field("integer", "Optional result limit, 1-10000; default unlimited.")},
         {"paths", choice(Json::Array{"absolute", "relative"}, "Default relative (to a single root).")},
-        {"max_output_bytes", field("integer", "512-1048576, default 65536.")},
+        {"max_output_bytes", field("integer", "Optional byte cap, 512-1048576; default unlimited.")},
         {"timeout_ms", field("integer", "Default 30000 (find_files 300000).")}};
 
     auto content_props = common;
-    content_props.emplace("pattern", field("string", "One pattern."));
-    content_props.emplace("patterns", list("Up to 1000 patterns, one pass; json pattern_id is the index."));
-    content_props.emplace("max_matches_per_file", field("integer", "Default 20."));
+    content_props.emplace("pattern", field("string", "One pattern; search LSP mode uses a symbol name path."));
+    content_props.emplace("patterns", list("Text: up to 1000 in one pass. LSP: symbol name paths, matched together."));
+    content_props.emplace("max_matches_per_file", field("integer", "Optional per-file match limit; default unlimited."));
     content_props.emplace("context_bytes", field("integer", "json: context bytes per side, default 80."));
     content_props.emplace("context_before_bytes", field("integer", "json: context bytes before."));
     content_props.emplace("context_after_bytes", field("integer", "json: context bytes after."));
 
     auto search_props = content_props;
+    search_props.emplace("operation", choice(Json::Array{"symbols", "definition", "declaration", "type_definition", "implementation", "references", "hover", "text"},
+        "Default symbols via LSP. text uses live grep; its text filters and budgets apply only there."));
+    search_props.emplace("path", field("string", "File or directory scope for symbols; other navigation needs a file. Omit for all workspaces."));
+    search_props.emplace("name_path", field("string", "Symbol name or slash-separated parent/name. /prefix anchors at the root; otherwise suffix match."));
+    search_props.emplace("include_body", field("boolean", "Include complete symbol bodies; default false."));
+    search_props.emplace("substring_matching", field("boolean", "Substring match on the last name-path component only; default false."));
+    search_props.emplace("include_info", field("boolean", "Include hover/signature information for symbol hits; default false."));
+    search_props.emplace("depth", field("integer", "Child depth from each symbol hit, default 0; -1 all."));
+    search_props.emplace("include_kinds", Json::Object{{"type", "array"}, {"items", Json::Object{{"type", "integer"}}}, {"description", "LSP kinds 1-26 to include."}});
+    search_props.emplace("exclude_kinds", Json::Object{{"type", "array"}, {"items", Json::Object{{"type", "integer"}}}, {"description", "LSP kinds to exclude."}});
+    search_props.emplace("line", field("integer", "1-based usage line for definition/references, instead of name_path."));
+    search_props.emplace("column", field("integer", "1-based UTF-16 column; use with line."));
+    search_props.emplace("include_declaration", field("boolean", "Include declaration in references; default false."));
     search_props.emplace("mode", choice(Json::Array{"regex", "literal"},
         "Default regex (PCRE, per line). Backreferences, lookaround or \\b make the whole call slow; use word."));
     search_props.emplace("case_insensitive", field("boolean", "Unicode-aware."));
@@ -5230,7 +5300,7 @@ Json tool_definitions() {
     search_props.emplace("context_lines", field("integer", "Lines around matches, 0-100."));
     search_props.emplace("before_lines", field("integer", "Lines before matches."));
     search_props.emplace("after_lines", field("integer", "Lines after matches."));
-    search_props.emplace("max_line_bytes", field("integer", "Window longer lines; default 400, 0 = whole."));
+    search_props.emplace("max_line_bytes", field("integer", "Optional line window; default 0 shows whole lines."));
     search_props.emplace("block", field("boolean", "Show each match inside its whole enclosing function (else class); "
                                                    "lines output. Brace languages and Python."));
     search_props.emplace("max_block_lines", field("integer", "Longer blocks keep line context; default 200."));
@@ -5252,6 +5322,13 @@ Json tool_definitions() {
     bytes_props.emplace("line_numbers", field("boolean", "Add lines to json."));
 
     auto files_props = common;
+    files_props.emplace("operation", choice(Json::Array{"filesystem", "symbols", "lsp"}, "Default filesystem. symbols finds files containing symbol hits; lsp lists configured source files without starting servers."));
+    files_props.emplace("path", field("string", "LSP file/directory scope; omit for all configured roots."));
+    files_props.emplace("pattern", field("string", "symbols: symbol name-path pattern."));
+    files_props.emplace("name_path", field("string", "symbols: alternative to pattern."));
+    files_props.emplace("substring_matching", field("boolean", "symbols: substring match on final component."));
+    files_props.emplace("include_kinds", Json::Object{{"type", "array"}, {"items", Json::Object{{"type", "integer"}}}});
+    files_props.emplace("exclude_kinds", Json::Object{{"type", "array"}, {"items", Json::Object{{"type", "integer"}}}});
     files_props.emplace("exact_name", field("string", "Whole filename, case-insensitive."));
     files_props.emplace("substring", field("string", "Text in the name or relative path."));
     files_props.emplace("glob", field("string", "Glob on the name or relative path."));
@@ -5259,14 +5336,15 @@ Json tool_definitions() {
 
     return Json::Array{
         Json::Object{{"name", "search"}, {"description",
-            "Search file contents like ripgrep, on the current disk state. Skips ignored, hidden and binary files. "
-            "Put related terms in one call's patterns. A final [status ...] line means results are incomplete."},
+            "Navigate live code through LSP: symbols, definition/declaration/type_definition, implementation, references, or hover. "
+            "Bodies are opt-in; no LSP output cap. Configure .shgrep/lsp.json. operation=text searches current disk text "
+            "with the grep options below, including XML and files without a language server."},
             {"inputSchema", schema(search_props)}},
         Json::Object{{"name", "search_bytes"}, {"description",
             "Search raw bytes of any file (no decoding or binary skipping) by hex or byte regex; exact offsets."},
             {"inputSchema", schema(bytes_props)}},
         Json::Object{{"name", "find_files"}, {"description",
-            "Find files by name or path without opening them. No filter lists all. Use list_dir for folders."},
+            "Find live files by name/path, configured LSP source files, or files containing symbol hits. Use list_dir for folder or symbol overviews."},
             {"inputSchema", schema(files_props)}}
     };
 }

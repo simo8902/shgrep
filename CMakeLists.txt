@@ -63,11 +63,12 @@ if(EXISTS "${SHGREP_PCRE2_DIR}/CMakeLists.txt")
 endif()
 
 file(READ "${SHGREP_HYPERSCAN_DIR}/COPYING" HYPERSCAN_LICENSE_TEXT)
+file(READ "${CMAKE_CURRENT_SOURCE_DIR}/third_party/solidlsp-LICENSE.txt" SOLIDLSP_LICENSE_TEXT)
 file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/generated")
 configure_file(src/license.hpp.in "${CMAKE_CURRENT_BINARY_DIR}/generated/license.hpp" @ONLY)
 
 add_executable(shgrep src/main.cpp src/cli.cpp src/json.cpp src/search.cpp src/ignore.cpp src/files.cpp
-               src/backend.cpp src/teddy.cpp src/dfa.cpp)
+               src/backend.cpp src/teddy.cpp src/dfa.cpp src/lsp.cpp)
 target_compile_features(shgrep PRIVATE cxx_std_20)
 target_include_directories(shgrep PRIVATE "${SHGREP_HYPERSCAN_DIR}/src" "${CMAKE_CURRENT_BINARY_DIR}/generated")
 # ntdll provides NtCreateFile for opening entries relative to their parent directory handle; bcrypt provides the

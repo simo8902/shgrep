@@ -1,4 +1,5 @@
 #include "files.hpp"
+#include "lsp.hpp"
 #include "ignore.hpp"
 #include "winfs.hpp"
 
@@ -12,7 +13,9 @@
 #include <cstring>
 #include <cwchar>
 #include <cwctype>
+#include <functional>
 #include <map>
+#include <limits>
 #include <mutex>
 #include <set>
 #include <stdexcept>
@@ -604,14 +607,15 @@ std::string replace_newlines(std::string_view s, std::string_view eol) {
 // leaves room for the MCP envelope and one trailing status line.
 struct Budget {
     size_t limit = 0, used = 0;
-    uint32_t max_output = 0;
-    explicit Budget(uint32_t max) : limit(max > 1024 ? max - 768 : max / 2), max_output(max) {}
+    size_t max_output = 0;
+    explicit Budget(size_t max) : limit(max > 1024 ? max - 768 : max / 2), max_output(max) {}
     bool fits(std::string_view s) const { return used + Json::escaped_size(s) - 2 <= limit; }
     void take(std::string_view s) { used += Json::escaped_size(s) - 2; }
 };
 
-uint32_t max_output_arg(const Json& args) {
-    return static_cast<uint32_t>(int_arg(args, "max_output_bytes", 65536, 512, 1048576));
+size_t max_output_arg(const Json& args) {
+    if (!args.get("max_output_bytes")) return std::numeric_limits<size_t>::max();
+    return static_cast<size_t>(int_arg(args, "max_output_bytes", 65536, 512, 1048576));
 }
 
 std::string file_header(const std::string& path, const std::string& raw, const TextFile& text,
@@ -628,13 +632,11 @@ std::string file_header(const std::string& path, const std::string& raw, const T
 // ---- read_file ----
 
 struct ReadOptions {
-    uint64_t offset = 1, limit = UINT64_MAX;
+    uint64_t offset = 1, limit = 200;
     bool numbers = true;
 };
 
-enum class Rendered { complete, cut, not_shown };
-
-Rendered render_file(std::string& out, Budget& budget, const Target& target, const ReadOptions& options) {
+void render_file(std::string& out, const Target& target, const ReadOptions& options) {
     const std::string path = target.display();
     if (target.parts.empty()) fail(path + " is a configured root directory; use list_dir");
     std::string raw;
@@ -643,103 +645,85 @@ Rendered render_file(std::string& out, Budget& budget, const Target& target, con
         Handle directory = open_parent(target, false);
         Handle file = open_file(directory.h, target, share_all);
         basic = basic_info(file.h, path);
-        if (!read_all(file.h, path, max_text_bytes, raw))
-            fail(path + " is larger than 64 MiB; read_file reads whole files up to that size. Use search to find "
-                 "the lines you need.");
+        if (!read_all(file.h, path, max_text_bytes, raw)) fail(path + " is larger than 64 MiB; use search");
     }
     const TextFile text = decode(raw);
-    if (text.binary)
-        fail(path + " is binary (NUL byte at offset " + std::to_string(text.nul_offset) +
-             "); use search_bytes to inspect it");
-    const std::string header = file_header(path, raw, text, basic);
-    if (!budget.fits(header)) return Rendered::not_shown;
-    budget.take(header);
-    out += header;
+    if (text.binary) fail(path + " is binary; use search_bytes");
+    out += file_header(path, raw, text, basic);
     if (options.offset > text.lines && !(text.lines == 0 && options.offset == 1)) {
-        out += "[offset " + std::to_string(options.offset) + " is past the end: the file has " +
-               std::to_string(text.lines) + " lines]\n";
-        return Rendered::complete;
+        out += "[offset " + std::to_string(options.offset) + " is past the end: the file has " + std::to_string(text.lines) + " lines]\n";
+        return;
     }
     const std::string& t = text.text;
     size_t pos = 0;
-    uint64_t number = 1;
+    uint64_t number = 1, shown = 0;
     while (number < options.offset && pos < t.size()) {
         const size_t newline = t.find('\n', pos);
         pos = newline == std::string::npos ? t.size() : newline + 1;
         ++number;
     }
     const uint64_t first = number;
-    uint64_t shown = 0;
-    bool out_of_budget = false;
-    std::string line;
     while (pos < t.size() && shown < options.limit) {
         const size_t newline = t.find('\n', pos);
         size_t end = newline == std::string::npos ? t.size() : newline;
         if (newline != std::string::npos && end > pos && t[end - 1] == '\r') --end;
-        line.clear();
         if (options.numbers) {
             char prefix[32];
             std::snprintf(prefix, sizeof(prefix), "%6llu", static_cast<unsigned long long>(number));
-            line += prefix;
-            line += "\xE2\x86\x92";  // U+2192 RIGHTWARDS ARROW
+            out += prefix; out += "\xE2\x86\x92";
         }
-        line.append(t, pos, end - pos);
-        line.push_back('\n');
-        if (!budget.fits(line)) { out_of_budget = true; break; }
-        budget.take(line);
-        out += line;
-        ++shown;
-        ++number;
+        out.append(t, pos, end - pos);
+        out.push_back('\n');
+        ++shown; ++number;
         pos = newline == std::string::npos ? t.size() : newline + 1;
     }
-    const std::string total = std::to_string(text.lines);
-    const std::string range = std::to_string(first) + "-" + std::to_string(first + shown - 1);
-    const std::string next = std::to_string(first + shown);
-    if (out_of_budget) {
-        if (shown == 0)
-            out += "[status output_limit: line " + std::to_string(first) + " alone does not fit in max_output_bytes=" +
-                   std::to_string(budget.max_output) + "; raise max_output_bytes (up to 1048576) or use search]\n";
-        else
-            out += "[status output_limit: showed lines " + range + " of " + total + " within max_output_bytes=" +
-                   std::to_string(budget.max_output) + "; continue with offset=" + next + "]\n";
-        return Rendered::cut;
-    }
     if (pos < t.size())
-        out += "[status limit: showed lines " + range + " of " + total + " (limit=" + std::to_string(options.limit) +
-               "); continue with offset=" + next + "]\n";
-    return Rendered::complete;
+        out += "[status limit: showed lines " + std::to_string(first) + "-" + std::to_string(first + shown - 1) +
+               " of " + std::to_string(text.lines) + " (limit=" + std::to_string(options.limit) +
+               "); continue with offset=" + std::to_string(first + shown) + "]\n";
 }
 
-Json read_file(const Json& args, const SearchContext& context) {
+Json read_file(const Json& args, const SearchContext& context, const std::shared_ptr<std::atomic_bool>& cancelled) {
     const std::vector<std::string> paths = path_args(args);
-    const bool several = args.get("paths") != nullptr;
     ReadOptions options;
     options.offset = static_cast<uint64_t>(int_arg(args, "offset", 1, 1, INT64_MAX));
-    if (args.get("limit")) options.limit = static_cast<uint64_t>(int_arg(args, "limit", 0, 1, INT64_MAX));
+    options.limit = static_cast<uint64_t>(int_arg(args, "limit", 200, 1, INT64_MAX));
     options.numbers = bool_arg(args, "line_numbers", true);
-    // CONTRACT: the whole file by default; only an explicit limit or max_output_bytes shortens the output.
-    Budget budget(static_cast<uint32_t>(int_arg(args, "max_output_bytes", read_file_max_output, 512,
-                                                read_file_max_output)));
+    const std::string operation = args.get("operation") ? string_arg(args, "operation") : "auto";
+    if (operation != "auto" && operation != "text" && operation != "overview" && operation != "symbol")
+        fail("read_file operation must be auto, text, overview, or symbol");
+    if (operation == "text" && args.get("name_path")) fail("operation=text does not accept name_path");
+    const bool text_mode = operation == "text" || args.get("offset") || args.get("limit");
+    if (text_mode && (args.get("depth") || args.get("include_kinds") || args.get("exclude_kinds")))
+        fail("depth/include_kinds/exclude_kinds require a symbol read");
+    if ((args.get("offset") || args.get("limit")) && (operation == "overview" || operation == "symbol" || args.get("name_path")))
+        fail("line ranges and symbol reads are mutually exclusive");
     std::string out;
-    for (size_t i = 0; i < paths.size(); ++i) {
-        Rendered rendered = Rendered::complete;
-        if (!several) rendered = render_file(out, budget, resolve(context, paths[i]), options);
-        else {
-            try { rendered = render_file(out, budget, resolve(context, paths[i]), options); }
-            catch (const std::exception& e) {
-                // CONTRACT: with paths, one unreadable file is reported in place and the others are still read.
-                const std::string error = "[error " + std::string(e.what()) + "]\n";
-                if (!budget.fits(error)) rendered = Rendered::not_shown;
-                else { budget.take(error); out += error; }
+    for (const auto& path : paths) {
+        if (cancelled && cancelled->load()) fail("read_file cancelled");
+        auto read = [&] {
+            const bool text_range = operation == "text" || args.get("offset") || args.get("limit");
+            if (!text_range) {
+                bool directory = false;
+                const SourceText descriptor = source_descriptor(context, path, &directory);
+                if (directory || operation != "auto" || args.get("name_path") || lsp_configured(descriptor, context)) {
+                    if (operation == "symbol" && !args.get("name_path")) fail("symbol read requires name_path");
+                    if (args.get("line_numbers")) fail("line_numbers is only for text reads");
+                    Json::Object query = args.object();
+                    query.erase("paths"); query["path"] = path;
+                    query["include_body"] = args.get("name_path") != nullptr;
+                    const Json result = lsp_query(args.get("name_path") ? "symbols" : "overview", query, context, cancelled);
+                    out += result.dump() + "\n";
+                    return;
+                }
             }
+            render_file(out, resolve(context, path), options);
+        };
+        if (!args.get("paths")) read();
+        else {
+            try { read(); }
+            catch (const std::exception& e) { out += "[error " + std::string(e.what()) + "]\n"; }
         }
-        if (rendered == Rendered::complete) continue;
-        std::string unread;
-        for (size_t j = rendered == Rendered::cut ? i + 1 : i; j < paths.size(); ++j) unread += (unread.empty() ? "" : ", ") + paths[j];
-        if (!unread.empty())
-            out += "[status output_limit: max_output_bytes=" + std::to_string(budget.max_output) +
-                   " reached; not read: " + unread + "]\n";
-        break;
     }
     return Json::Object{{"text", std::move(out)}};
 }
@@ -894,7 +878,7 @@ Json list_dir(const Json& args, const SearchContext& context, const std::shared_
     // CONTRACT: list_dir applies search's filters by default; hidden true and no_ignore true opt out of them.
     s.hidden = bool_arg(args, "hidden", false);
     s.no_ignore = bool_arg(args, "no_ignore", false);
-    s.max_entries = static_cast<uint64_t>(int_arg(args, "max_results", 500, 1, 10000));
+    s.max_entries = args.get("max_results") ? static_cast<uint64_t>(int_arg(args, "max_results", 500, 1, 10000)) : UINT64_MAX;
     s.budget = Budget(max_output_arg(args));
     const auto timeout = int_arg(args, "timeout_ms", 30000, 1, 300000);
     s.deadline = Clock::now() + std::chrono::milliseconds(timeout);
@@ -1017,11 +1001,22 @@ struct DiscardOnFailure {
 // Writes bytes to a new temporary file beside the target, flushes it, then renames it onto the target. With
 // replace false the rename fails if the target exists, so creating never clobbers a file that appeared meanwhile.
 // Readers therefore see the old contents or the new ones, never a partial file.
-FILE_BASIC_INFO atomic_write(HANDLE directory, const Target& target, const std::string& bytes, bool replace,
-                             DWORD attributes, Handle* original) {
+struct StagedWrite {
+    Handle file;
+    bool armed = true;
+    ~StagedWrite() {
+        if (armed && file) {
+            FILE_DISPOSITION_INFO info{TRUE};
+            SetFileInformationByHandle(file.h, FileDispositionInfo, &info, sizeof(info));
+        }
+    }
+};
+std::unique_ptr<StagedWrite> stage_write(HANDLE directory, const Target& target,
+                                          const std::string& bytes, DWORD attributes) {
     static std::atomic<uint32_t> counter{0};
     const std::string path = target.display();
-    Handle temp;
+    auto staged = std::make_unique<StagedWrite>();
+    Handle& temp = staged->file;
     for (int attempt = 0;; ++attempt) {
         const std::wstring temp_name = L".shgrep-" + std::to_wstring(GetCurrentProcessId()) + L"-" +
                                        std::to_wstring(++counter) + L".tmp";
@@ -1033,7 +1028,6 @@ FILE_BASIC_INFO atomic_write(HANDLE directory, const Target& target, const std::
             fail(path + ": cannot create a temporary file in its folder (" + status_text(status) +
                  "); nothing was written");
     }
-    DiscardOnFailure discard{temp.h};
     for (size_t offset = 0; offset < bytes.size();) {
         const auto chunk = static_cast<DWORD>(std::min<size_t>(bytes.size() - offset, size_t{1} << 24));
         DWORD written = 0;
@@ -1047,10 +1041,15 @@ FILE_BASIC_INFO atomic_write(HANDLE directory, const Target& target, const std::
         const DWORD code = GetLastError();
         fail(path + ": flush failed (" + win32_text(code) + "); nothing was written");
     }
-    if (const DWORD code = rename_handle(temp.h, directory, target.name(), replace, original))
-        fail(path + ": " + rename_error(code) + "; nothing was written");
-    discard.armed = false;
-    try { return basic_info(temp.h, path); }
+    return staged;
+}
+FILE_BASIC_INFO atomic_write(HANDLE directory, const Target& target, const std::string& bytes, bool replace,
+                             DWORD attributes, Handle* original) {
+    auto staged = stage_write(directory, target, bytes, attributes);
+    if (const DWORD code = rename_handle(staged->file.h, directory, target.name(), replace, original))
+        fail(target.display() + ": " + rename_error(code) + "; nothing was written");
+    staged->armed = false;
+    try { return basic_info(staged->file.h, target.display()); }
     catch (const std::exception&) { return FILE_BASIC_INFO{}; }
 }
 
@@ -1363,6 +1362,7 @@ Json edit_file(const Json& args, const SearchContext& context) {
     summary += "Now " + std::to_string(after.lines) + " lines, " + encoding_name(text.encoding) + ", " + eol_name(after);
     if (!dry_run) summary += " | mtime " + format_mtime(written.LastWriteTime.QuadPart) + " | sha256 " + sha256_hex(bytes);
     summary += "\n";
+    if (!args.get("max_output_bytes")) return Json::Object{{"text", summary + diff.text}};
     budget.take(summary);
     return Json::Object{{"text", summary + fit(diff.text, budget, dry_run
         ? "[diff cut at max_output_bytes]\n" : "[diff cut at max_output_bytes; the edit was applied in full]\n")}};
@@ -1450,7 +1450,7 @@ bool same_parts(const std::vector<std::wstring>& a, const std::vector<std::wstri
     return true;
 }
 
-Json move_file(const Json& args, const SearchContext& context) {
+Json move_file_unlocked(const Json& args, const SearchContext& context) {
     const Target source = resolve(context, string_arg(args, "source"));
     const Target destination = resolve(context, string_arg(args, "destination"));
     const bool overwrite = bool_arg(args, "overwrite", false);
@@ -1462,7 +1462,6 @@ Json move_file(const Json& args, const SearchContext& context) {
     if (same_root && destination.parts.size() > source.parts.size() &&
         same_parts(source.parts, destination.parts, source.parts.size()))
         fail("cannot move a directory into itself");
-    std::lock_guard lock(write_mutex());
     Handle source_directory = open_parent(source, false);
     Handle item;
     const NTSTATUS status = nt_open(source_directory.h, source.name(), DELETE | FILE_READ_ATTRIBUTES, share_all,
@@ -1482,6 +1481,11 @@ Json move_file(const Json& args, const SearchContext& context) {
         out += "\n";
     }
     return Json::Object{{"text", std::move(out)}};
+}
+
+Json move_file(const Json& args, const SearchContext& context) {
+    std::lock_guard lock(write_mutex());
+    return move_file_unlocked(args, context);
 }
 
 Json create_directory(const Json& args, const SearchContext& context) {
@@ -1506,6 +1510,204 @@ Json create_directory(const Json& args, const SearchContext& context) {
 }
 }
 
+SourceText source_descriptor(const SearchContext& context, const std::string& path, bool* directory, bool allow_missing, bool* exists) {
+    const Target target = resolve(context, path);
+    Handle item = open_root(target);
+    bool present = true;
+    for (size_t i = 0; i < target.parts.size(); ++i) {
+        Handle child;
+        const bool last = i + 1 == target.parts.size();
+        const NTSTATUS status = nt_open(item.h, target.parts[i], last ? FILE_READ_ATTRIBUTES : directory_access, share_all,
+            disposition_open, option_open_reparse_point | (last ? 0 : option_directory), 0, child);
+        if (status < 0) {
+            if (allow_missing && (static_cast<uint32_t>(status) == 0xC0000034 || static_cast<uint32_t>(status) == 0xC000003A)) {
+                present = false; item.close(); break;
+            }
+            fail(target.display(i + 1) + ": " + status_text(status));
+        }
+        refuse_link(child.h, target.display(i + 1));
+        item = std::move(child);
+    }
+    if (exists) *exists = present;
+    if (directory) *directory = item && (attributes_of(item.h, target.display()) & FILE_ATTRIBUTE_DIRECTORY);
+    return {fs::path(target.full(target.parts.size())), fs::path(target.root), {}, {}};
+}
+
+Json apply_source_changes(const std::vector<SourceChange>& changes, const Json& arguments,
+                          const SearchContext& context, const std::shared_ptr<std::atomic_bool>& cancelled,
+                          const Json* move_arguments) {
+    if (context.read_only) fail("writes are disabled: --read-only");
+    const bool dry = bool_arg(arguments, "dry_run", false);
+    const auto deadline = Clock::now() + std::chrono::milliseconds(int_arg(arguments, "timeout_ms", 30000, 1, 300000));
+    auto check = [&] {
+        if (cancelled && cancelled->load()) fail("edit cancelled before commit");
+        if (Clock::now() >= deadline) fail("edit timed out before commit");
+    };
+    std::lock_guard lock(write_mutex());
+    struct Pending {
+        Target target;
+        Handle parent, original;
+        FILE_BASIC_INFO basic{};
+        std::string old_bytes, new_bytes;
+        std::unique_ptr<StagedWrite> replacement, recovery;
+        bool committed = false;
+    };
+    std::vector<std::unique_ptr<Pending>> pending;
+    std::set<std::wstring> seen;
+    std::string out;
+    std::wstring primary;
+    if (arguments.get("path")) { const Target target = resolve(context, string_arg(arguments, "path")); primary = target.full(target.parts.size()); }
+    for (const auto& change : changes) {
+        check();
+        auto p = std::make_unique<Pending>();
+        p->target = resolve(context, [&] { std::string s; if (!try_utf8(change.before.path.wstring(), s)) fail("invalid path"); return s; }());
+        std::wstring key = p->target.full(p->target.parts.size());
+        std::transform(key.begin(), key.end(), key.begin(), [](wchar_t c) { return static_cast<wchar_t>(std::towlower(c)); });
+        if (!seen.insert(key).second) fail("duplicate file in workspace edit");
+        p->parent = open_parent(p->target, false);
+        p->original = open_file(p->parent.h, p->target, FILE_SHARE_READ | FILE_SHARE_DELETE);
+        p->basic = basic_info(p->original.h, p->target.display());
+        if (!read_all(p->original.h, p->target.display(), max_text_bytes, p->old_bytes)) fail("workspace edit file exceeds 64 MiB");
+        if (sha256_hex(p->old_bytes) != change.before.sha256) fail(p->target.display() + " changed before commit; nothing was written");
+        if (!primary.empty() && same_name(primary, p->target.full(p->target.parts.size()).c_str()))
+            check_guards(arguments, p->target.display(), p->old_bytes, p->basic);
+        const TextFile text = decode(p->old_bytes);
+        if (text.binary || text.invalid || text.text != change.before.text) fail("workspace edit snapshot mismatch");
+        if (!dry && (p->basic.FileAttributes & FILE_ATTRIBUTE_READONLY)) fail(p->target.display() + " is read-only; nothing was written");
+        p->new_bytes = encode(change.after, text.encoding);
+        if (p->new_bytes.size() > max_text_bytes) fail("workspace edit result exceeds 64 MiB");
+        if (p->new_bytes == p->old_bytes) continue;
+        out += unified_diff(text.text, change.after, p->target.relative()).text;
+        pending.push_back(std::move(p));
+    }
+    if (dry) return Json::Object{{"text", "Dry run, nothing written. " + std::to_string(pending.size()) + " files would change.\n" +
+        (move_arguments ? "Would move " + string_arg(*move_arguments, "source") + " -> " + string_arg(*move_arguments, "destination") + "\n" : "") + out}};
+    // Stage every replacement and recovery before the first target is changed.
+    for (auto& p : pending) {
+        check();
+        p->replacement = stage_write(p->parent.h, p->target, p->new_bytes, p->basic.FileAttributes & kept_attributes);
+        p->recovery = stage_write(p->parent.h, p->target, p->old_bytes, p->basic.FileAttributes & kept_attributes);
+        if (!SetFileInformationByHandle(p->recovery->file.h, FileBasicInfo, &p->basic, sizeof(p->basic)))
+            fail("cannot prepare recovery metadata; nothing was written");
+    }
+    try {
+        check();
+        for (auto& p : pending) {
+            check();
+            if (const DWORD code = rename_handle(p->replacement->file.h, p->parent.h, p->target.name(), true, &p->original))
+                fail(p->target.display() + ": " + rename_error(code));
+            p->replacement->armed = false;
+            p->replacement->file.close();
+            p->committed = true;
+            p->original.close();
+            p->original = open_file(p->parent.h, p->target, FILE_SHARE_READ | FILE_SHARE_DELETE);
+            std::string actual;
+            if (!read_all(p->original.h, p->target.display(), max_text_bytes, actual) || actual != p->new_bytes)
+                fail(p->target.display() + ": replacement read-back differs");
+        }
+        // The move is last: its failure restores all preceding import/reference edits.
+        if (move_arguments) {
+            for (auto& p : pending) p->original.close();
+            out += move_file_unlocked(*move_arguments, context).get("text")->string();
+        }
+    } catch (const std::exception& error) {
+        std::string recovery_errors;
+        for (auto it = pending.rbegin(); it != pending.rend(); ++it) {
+            auto& p = *it;
+            if (!p->committed) continue;
+            try {
+                p->original.close();
+                p->original = open_file(p->parent.h, p->target, FILE_SHARE_READ | FILE_SHARE_DELETE);
+                std::string actual;
+                if (!read_all(p->original.h, p->target.display(), max_text_bytes, actual) || actual != p->new_bytes)
+                    fail("concurrent modification; recovery refused to overwrite it");
+                if (const DWORD code = rename_handle(p->recovery->file.h, p->parent.h, p->target.name(), true, &p->original))
+                    fail(rename_error(code));
+                p->recovery->armed = false;
+            } catch (const std::exception& e) {
+                std::string backup;
+                try { try_utf8(without_verbatim(final_path(p->recovery->file.h)), backup); } catch (...) {}
+                p->recovery->armed = false;
+                recovery_errors += "\n" + p->target.display() + ": " + e.what() + "; recovery bytes retained at " + backup;
+            }
+        }
+        fail(std::string(error.what()) + (recovery_errors.empty() ? "; committed text changes restored" :
+             "; recovery incomplete, inspect these files:" + recovery_errors));
+    }
+    return Json::Object{{"text", "Applied " + std::to_string(pending.size()) + " file changes.\n" + out}};
+}
+
+SourceText read_source_text(const SearchContext& context, const std::string& path) {
+    const Target target = resolve(context, path);
+    if (target.parts.empty()) fail("expected a file: " + path);
+    Handle parent = open_parent(target, false);
+    Handle file = open_file(parent.h, target, share_all);
+    std::string raw;
+    if (!read_all(file.h, path, max_text_bytes, raw)) fail(path + " is larger than 64 MiB");
+    TextFile text = decode(raw);
+    if (text.binary || text.invalid) fail(path + " is not valid Unicode source text");
+    return {std::filesystem::path(target.full(target.parts.size())), std::filesystem::path(target.root),
+            std::move(text.text), sha256_hex(raw), format_mtime(basic_info(file.h, path).LastWriteTime.QuadPart)};
+}
+
+std::vector<std::string> source_paths(const SearchContext& context, const std::string& root,
+    const std::vector<std::string>& extensions, Clock::time_point deadline,
+    const std::shared_ptr<std::atomic_bool>& cancelled) {
+    const Target target = resolve(context, root);
+    if (!target.parts.empty()) fail("LSP workspace must be a configured root");
+    Handle directory = open_root(target);
+    std::vector<std::string> paths;
+    std::function<void(HANDLE, const std::wstring&, const std::string&, std::shared_ptr<const IgnoreScope>)> walk;
+    walk = [&](HANDLE handle, const std::wstring& absolute, const std::string& relative,
+               std::shared_ptr<const IgnoreScope> scope) {
+        if (cancelled && cancelled->load()) fail("LSP request cancelled");
+        if (Clock::now() >= deadline) fail("LSP synchronization timed out");
+        std::vector<uint64_t> buffer((64 * 1024) / sizeof(uint64_t));
+        std::vector<DirEntry> entries;
+        if (!list_directory(handle, buffer, entries)) fail("cannot enumerate LSP workspace: " + root);
+        bool gitignore = false, dotignore = false;
+        for (const auto& e : entries) {
+            if (e.attributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) continue;
+            gitignore |= same_name(e.name, L".gitignore");
+            dotignore |= same_name(e.name, L".ignore");
+        }
+        if (gitignore || dotignore) {
+            auto next = std::make_shared<IgnoreScope>();
+            next->parent = scope;
+            read_ignore_rules(absolute, relative, gitignore, dotignore, next->rules);
+            if (!next->rules.empty()) scope = std::move(next);
+        }
+        for (const auto& e : entries) {
+            if (cancelled && cancelled->load()) fail("LSP request cancelled");
+            if (Clock::now() >= deadline) fail("LSP synchronization timed out");
+            if (e.attributes & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_HIDDEN)) continue;
+            std::string name;
+            if (!try_utf8(e.name, name) || name.empty() || name.front() == '.') continue;
+            const bool folder = (e.attributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+            const std::string child = relative.empty() ? name : relative + "/" + name;
+            if (ignored_path(scope.get(), child, folder)) continue;
+            if (folder) {
+                bool denied = false;
+                Handle sub(open_relative(handle, e.name, true, denied));
+                if (!sub) fail("cannot enumerate LSP directory: " + child);
+                walk(sub.h, join_path(absolute, e.name), child, scope);
+            } else {
+                std::string ext;
+                if (!try_utf8(std::filesystem::path(e.name).extension().wstring(), ext)) continue;
+                std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+                if (std::find(extensions.begin(), extensions.end(), ext) != extensions.end()) {
+                    std::string path;
+                    if (!try_utf8(join_path(absolute, e.name), path)) fail("invalid source path");
+                    paths.push_back(std::move(path));
+                }
+            }
+        }
+    };
+    walk(directory.h, target.root, "", nullptr);
+    std::sort(paths.begin(), paths.end());
+    return paths;
+}
+
 bool is_file_tool(const std::string& name) {
     return name == "read_file" || name == "list_dir" || name == "file_info" || is_write_tool(name);
 }
@@ -1519,14 +1721,75 @@ Json run_file_tool(const std::string& name, const Json& arguments, const SearchC
     if (!std::holds_alternative<Json::Object>(arguments.value)) fail("arguments must be an object");
     if (context.read_only && is_write_tool(name)) fail(name + " is disabled: this server runs with --read-only");
     reject_unknown(name, arguments);
-    if (name == "read_file") return read_file(arguments, context);
-    if (name == "list_dir") return list_dir(arguments, context, cancelled);
-    if (name == "file_info") return file_info(arguments, context);
-    if (name == "edit_file") return edit_file(arguments, context);
-    if (name == "write_file") return write_file(arguments, context);
-    if (name == "move_file") return move_file(arguments, context);
-    if (name == "create_directory") return create_directory(arguments, context);
-    fail("unknown tool");
+    const bool want_diagnostics = is_write_tool(name) && bool_arg(arguments, "diagnostics", false);
+    const bool dry_run = is_write_tool(name) && bool_arg(arguments, "dry_run", false);
+    if (name == "edit_file") (void)max_output_arg(arguments);
+    if (cancelled && cancelled->load()) fail("request cancelled");
+    const std::string operation = arguments.get("operation") ? string_arg(arguments, "operation") : "auto";
+    if (name == "read_file") return read_file(arguments, context, cancelled);
+    if (name == "list_dir") {
+        if (operation == "auto" || operation == "filesystem") return list_dir(arguments, context, cancelled);
+        if (operation != "overview") fail("list_dir operation must be filesystem or overview");
+        for (const char* key : {"hidden", "no_ignore", "max_results", "max_output_bytes"})
+            if (arguments.get(key)) fail(std::string(key) + " is only for filesystem listing");
+        Json::Object query = arguments.object();
+        if (!query.contains("path")) query.emplace("path", ".");
+        return Json::Object{{"text", lsp_query("overview", query, context, cancelled).dump() + "\n"}};
+    }
+    if (name == "file_info") {
+        if (operation == "auto" || operation == "metadata") {
+            if (arguments.get("name_path") || arguments.get("severity")) fail("name_path/severity require diagnostics");
+            return file_info(arguments, context);
+        }
+        if (operation != "lsp" && operation != "diagnostics" && operation != "restart")
+            fail("file_info operation must be metadata, lsp, diagnostics, or restart");
+        if (arguments.get("max_output_bytes")) fail("LSP information has no output byte cap");
+        if (operation != "diagnostics" && (arguments.get("name_path") || arguments.get("severity")))
+            fail("name_path/severity require diagnostics");
+        const std::string method = operation == "lsp" ? "status" : operation;
+        if (!arguments.get("paths")) return Json::Object{{"text", lsp_query(method, arguments, context, cancelled).dump() + "\n"}};
+        std::string out;
+        for (const auto& path : path_args(arguments)) {
+            Json::Object query = arguments.object(); query.erase("paths"); query["path"] = path;
+            try { out += lsp_query(method, query, context, cancelled).dump() + "\n"; }
+            catch (const std::exception& e) { out += "[error " + path + ": " + e.what() + "]\n"; }
+        }
+        return Json::Object{{"text", std::move(out)}};
+    }
+    Json result;
+    if (name == "edit_file") {
+        if (operation != "auto" && operation != "symbol" && operation != "text" && operation != "insert_before" &&
+            operation != "insert_after" && operation != "rename" && operation != "safe_delete") fail("unknown edit_file operation");
+        const bool semantic = operation != "text" && (operation != "auto" || arguments.get("name_path"));
+        if (semantic) {
+            if (arguments.get("edits")) fail("semantic edits do not accept text edits");
+            if (operation != "rename" && arguments.get("new_name")) fail("new_name requires operation=rename");
+            if ((operation == "rename" || operation == "safe_delete") && arguments.get("new_text")) fail("rename/safe_delete do not accept new_text");
+            result = lsp_edit(arguments, context, cancelled);
+        } else {
+            for (const char* key : {"name_path", "new_text", "new_name", "line", "column"})
+                if (arguments.get(key)) fail(std::string(key) + " is only for semantic edits");
+            result = edit_file(arguments, context);
+        }
+    } else if (name == "write_file") result = write_file(arguments, context);
+    else if (name == "move_file") result = lsp_move(arguments, context, cancelled);
+    else if (name == "create_directory") result = create_directory(arguments, context);
+    else fail("unknown tool");
+    if (!dry_run) {
+        lsp_after_mutation(result, name, arguments, context, cancelled);
+        if (want_diagnostics) {
+            try {
+                Json::Object query{{"path", string_arg(arguments, "path")}};
+                if (const Json* timeout = arguments.get("timeout_ms")) query.emplace("timeout_ms", *timeout);
+                auto& text = std::get<Json::Object>(result.value).at("text");
+                text = text.string() + lsp_query("diagnostics", query, context, cancelled).dump() + "\n";
+            } catch (const std::exception& e) {
+                auto& text = std::get<Json::Object>(result.value).at("text");
+                text = text.string() + "[warning: write applied; diagnostics unavailable: " + e.what() + "]\n";
+            }
+        }
+    }
+    return result;
 }
 
 // CONTRACT: these descriptions are the model's only documentation of the tools; every statement must match the
@@ -1548,33 +1811,45 @@ Json file_tool_definitions(bool read_only) {
     const Json path = field("string", path_text);
     const Json paths = Json::Object{{"type", "array"}, {"items", Json::Object{{"type", "string"}}},
         {"description", "Up to 32 paths instead of path."}};
-    const Json max_output = field("integer", "512-1048576, default 65536.");
+    const Json max_output = field("integer", "Optional byte cap, 512-1048576. Default unlimited.");
     const Json expected_sha256 = field("string", "Fail if the file's sha256 (from read_file) changed.");
     const Json expected_mtime = field("string", "Fail if the file's mtime (from read_file) changed.");
     const std::string common_paths = " Links are never followed.";
 
     Json::Array tools;
     tools.push_back(Json::Object{{"name", "read_file"}, {"description",
-        "Read whole text files with line numbers (\"    42\xE2\x86\x92text\"). The header gives encoding, line endings, "
-        "mtime and sha256. Binary and >64 MiB files are refused." + common_paths},
+        "Read live code through LSP: symbol overview by default, or name_path for a symbol body. "
+        "Explicit offset/limit or operation=text reads lines (default 200). Unconfigured formats use text. "
+        "No output byte cap. Text header includes encoding, mtime and sha256; binary and >64 MiB refused." + common_paths},
         {"inputSchema", schema(Json::Object{{"path", path}, {"paths", paths},
             {"offset", field("integer", "First line, from 1.")},
-            {"limit", field("integer", "Lines per file.")},
-            {"line_numbers", field("boolean", "Default true.")},
-            {"max_output_bytes", field("integer", "Default: unlimited.")}})}});
+            {"limit", field("integer", "Text lines per file; default 200, increase for larger reads.")},
+            {"operation", choice(Json::Array{"auto", "overview", "symbol", "text"}, "Default auto: LSP if configured, otherwise text.")},
+            {"name_path", field("string", "Read this symbol's complete body; slash-separated parent/name with optional overload [i].")},
+            {"include_kinds", Json::Object{{"type", "array"}, {"items", Json::Object{{"type", "integer"}}}, {"description", "LSP kinds 1-26 to include."}}},
+            {"exclude_kinds", Json::Object{{"type", "array"}, {"items", Json::Object{{"type", "integer"}}}, {"description", "LSP kinds to exclude."}}},
+            {"depth", field("integer", "Overview child depth; default 0, -1 all.")},
+            {"timeout_ms", field("integer", "LSP deadline, 1-300000; default 30000.")},
+            {"line_numbers", field("boolean", "Text line numbers; default true.")}})}});
     tools.push_back(Json::Object{{"name", "list_dir"}, {"description",
         "List files and folders: \"d sub/\", \"f name SIZE\", \"l link\"." + common_paths},
         {"inputSchema", schema(Json::Object{
             {"path", field("string", "Folder; default the first root.")},
-            {"depth", field("integer", "1-32, default 1.")},
+            {"operation", choice(Json::Array{"filesystem", "overview"}, "Default filesystem; overview returns live LSP symbols by file.")},
+            {"depth", field("integer", "Filesystem: 1-32, default 1. Overview: child depth, default 0, -1 all.")},
             {"hidden", field("boolean", "Include hidden entries.")},
             {"no_ignore", field("boolean", "Include .gitignore/.ignore'd entries.")},
-            {"max_results", field("integer", "Default 500.")},
+            {"max_results", field("integer", "Optional entry limit, 1-10000; default unlimited.")},
             {"timeout_ms", field("integer", "Default 30000.")},
             {"max_output_bytes", max_output}})}});
     tools.push_back(Json::Object{{"name", "file_info"}, {"description",
-        "Type, size, mtime, attributes; for text also encoding, lines, line endings and sha256." + common_paths},
-        {"inputSchema", schema(Json::Object{{"path", path}, {"paths", paths}, {"max_output_bytes", max_output}})}});
+        "Disk metadata, or operation=lsp for server capabilities, diagnostics for current file/symbol problems, restart for LSP recovery." + common_paths},
+        {"inputSchema", schema(Json::Object{{"path", path}, {"paths", paths},
+            {"operation", choice(Json::Array{"metadata", "lsp", "diagnostics", "restart"}, "Default metadata. lsp/restart may omit path to address all configured servers.")},
+            {"name_path", field("string", "diagnostics: restrict to this symbol.")},
+            {"severity", field("integer", "diagnostics: highest numeric severity to include, 1-4; default 4.")},
+            {"timeout_ms", field("integer", "LSP deadline, 1-300000; default 30000.")},
+            {"max_output_bytes", max_output}})}});
     if (read_only) return tools;
 
     const Json edit_item = Json::Object{{"type", "object"}, {"additionalProperties", false},
@@ -1584,17 +1859,27 @@ Json file_tool_definitions(bool read_only) {
             {"new_text", field("string", "Replacement.")},
             {"replace_all", field("boolean", "Replace every match.")}}}};
     tools.push_back(Json::Object{{"name", "edit_file"}, {"description",
-        "Exact-text edits, applied in order, all or none, atomically; keeps encoding and line endings (\\n matches "
-        "CRLF). Returns a diff." + common_paths},
+        "Live LSP symbol replace, insert_before/insert_after, rename across files, or reference-checked safe_delete. "
+        "Text edits remain available. Snapshot guards, encoding preservation, dry-run diffs and rollback on commit failure; atomic per file." + common_paths},
         {"inputSchema", schema(Json::Object{{"path", path},
             {"edits", Json::Object{{"type", "array"}, {"items", edit_item}, {"description", "1-256 edits."}}},
+            {"operation", choice(Json::Array{"auto", "symbol", "insert_before", "insert_after", "rename", "safe_delete", "text"}, "Default auto: name_path selects symbol replacement; edits selects text.")},
+            {"name_path", field("string", "Unique slash-separated symbol path; overload [i] supported.")},
+            {"new_name", field("string", "rename: new identifier; language server computes all affected files.")},
+            {"line", field("integer", "rename: 1-based line instead of name_path.")},
+            {"column", field("integer", "rename: 1-based UTF-16 column with line.")},
+            {"diagnostics", field("boolean", "Return diagnostics for the primary file after a successful write; default false.")},
+            {"new_text", field("string", "Complete replacement symbol, including declaration; used with name_path.")},
+            {"timeout_ms", field("integer", "LSP deadline, 1-300000; default 30000.")},
             {"dry_run", field("boolean", "Diff only, write nothing.")},
             {"expected_sha256", expected_sha256}, {"expected_mtime", expected_mtime},
-            {"max_output_bytes", max_output}}, Json::Array{"path", "edits"})}});
+            {"max_output_bytes", field("integer", "Optional diff byte cap; no cap by default.")}}, Json::Array{"path"})}});
     tools.push_back(Json::Object{{"name", "write_file"}, {"description",
         "Create or replace a file atomically; creates parent folders." + common_paths},
         {"inputSchema", schema(Json::Object{{"path", path},
             {"content", field("string", "Full contents.")},
+            {"diagnostics", field("boolean", "Include diagnostics after writing; default false.")},
+            {"timeout_ms", field("integer", "Diagnostic deadline, 1-300000; default 30000.")},
             {"overwrite", field("boolean", "Replace an existing file.")},
             {"line_endings", choice(Json::Array{"lf", "crlf"}, "Default: the replaced file's, else as given.")},
             {"encoding", choice(Json::Array{"utf-8", "utf-8-bom", "utf-16le", "utf-16be"},
@@ -1602,10 +1887,13 @@ Json file_tool_definitions(bool read_only) {
             {"expected_sha256", expected_sha256}, {"expected_mtime", expected_mtime}},
             Json::Array{"path", "content"})}});
     tools.push_back(Json::Object{{"name", "move_file"}, {"description",
-        "Move or rename a file or folder on one volume, atomically." + common_paths},
+        "Move a file/folder; auto asks configured LSP servers for import edits when supported. Refactor requires that support; filesystem moves paths. Active servers refresh after success." + common_paths},
         {"inputSchema", schema(Json::Object{{"source", field("string", path_text)},
             {"destination", field("string", path_text)},
-            {"overwrite", field("boolean", "Replace an existing file.")}},
+            {"operation", choice(Json::Array{"auto", "refactor", "filesystem"}, "Default auto. refactor requires willRenameFiles; filesystem bypasses semantic import edits.")},
+            {"dry_run", field("boolean", "Preview import edits and move without writing.")},
+            {"timeout_ms", field("integer", "LSP deadline, 1-300000; default 30000.")},
+            {"overwrite", field("boolean", "Replace an existing file; requires operation=filesystem.")}},
             Json::Array{"source", "destination"})}});
     tools.push_back(Json::Object{{"name", "create_directory"}, {"description",
         "Create a folder and its parents (mkdir -p)." + common_paths},

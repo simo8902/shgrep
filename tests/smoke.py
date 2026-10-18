@@ -29,6 +29,8 @@ def main():
         )
 
         def call(method, params=None, request_id=1):
+            if method == "tools/call" and params and params.get("name") == "search":
+                params = {**params, "arguments": {"operation": "text", **params.get("arguments", {})}}
             message = {"jsonrpc": "2.0", "id": request_id, "method": method}
             if params is not None:
                 message["params"] = params
@@ -45,9 +47,12 @@ def main():
             return json.loads(reply["content"][0]["text"])
 
         def tool_text(name, arguments, request_id):
+            if name in {"search", "find_files"}:
+                arguments = {"paths": "absolute", **arguments}
             reply = call("tools/call", {"name": name, "arguments": arguments}, request_id)
             assert not reply.get("isError"), reply
-            return reply["content"][0]["text"]
+            text = reply["content"][0]["text"]
+            return text.split("\n", 1)[1] if text.startswith("[paths ") else text
 
         def tool_error(name, arguments, request_id):
             reply = call("tools/call", {"name": name, "arguments": arguments}, request_id)
@@ -148,7 +153,7 @@ def main():
                                                "include": ["feat/a.txt"]}, 45)
             assert per_pattern == f"{a}:3 [0:2 1:1]\n", per_pattern
             relative = tool_text("search", {"pattern": "alpha", "paths": "relative", "include": ["feat/*"]}, 46)
-            assert relative == f"[paths relative to {root}]\nfeat\\a.txt:2:drop alpha\n", relative
+            assert relative == "feat\\a.txt:2:drop alpha\n", relative
             bad_invert = call("tools/call", {"name": "search", "arguments": {"pattern": "x", "invert": True,
                                                                            "output": "json"}}, 47)
             assert bad_invert.get("isError") is True, bad_invert
@@ -207,13 +212,15 @@ def main():
             crlf = ft / "crlf.txt"
             crlf.write_bytes(b"one\r\ntwo\r\nthree\r\n")
             header, *body = tool_text("read_file", {"path": "ft/crlf.txt"}, 102).splitlines(keepends=True)
-            assert header.startswith(f"[file {crlf} | 3 lines, 18 bytes | utf-8, crlf, final newline | mtime "), header
+            assert header.startswith(f"[file {crlf} | 3 lines, 17 bytes | utf-8, crlf, final newline | mtime "), header
             assert body == ["     1→one\n", "     2→two\n", "     3→three\n"], body
             sha = header.rsplit("sha256 ", 1)[1].rstrip("]\n")
             assert sha == hashlib.sha256(b"one\r\ntwo\r\nthree\r\n").hexdigest(), header
             big = ft / "big.txt"
             big.write_bytes(b"".join(b"line %d " % i + b"x" * 100 + b"\n" for i in range(5000)))
-            whole = tool_text("read_file", {"path": "ft/big.txt"}, 134)
+            default_window = tool_text("read_file", {"path": "ft/big.txt"}, 133)
+            assert "showed lines 1-200 of 5000" in default_window, default_window[-300:]
+            whole = tool_text("read_file", {"path": "ft/big.txt", "limit": 5000}, 134)
             assert "[status" not in whole and whole.endswith("  5000→line 4999 " + "x" * 100 + "\n"), whole[-300:]
             window = tool_text("read_file", {"path": str(crlf), "offset": 2, "limit": 1}, 103).splitlines()[1:]
             assert window == ["     2→two",
@@ -267,7 +274,7 @@ def main():
             (ft / ".hidden.txt").write_bytes(b"h")
             (ft / ".gitignore").write_bytes(b"*.log\n")
             (ft / "x.log").write_bytes(b"l")
-            listing = tool_text("list_dir", {"path": "ft", "depth": 2}, 120)
+            listing = tool_text("list_dir", {"path": "ft", "depth": 2, "hidden": True, "no_ignore": True}, 120)
             assert "d sub/\n" in listing and "f sub/new.txt 4\n" in listing and "f bom.txt 7\n" in listing, listing
             assert "f x.log 1\n" in listing and "f .hidden.txt 1\n" in listing and "[not shown" not in listing, listing
             filtered = tool_text("list_dir", {"path": "ft", "hidden": False, "no_ignore": False}, 121)
@@ -284,7 +291,7 @@ def main():
             assert tool_text("create_directory", {"path": "ft/a/b"}, 126).startswith("Already exists")
             tool_text("move_file", {"source": "ft/sub/new.txt", "destination": "ft/moved/renamed.txt"}, 127)
             assert (ft / "moved" / "renamed.txt").read_bytes() == b"a\nb\n" and not (ft / "sub" / "new.txt").exists()
-            assert "overwrite: true" in tool_error("move_file", {"source": "ft/bom.txt",
+            assert "already exists" in tool_error("move_file", {"source": "ft/bom.txt",
                                                                  "destination": "ft/moved/renamed.txt"}, 128)
             # Junctions below the root are refused for reads and writes, and listed without being entered.
             try:
@@ -301,7 +308,7 @@ def main():
             # search: max_line_bytes 0 turns off the 400-byte window around long-line matches.
             long_line = ft / "long.txt"
             long_line.write_bytes(b"a" * 600 + b"needle" + b"b" * 600 + b"\n")
-            windowed = tool_text("search", {"pattern": "needle", "include": ["ft/long.txt"]}, 132)
+            windowed = tool_text("search", {"pattern": "needle", "include": ["ft/long.txt"], "max_line_bytes": 400}, 132)
             assert "..." in windowed and len(windowed) < 600, windowed
             whole = tool_text("search", {"pattern": "needle", "include": ["ft/long.txt"], "max_line_bytes": 0}, 133)
             assert whole == f"{long_line}:1:" + "a" * 600 + "needle" + "b" * 600 + "\n", whole[:200]
@@ -342,13 +349,13 @@ def main():
         filename_cli = subprocess.run([str(executable), "find_files", source.name,
                                        "--root", str(root)],
                                       capture_output=True, text=True, encoding="utf-8", check=True)
-        assert str(source) in filename_cli.stdout, filename_cli.stdout
+        assert source.name in filename_cli.stdout, filename_cli.stdout
         oversized_cli = subprocess.run([str(executable), "search", "--root", str(root),
                                         "--pattern", "changed", "--include", "*source.cpp",
                                         "--max-file-bytes", "1"],
                                        capture_output=True, text=True, encoding="utf-8", check=True)
         assert "Skipped oversized text file:" in oversized_cli.stdout, oversized_cli.stdout
-        assert str(source) in oversized_cli.stdout, oversized_cli.stdout
+        assert source.name in oversized_cli.stdout, oversized_cli.stdout
     print("MCP smoke checks passed")
 
 
