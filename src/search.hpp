@@ -12,8 +12,6 @@ struct SearchContext {
     std::vector<std::filesystem::path> allowed_roots;
     // --read-only: the write tools (edit_file, write_file, move_file, create_directory) are neither listed nor run.
     bool read_only = false;
-    // Set by the STDIO MCP entry point. CLI/internal scans never bypass a required MCP selection.
-    bool laya_required = false;
     // --live-index (MCP server): each root has a watched index, and searches use it unless they pass index: false.
     bool live_index = false;
 };

@@ -3,7 +3,7 @@
 #include "dfa.hpp"
 #include "files.hpp"
 #include "lsp.hpp"
-#include "laya.hpp"
+#include "rank.hpp"
 #include "ignore.hpp"
 #include "teddy.hpp"
 #include "winfs.hpp"
@@ -5747,11 +5747,14 @@ Json run_unlocked(const std::string& name, const Json& arguments, const SearchCo
     if (name == "index") return build_index(context, cancelled);
     if (name != "search" && name != "search_bytes" && name != "find_files") throw std::runtime_error("unknown tool");
     Request r = parse_request(name, arguments, context);
-    const bool require_laya = context.laya_required && name == "search";
+    // CONTRACT: an intent turns on keyword ranking of the findings (hunks, best first, capped per file); without one
+    //   the search returns every finding in scan order, exactly as before.
+    const std::string intent = name == "search" ? text(arguments, "intent") : std::string();
+    const bool ranking = intent.find_first_not_of(" \t\r\n") != std::string::npos;
     const uint32_t requested_results = r.max_results, requested_per_file = r.max_per_file;
     const size_t requested_output = r.max_output;
-    if (require_laya) {
-        // CONTRACT: selection sees every finding. Explicit result/output limits apply afterwards.
+    if (ranking) {
+        // CONTRACT: ranking sees every finding. Explicit result/output limits apply afterwards.
         r.max_results = UINT32_MAX;
         r.max_per_file = UINT32_MAX;
         r.max_output = SIZE_MAX;
@@ -5761,9 +5764,8 @@ Json run_unlocked(const std::string& name, const Json& arguments, const SearchCo
     }
     const auto started = Clock::now();
     Control control{cancelled, request_deadline(started + std::chrono::milliseconds(r.timeout_ms))};
-    std::unique_ptr<LayaSelector> selector;
-    if (require_laya)
-        selector = std::make_unique<LayaSelector>(text(arguments, "intent"), cancelled, control.deadline);
+    std::unique_ptr<Ranker> ranker;
+    if (ranking) ranker = std::make_unique<Ranker>(intent);
     const int64_t began = ticks();
     std::shared_ptr<const Database> database;
     if (!r.file_only) database = compiled_database(r, context);
@@ -5913,23 +5915,9 @@ Json run_unlocked(const std::string& name, const Json& arguments, const SearchCo
         for (size_t i : order) sorted.push_back(std::move(results[i]));
         results = std::move(sorted);
     }
-    std::unique_ptr<LayaFingerprint> evidence_snapshot;
-    if (selector && state == "complete" && (!blocks.empty() || !results.empty())) {
-        evidence_snapshot = std::make_unique<LayaFingerprint>();
-        if (text_output) {
-            if (!relative_prefix.empty() && !blocks.empty())
-                evidence_snapshot->add("[paths relative to " + relative_root + "]\n");
-            for (size_t i = 0; i < blocks.size(); ++i) {
-                if (i && r.output == "lines" && (r.before_lines || r.after_lines)) evidence_snapshot->add("--\n");
-                evidence_snapshot->add(blocks[i].text);
-            }
-        } else {
-            for (const auto& item : results) { evidence_snapshot->add(item.dump()); evidence_snapshot->add("\n"); }
-        }
-    }
-    Json laya_report;
-    if (selector) {
-        // CONTRACT: Laya ranks hunks of the text output (groups between "--" separators, or nearby matched lines
+    Json rank_report;
+    if (ranker) {
+        // CONTRACT: ranking orders hunks of the text output (groups between "--" separators, or nearby matched lines
         //   when there are none) or groups of json results with overlapping context. The returned groups keep their
         //   original output text and come best first; explicit result/output limits apply afterwards.
         struct Piece {
@@ -6044,10 +6032,10 @@ Json run_unlocked(const std::string& name, const Json& arguments, const SearchCo
                 pieces.push_back(std::move(group));
             }
         }
-        std::vector<LayaCandidate> laya_candidates;
-        laya_candidates.reserve(pieces.size());
-        for (const auto& piece : pieces) laya_candidates.push_back({piece.path, piece.first, piece.last, piece.code});
-        const std::vector<LayaRanked> ranked = selector->rank(laya_candidates);
+        std::vector<RankCandidate> rank_candidates;
+        rank_candidates.reserve(pieces.size());
+        for (const auto& piece : pieces) rank_candidates.push_back({piece.path, piece.first, piece.last, piece.code});
+        const std::vector<Ranked> ranked = ranker->rank(rank_candidates);
         if (text_output) {
             std::vector<TextBlock> kept_blocks;
             kept_blocks.reserve(ranked.size());
@@ -6059,19 +6047,18 @@ Json run_unlocked(const std::string& name, const Json& arguments, const SearchCo
         } else {
             Json::Array kept_results;
             for (size_t position = 0; position < ranked.size(); ++position) {
-                const LayaRanked& pick = ranked[position];
+                const Ranked& pick = ranked[position];
                 for (size_t i : pieces[pick.index].items) {
                     Json item = std::move(results[i]);
-                    std::get<Json::Object>(item.value).emplace("laya", Json::Object{
+                    std::get<Json::Object>(item.value).emplace("ranking", Json::Object{
                         {"rank", static_cast<int64_t>(position + 1)},
-                        {"lexical_rank", static_cast<int64_t>(pick.lexical_rank + 1)},
-                        {"p", pick.scored ? Json(pick.probability) : Json()}, {"score", pick.score}});
+                        {"keyword_rank", static_cast<int64_t>(pick.keyword_rank + 1)}, {"score", pick.score}});
                     kept_results.push_back(std::move(item));
                 }
             }
             results = std::move(kept_results);
         }
-        laya_report = selector->report();
+        rank_report = ranker->report();
         r.max_results = requested_results;
         r.max_per_file = requested_per_file;
         r.max_output = requested_output;
@@ -6107,32 +6094,6 @@ Json run_unlocked(const std::string& name, const Json& arguments, const SearchCo
             limited_results.push_back(std::move(item));
         }
         results = std::move(limited_results);
-        if (const char* why = control.interrupted())
-            throw std::runtime_error(std::string("LAYA_REQUIRED: ") + why + "; selection is incomplete");
-    }
-    if (evidence_snapshot) {
-        // CONTRACT: inference can take seconds. Re-read disk and reject changed findings rather than return stale code.
-        SearchContext verification_context = context;
-        verification_context.laya_required = false;
-        Json::Object verification_args = arguments.object();
-        for (const char* key : {"intent", "max_results", "max_matches_per_file", "max_output_bytes", "profile", "color"})
-            verification_args.erase(key);
-        verification_args["index"] = false;
-        const Json fresh = run_unlocked(name, verification_args, verification_context, cancelled);
-        const Json* fresh_summary = fresh.get("summary");
-        if (!fresh_summary || fresh_summary->get("status")->string() != "complete")
-            throw std::runtime_error("LAYA_REQUIRED: freshness verification was incomplete; retry");
-        LayaFingerprint checked;
-        if (text_output) checked.add(fresh.get("text")->string());
-        else for (const auto& item : fresh.get("results")->array()) { checked.add(item.dump()); checked.add("\n"); }
-        if (checked.finish() != evidence_snapshot->finish())
-            throw std::runtime_error("LAYA_REQUIRED: filesystem findings changed during selection; retry");
-        auto& report = std::get<Json::Object>(laya_report.value);
-        report.emplace("freshness_verified", true);
-        report.emplace("verification_files_scanned", *fresh_summary->get("files_scanned"));
-        report.emplace("verification_bytes_scanned", *fresh_summary->get("bytes_scanned"));
-        if (const char* why = control.interrupted())
-            throw std::runtime_error(std::string("LAYA_REQUIRED: ") + why + "; freshness verification was incomplete");
     }
     const int64_t ordered = ticks();
     auto elapsed = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - started).count());
@@ -6173,15 +6134,15 @@ Json run_unlocked(const std::string& name, const Json& arguments, const SearchCo
             std::string display;
             if (try_utf8(root.path, display)) footer.roots.push_back(std::move(display));
         }
-        // Laya returns block-mode hunks one per block, so they need the separator the scan put between them.
-        const bool separate_files = r.output == "lines" && (r.before_lines || r.after_lines || (selector && r.block));
+        // Ranking returns block-mode hunks one per block, so they need the separator the scan put between them.
+        const bool separate_files = r.output == "lines" && (r.before_lines || r.after_lines || (ranking && r.block));
         for (;;) {
             std::string text;
             uint64_t units = 0;
             size_t length = 0;
             for (const auto& block : blocks) length += block.text.size() + 3;
             text.reserve(length + 1024);
-            if (selector) text += "[laya selection " + laya_report.dump() + "]\n";
+            if (ranking) text += "[ranking " + rank_report.dump() + "]\n";
             if (!relative_prefix.empty() && !blocks.empty()) text += "[paths relative to " + relative_root + "]\n";
             for (size_t i = 0; i < blocks.size(); ++i) {
                 if (separate_files && i) text += "--\n";
@@ -6190,9 +6151,7 @@ Json run_unlocked(const std::string& name, const Json& arguments, const SearchCo
             }
             footer.state = state;
             // Selection can retain supporting context without a grep hit; do not claim the scan found nothing.
-            footer.returned = selector && out.found.load() ? std::max<uint64_t>(units, 1) : units;
-            if (selector && blocks.empty() && out.found.load())
-                text += "Laya selected no evidence; the live scan did find matches. Refine the intent or search scope.\n";
+            footer.returned = ranking && out.found.load() ? std::max<uint64_t>(units, 1) : units;
             text += render_footer(r, footer, skipped_files);
             text += index_note;
             // PERF: blocks were budgeted while publishing, so this loop rarely drops anything.
@@ -6220,7 +6179,7 @@ Json run_unlocked(const std::string& name, const Json& arguments, const SearchCo
         Json::Object payload{{"results", results}, {"skipped_files", skipped_files},
             {"summary", summary(files, out.bytes.load(), out.found.load(), results.size(), errors, skipped_size,
                                 out.skipped_binary.load(), elapsed, state)}};
-        if (selector) payload.emplace("laya", laya_report);
+        if (ranking) payload.emplace("ranking", rank_report);
         if (show_selection)
             payload.emplace("selection", Json::Object{{"regular_files_seen", out.regular_seen.load()},
                 {"files_filtered", out.files_filtered.load()}, {"files_ignored", out.files_ignored.load()},
@@ -6290,7 +6249,7 @@ Json tool_definitions() {
 
     auto search_props = content_props;
     search_props.emplace("intent", field("string",
-        "Required for operation=text: the user's task; local Laya ranks the findings against it, best first."));
+        "Optional for operation=text: the user's task. With it the findings are ranked against it by keywords (BM25) and the best hunks return first."));
     search_props.emplace("operation", choice(Json::Array{"symbols", "definition", "declaration", "type_definition", "implementation", "references", "hover", "text"},
         "Default symbols via LSP. text uses live grep; its text filters and budgets apply only there."));
     search_props.emplace("path", field("string", "File or folder to limit text search or symbols to; other navigation needs a file. Omit for all workspaces."));
@@ -6351,9 +6310,9 @@ Json tool_definitions() {
             "Navigate live code through LSP: symbols, definition/declaration/type_definition, implementation, references, or hover. "
             "Bodies are opt-in; no LSP output cap. Lua, XML, C/C++, Rust and Python work out of the box; .shgrep/lsp.json adds or overrides servers. "
             "A failing server is reported in a leading [LSP FAILURE ...] line, to relay to the user, followed by whole-word text matches. "
-            "operation=text requires intent and a local llama-server with Laya: findings are ranked by keywords, the best re-ranked by Laya, "
-            "and the top hunks return best first with their original text; the laya report gives the counts. An unreachable "
-            "Laya is an error. Grep filters apply, including XML and files without a language server."},
+            "operation=text takes an optional intent: with it, hunks are ranked by BM25 against the task and the best 10 return first "
+            "(at most 3 per file) with their original text; without it every finding returns in scan order. "
+            "Grep filters apply, including XML and files without a language server."},
             {"inputSchema", schema(search_props)}},
         Json::Object{{"name", "search_bytes"}, {"description",
             "Search raw bytes of any file (no decoding or binary skipping) by hex or byte regex; exact offsets."},

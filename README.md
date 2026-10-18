@@ -1,51 +1,34 @@
 # shgrep
 
-## Required local Laya
+## Ranked text search
 
-MCP search with operation="text" requires intent and a local llama-server running the Laya GGUF. There is no MCP opt-out or raw fallback. LSP navigation, explicit file reads, binary search and filename search keep their existing contracts. The native CLI remains the raw engine used by comparison benchmarks.
+MCP search with operation="text" takes an optional `intent`, the user's task in words. With it, the findings are ranked against it and only the best come back; without it every finding returns in scan order, exactly as before. Ranking is local, needs no model or server, and keeps no state between requests.
 
-Start llama-server on the GPU (check `llama-server --list-devices` lists it; `-c 8192 -np 4` gives each slot 2048 tokens, more than one decision needs):
+How a ranked search works:
 
-    llama-server -m Laya-Q8_0.gguf -ngl 99 -c 8192 -np 4 --host 127.0.0.1 --port 8080
-
-shgrep talks to it directly over loopback; there is no bridge process.
+1. The live scan's findings become candidates: text hunks (groups between `--` separators, or nearby matched lines), or json results grouped where their context overlaps.
+2. BM25 (k1 1.2, b 0.75) of the intent over each candidate's path and code orders them. Identifiers are split at `_` and camelCase, and instruction words (find, show, where, the, ...) are ignored. Ties keep scan order.
+3. At most 3 candidates per file and the best 10 overall come back, best first, with their original output text. json results carry `ranking: {rank, keyword_rank, score}`.
+4. Explicit limits (`max_results`, `max_matches_per_file`, `max_output_bytes`) apply after ranking. Responses include a ranking report (a leading `[ranking ...]` line for text): candidates, returned and the active limits. summary.matches_found describes the raw scan; matches_returned the returned matches.
 
 | Setting | Default | Effect |
 |---|---|---|
-| SHGREP_LAYA_PORT | 8080 | llama-server port on 127.0.0.1 |
-| SHGREP_LAYA_TOKEN | unset | sent as `Authorization: Bearer`, for llama-server `--api-key` |
-| SHGREP_LAYA_BUDGET_MS | 2000 | Laya time per search, capped at half the remaining timeout_ms |
-| SHGREP_LAYA_POOL | 24 | best keyword candidates kept, at most 3 per file (0 = all, no per-file cap) |
-| SHGREP_LAYA_SCORE | 16 | of those, how many Laya scores (0 = all) |
-| SHGREP_LAYA_RETURN | 10 | most hunks returned (0 = the whole pool, no P filter) |
-| SHGREP_LAYA_FILTER | 0 | minimum P in percent for a scored hunk to be kept, at least 3 kept (0 = no filter, order only; 50 cost 10 points of recall in the 30-question eval) |
-| SHGREP_LAYA_WEIGHT | 100 | weight of Laya's rank against the keyword rank in the RRF fusion, in percent (100 = equal, 0 = keyword order) |
+| SHGREP_RANK_RETURN | 10 | most candidates returned (0 = all) |
+| SHGREP_RANK_PER_FILE | 3 | most candidates per file (0 = no cap) |
 
-How a search is ranked (the laya-codex design, so a converted laya-code GGUF needs no change):
-
-1. The live scan's findings become candidates: text hunks (groups between `--` separators, or nearby matched lines), or json results grouped where their context overlaps.
-2. Request-local BM25 of the intent over each candidate's path and code orders them; the top SHGREP_LAYA_POOL stay, at most 3 per file.
-3. The best SHGREP_LAYA_SCORE get one Laya `noul` decision each, in parallel up to the server's slots: `Is this source code relevant to the software change: "<intent>"?` over `file: <path> (lines a-b)` and the first 400 bytes of code (about 128 tokens).
-4. Scored candidates are ordered by RRF (k = 60) of their keyword and Laya ranks. With SHGREP_LAYA_FILTER set, hunks below that P are dropped (at least 3 kept). When the budget ends first, unscored candidates keep keyword order below the scored ones; the report says `laya-partial` or `lexical`. That is not an error.
-5. At most SHGREP_LAYA_RETURN come back best first with their original output text; json results carry `laya: {rank, lexical_rank, p, score}`.
-
-An unreachable or failing llama-server, cancellation and the request timeout are errors. A final live scan verifies the findings after inference; changed findings cause a retry error. Responses include the laya report (a leading [laya selection ...] line for text): mode, candidates, pool, scored, unscored, returned, budget and Laya time. summary.matches_found describes the raw scan; matches_returned describes the returned matches after explicit limits. Scores are comparative and are not calibrated for code retrieval.
-
-No searched text, decisions or results persist between requests. The running llama-server owns model memory and model files.
+Measured on 30 doc-comment questions in a Rust and Python repository (`tests/retrieval_eval.py`): the right function was ranked first for 87% of questions (77% with `--hard`) and returned about 6,000 tokens instead of about 123,000 for grep plus reading the file. Models were tried as a second stage (Laya System One decision models, a Qwen reranker); none is part of shgrep. The Laya integration and its evals are in commit 1b89e50 ("SYSTEM ONE").
 
 Example text search:
 
     {"operation":"text","patterns":["combat","transaction"],"intent":"Locate where a combat tick emits its transaction"}
 
-User-run checks against the real model (llama-server running):
+User-run ranking checks (no model, no server):
 
-    python tests\laya_checks.py build-rel\shgrep.exe
+    python tests\rank_checks.py build-rel\shgrep.exe
 
-Retrieval quality, Laya against keyword-only ranking on the same pool:
+Retrieval quality, ranked against unranked results (add --hard to drop question words that also appear in the answer's code):
 
     python tests\retrieval_eval.py build-rel\shgrep.exe "C:\Users\Simeon\Documents\rust-experimental" --count 30
-
-The source/protocol regression clients (smoke.py, lsp_smoke.py) also need llama-server. They run with a zero budget and no pool or return limit, so every finding comes back in scan order.
 
 ## mcp__shgrep__create_directory
 

@@ -6,13 +6,12 @@ import pathlib
 import subprocess
 import sys
 import tempfile
-from laya_fixture import REGRESSION_INTENT, RegressionLaya, strip_selection
 
 
 def main():
     executable = pathlib.Path(sys.argv[1]).resolve()
     # Bundled language servers run inside the root and release it a moment after shgrep exits.
-    with tempfile.TemporaryDirectory(prefix="shgrep-", ignore_cleanup_errors=True) as root, RegressionLaya() as laya:
+    with tempfile.TemporaryDirectory(prefix="shgrep-", ignore_cleanup_errors=True) as root:
         root = pathlib.Path(root)
         source = root / "unicøde source.cpp"
         source.write_bytes(b"first needle\nother line\n")
@@ -25,7 +24,6 @@ def main():
         process = subprocess.Popen(
             [str(executable), "--root", str(root)],
             cwd=working,
-            env=laya.environment(),
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -33,7 +31,7 @@ def main():
 
         def call(method, params=None, request_id=1):
             if method == "tools/call" and params and params.get("name") == "search":
-                params = {**params, "arguments": {"operation": "text", "intent": REGRESSION_INTENT, **params.get("arguments", {})}}
+                params = {**params, "arguments": {"operation": "text", **params.get("arguments", {})}}
             message = {"jsonrpc": "2.0", "id": request_id, "method": method}
             if params is not None:
                 message["params"] = params
@@ -42,10 +40,7 @@ def main():
             response = json.loads(process.stdout.readline())
             assert response["id"] == request_id, response
             assert "error" not in response, response
-            result = response["result"]
-            if method == "tools/call" and not result.get("isError"):
-                result["content"][0]["text"] = strip_selection(result["content"][0]["text"])
-            return result
+            return response["result"]
 
         def tool(name, arguments, request_id):
             reply = call("tools/call", {"name": name, "arguments": {"output": "json", **arguments}}, request_id)
@@ -331,7 +326,7 @@ def main():
             capped_lines = [line for line in capped["content"][0]["text"].splitlines() if ":limit hit" in line]
             assert len(capped_lines) == 3, capped
             # JSON context preserves the complete multibyte match, including matches over 2,048 bytes.
-            (root / "scope" / "euro.txt").write_text("\u20ac" * 1000 + "\n", encoding="utf-8")
+            (root / "scope" / "euro.txt").write_text(newline=chr(10), data="\u20ac" * 1000 + "\n", encoding="utf-8")
             euro = tool("search", {"operation": "text", "pattern": "^.+$", "path": "scope/euro.txt"}, 151)
             assert euro["results"] and euro["results"][0]["context"].startswith("\u20ac"), euro
             euro_hit = euro["results"][0]
@@ -433,7 +428,7 @@ def main():
                 raise AssertionError(process.stderr.read().decode(errors="replace"))
         # --read-only hides and refuses the write tools.
         read_only = subprocess.Popen([str(executable), "--root", str(root), "--read-only"],
-                                     stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=laya.environment())
+                                     stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         try:
             def read_only_call(method, params, request_id):
                 message = {"jsonrpc": "2.0", "id": request_id, "method": method, "params": params}

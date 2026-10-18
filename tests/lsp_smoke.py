@@ -14,7 +14,6 @@ import tempfile
 import threading
 import time
 import urllib.parse
-from laya_fixture import REGRESSION_INTENT, RegressionLaya, strip_selection
 
 
 def units(text):
@@ -238,9 +237,7 @@ def mock():
 
 
 class Client:
-    def __init__(self, executable, root, stderr=None, arguments=(), cwd=None, timeout=20, regression_laya=True, environment=None):
-        self.laya = RegressionLaya() if regression_laya else None
-        environment = self.laya.environment() if self.laya else environment
+    def __init__(self, executable, root, stderr=None, arguments=(), cwd=None, timeout=20, environment=None):
         self.process = subprocess.Popen([str(executable), "--root", str(root), *arguments], cwd=cwd,
                                         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=stderr, env=environment)
         self.timeout = timeout  # seconds to wait for one reply; real servers on cold repos need minutes
@@ -258,8 +255,6 @@ class Client:
                 self.messages.put(error)
 
     def call(self, method, params):
-        if self.laya and method == "tools/call" and params.get("name") == "search" and params.get("arguments", {}).get("operation") == "text":
-            params = {**params, "arguments": {"intent": REGRESSION_INTENT, **params["arguments"]}}
         self.next_id += 1
         request = {"jsonrpc": "2.0", "id": self.next_id, "method": method, "params": params}
         self.process.stdin.write(json.dumps(request).encode() + b"\n")
@@ -274,8 +269,6 @@ class Client:
             return response["result"]
 
     def tool(self, name, arguments, error=False, raw=False):
-        if name == "search" and arguments.get("operation") == "text":
-            arguments = {"intent": REGRESSION_INTENT, **arguments}
         # Overviews default to compact text; parsed checks ask for the json form.
         overview = name in ("read_file", "list_dir") and not any(k in arguments for k in ("name_path", "offset", "limit")) and \
             arguments.get("operation", "overview" if name == "list_dir" else "auto") in ("auto", "overview")
@@ -285,8 +278,6 @@ class Client:
         result = self.call("tools/call", {"name": name, "arguments": arguments})
         assert bool(result.get("isError")) == error, result
         text = result["content"][0]["text"]
-        if self.laya and not error:
-            text = strip_selection(text)
         return text if raw or error else json.loads(text)
 
     def close(self):
@@ -297,9 +288,6 @@ class Client:
             self.process.kill()
             self.process.wait()
             raise
-        finally:
-            if self.laya:
-                self.laya.close()
 
 
 def exercise_extended(client, root):

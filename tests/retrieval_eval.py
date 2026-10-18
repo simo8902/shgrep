@@ -1,11 +1,12 @@
-"""Measures Laya-ranked intent -> function retrieval on a real repository, against the real llama-server.
-Usage: python tests/retrieval_eval.py dist/shgrep.exe <repo> [--count 30] [--seed 1] [--budget-ms 120000]
+"""Measures intent -> function retrieval on a real repository: shgrep's keyword ranking against unranked results.
+Usage: python tests/retrieval_eval.py dist/shgrep.exe <repo> [--count 30] [--seed 1] [--hard]
   Questions come from the repo's own doc comments (Rust ///, Python docstrings), with the function's own name
-  removed; the answer is that function. For each question it measures:
+  removed; the answer is that function. With --hard, question words that also appear in the answer's code are
+  dropped too (questions left with fewer than 3 words are skipped). For each question it measures:
     baseline  grep the intent's words (lines output) + read the answer's whole file: tokens an agent pays
-    pipeline  shgrep's ranked hunks (BM25 pool, Laya re-rank) -> enclosing functions (LSP), in returned order
-  Start llama-server with the Laya GGUF first (SHGREP_LAYA_PORT, default 8080). The default budget lets a
-  CPU-only server score every candidate; pass --budget-ms 2000 to measure the interactive default.
+    unranked  the same search without an intent: findings in scan order, candidates sorted by hit count
+    ranked    the same search with the intent: BM25-ranked hunks (top 10, at most 3 per file), in returned order
+  Candidates are enclosing functions (LSP) or text hunks; a hunk overlapping the answer's lines counts as the answer.
   Top-three tokens are a comparison metric only. Tokens are estimated as characters / 4. Nothing in the repo is written.
 """
 import argparse
@@ -21,7 +22,6 @@ import sys
 import subprocess
 import time
 
-from laya_fixture import require_server
 from lsp_smoke import Client
 
 SLOW = {"timeout_ms": 300000}
@@ -55,7 +55,41 @@ def function_span(lines, start, python):
     return start + 1, end + 1
 
 
-def questions(repo, count, seed):
+def code_terms(lines, start, end, python):
+    """Lowercase words (identifiers split at _ and camelCase, plus a plural-stripped form) in lines[start:end], with
+    comments and docstrings left out."""
+    terms, in_doc = set(), False
+    for line in lines[start:end]:
+        stripped = line.strip()
+        if python:
+            quotes = stripped.count('"""') + stripped.count("'''")
+            if in_doc or quotes:
+                if quotes % 2 == 1:
+                    in_doc = not in_doc
+                continue
+            if stripped.startswith("#"):
+                continue
+        elif stripped.startswith("//"):
+            continue
+        for token in re.findall(r"[A-Za-z0-9_]+", stripped):
+            for part in [token] + token.split("_"):
+                for piece in [part] + re.findall(r"[A-Z]?[a-z]+|[A-Z]+(?![a-z])|\d+", part):
+                    piece = piece.lower()
+                    if piece:
+                        terms.add(piece)
+                        terms.add(piece.rstrip("s"))
+    return terms
+
+
+def harden(text, terms):
+    """The question without the words its answer's code contains: it can no longer be matched by identifier."""
+    kept = [w for w in re.findall(r"\S+", text)
+            if not (re.fullmatch(r"[A-Za-z][A-Za-z0-9]*", w.strip(".,;:()'\"`")) and
+                    (w.strip(".,;:()'\"`").lower() in terms or w.strip(".,;:()'\"`").lower().rstrip("s") in terms))]
+    return " ".join(kept)
+
+
+def questions(repo, count, seed, hard=False):
     found = []
     for folder, subfolders, files in os.walk(repo):
         subfolders[:] = [d for d in subfolders if not d.startswith(".") and d.lower() not in SKIP]
@@ -92,11 +126,13 @@ def questions(repo, count, seed):
                 for part in set(re.split(r"_+", fn)) | {fn}:
                     if len(part) > 2:
                         text = re.sub(rf"\b{re.escape(part)}\b", "", text, flags=re.IGNORECASE)
+                span = function_span(lines, i, path.suffix == ".py")
+                if hard:
+                    text = harden(text, code_terms(lines, i, span[1], path.suffix == ".py"))
                 words = [w for w in re.findall(r"[A-Za-z][A-Za-z0-9]+", text) if w.lower() not in STOP]
                 if len(words) >= 3:
                     found.append({"intent": " ".join(text.split()), "path": path.relative_to(repo).as_posix(),
-                                  "function": fn, "line": i + 1,
-                                  "span": (doc_first, function_span(lines, i, path.suffix == ".py")[1])})
+                                  "function": fn, "line": i + 1, "span": (doc_first, span[1])})
     random.Random(seed).shuffle(found)
     return found[:count]
 
@@ -108,18 +144,24 @@ def keywords(intent):
     return list(dict.fromkeys(words + joined))
 
 
-def lexical(client, keys, extensions, intent="Inspect all matching source"):
-    reply = client.tool("search", {"operation": "text", "patterns": keys, "case_insensitive": True, "mode": "literal",
-                                   "output": "json", "extensions": extensions, "index": False, "intent": intent, **SLOW})
+def lexical(client, keys, extensions, intent=None):
+    """Candidates (functions via LSP, else text hunks) from one search. With an intent shgrep ranks the hunks and
+    they come best first; without one the findings arrive in scan order and candidates sort by hit count."""
+    arguments = {"operation": "text", "patterns": keys, "case_insensitive": True, "mode": "literal",
+                 "output": "json", "extensions": extensions, "index": False, **SLOW}
+    if intent:
+        arguments["intent"] = intent
+    reply = client.tool("search", arguments)
     summary = reply["summary"]
     if summary["status"] != "complete" or summary.get("truncated"):
         raise RuntimeError(f"Incomplete search; refusing to report full-retrieval metrics: {summary}")
     by_file = {}
-    best = {}  # (path, line) -> Laya rank of the group that returned it; results arrive best first
+    best = {}  # (path, line) -> rank of the hunk that returned it; ranked results arrive best first
     for item in reply["results"]:
         path = item["path"].replace("\\", "/")
         by_file.setdefault(path, []).append(item["line"])
-        best.setdefault((path, item["line"]), item["laya"]["rank"])
+        if intent:
+            best.setdefault((path, item["line"]), item["ranking"]["rank"])
     candidates = []
     for path in sorted(by_file, key=lambda p: (-len(by_file[p]), p)):
         hit_lines = sorted(by_file[path])
@@ -152,9 +194,12 @@ def lexical(client, keys, extensions, intent="Inspect all matching source"):
                 pending = {"path": path, "name": "", "name_path": None,
                            "first": line, "last": line, "hits": hits, "kind": "text"}
                 candidates.append(pending)
-    for c in candidates:
-        c["rank"] = min(r for (p, line), r in best.items() if p == c["path"] and c["first"] <= line <= c["last"])
-    candidates.sort(key=lambda c: (c["rank"], -c["hits"]))
+    if intent:
+        for c in candidates:
+            c["rank"] = min(r for (p, line), r in best.items() if p == c["path"] and c["first"] <= line <= c["last"])
+        candidates.sort(key=lambda c: (c["rank"], -c["hits"]))
+    else:
+        candidates.sort(key=lambda c: (-c["hits"], c["last"] - c["first"]))
     return candidates, reply
 
 
@@ -176,24 +221,15 @@ def main():
     parser.add_argument("repo", type=Path)
     parser.add_argument("--count", type=int, default=30)
     parser.add_argument("--seed", type=int, default=1)
-    parser.add_argument("--budget-ms", type=int, default=120000, help="SHGREP_LAYA_BUDGET_MS for the Laya run")
+    parser.add_argument("--hard", action="store_true",
+                        help="drop the question words that also appear in the answer's code; keep questions with 3+ words left")
     args = parser.parse_args()
-    require_server()
     repo = args.repo.resolve()
-    asked = questions(repo, args.count, args.seed)
+    asked = questions(repo, args.count, args.seed, args.hard)
     print(f"{len(asked)} questions from doc comments in {repo}")
     if not asked:
         return
-    client = Client(args.executable.resolve(), repo, timeout=330, regression_laya=False,
-                    environment={**os.environ, "SHGREP_LAYA_BUDGET_MS": str(args.budget_ms)})
-    # Same pool and limits with a zero budget: keyword order only, so the rows show what Laya adds.
-    keyword_client = Client(args.executable.resolve(), repo, timeout=330, regression_laya=False,
-                            environment={**os.environ, "SHGREP_LAYA_BUDGET_MS": "0"})
-    # Laya arms differ only in the fusion weight of Laya's rank (percent); the P filter is off in all of them.
-    arms = {w: Client(args.executable.resolve(), repo, timeout=330, regression_laya=False,
-                      environment={**os.environ, "SHGREP_LAYA_BUDGET_MS": str(args.budget_ms),
-                                   "SHGREP_LAYA_FILTER": "0", "SHGREP_LAYA_WEIGHT": str(w)})
-            for w in (100, 50, 25)}
+    client = Client(args.executable.resolve(), repo, timeout=330)
     rows = []
     try:
         for q in asked:
@@ -202,8 +238,7 @@ def main():
             started = time.monotonic()
             candidates, findings = lexical(client, keys, extensions, q["intent"])
             lexical_s = time.monotonic() - started
-            keyword_candidates, _ = lexical(keyword_client, keys, extensions, q["intent"])
-            weighted = {w: lexical(c, keys, extensions, q["intent"])[0] for w, c in arms.items()}
+            unranked_candidates, _ = lexical(client, keys, extensions)
             # The comparison baseline uses the native CLI, never an MCP bypass.
             command = [str(args.executable.resolve()), "search", "--root", str(repo), "-F", "-i",
                        "--color", "never", "--timeout-ms", "300000"]
@@ -227,28 +262,20 @@ def main():
                    "matched_files": len({item["path"] for item in findings["results"]}),
                    "search_hits": len(findings["results"]),
                    "unmapped_text_candidates": sum(c["kind"] == "text" for c in candidates),
-                   "pipeline_rank": rank_of(candidates, q), "keyword_rank": rank_of(keyword_candidates, q),
-                   **{f"w{w}_rank": rank_of(found, q) for w, found in weighted.items()},
-                   "laya": findings.get("laya"),
+                   "ranked_rank": rank_of(candidates, q), "unranked_rank": rank_of(unranked_candidates, q),
+                   "ranking": findings.get("ranking"),
                    "baseline_tokens": baseline, "mcp_tokens": tokens(json.dumps(findings, ensure_ascii=False)), "top3_tokens": answer_tokens, "lexical_s": round(lexical_s, 1)}
             rows.append(row)
             print(json.dumps(row), flush=True)
     finally:
         client.close()
-        keyword_client.close()
-        for c in arms.values():
-            c.close()
     n = len(rows)
     def share(key, k):
         return sum(1 for r in rows if r[key] and r[key] <= k) / n if n else 0
     print("\nsummary")
-    print(f"  answer among returned (recall)     {share('pipeline_rank', 10**9):.0%}  keywords only {share('keyword_rank', 10**9):.0%}")
-    print(f"  Laya top-1 / top-3                 {share('pipeline_rank', 1):.0%} / {share('pipeline_rank', 3):.0%}")
-    for w in arms:
-        key = f"w{w}_rank"
-        print(f"  Laya weight {w:>3}%: recall {share(key, 10**9):.0%}, top-1 / top-3 {share(key, 1):.0%} / {share(key, 3):.0%}")
-    print(f"  keywords top-1 / top-3             {share('keyword_rank', 1):.0%} / {share('keyword_rank', 3):.0%}")
-    print(f"  Laya search time per question      {sum(r['lexical_s'] for r in rows) / n:.1f} s")
+    print(f"  ranked   recall, top-1 / top-3     {share('ranked_rank', 10**9):.0%}, {share('ranked_rank', 1):.0%} / {share('ranked_rank', 3):.0%}")
+    print(f"  unranked recall, top-1 / top-3     {share('unranked_rank', 10**9):.0%}, {share('unranked_rank', 1):.0%} / {share('unranked_rank', 3):.0%}")
+    print(f"  ranked search time per question    {sum(r['lexical_s'] for r in rows) / n:.1f} s")
     print(f"  tokens: MCP selected evidence    {sum(r['mcp_tokens'] for r in rows) // n} per question")
     print(f"  tokens: baseline grep+read        {sum(r['baseline_tokens'] for r in rows) // n} per question")
     print(f"  tokens: top-3 bodies (metric only) {sum(r['top3_tokens'] for r in rows) // n} per question")
