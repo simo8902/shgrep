@@ -130,7 +130,7 @@ class Server:
 
 
 def server_args(patterns, literal, output):
-    return {"operation": "text", "patterns": patterns, "mode": "literal" if literal else "regex", "output": output,
+    return {"operation": "text", "intent": "Locate source matching these exact benchmark patterns", "patterns": patterns, "mode": "literal" if literal else "regex", "output": output,
             "max_results": 10000, "max_matches_per_file": 10000, "max_output_bytes": 1048576,
             "timeout_ms": 300000}
 

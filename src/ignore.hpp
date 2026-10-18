@@ -7,8 +7,10 @@
 #include <vector>
 
 namespace shgrep {
+struct IgnorePattern;
 struct IgnoreRule {
     std::string base, pattern;
+    std::shared_ptr<const IgnorePattern> compiled;
     bool negated = false, directory_only = false, has_slash = false;
 };
 

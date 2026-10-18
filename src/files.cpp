@@ -3,6 +3,7 @@
 #include "ignore.hpp"
 #include "winfs.hpp"
 
+#include <aclapi.h>
 #include <bcrypt.h>
 
 #include <algorithm>
@@ -30,6 +31,10 @@ namespace fs = std::filesystem;
 using Clock = std::chrono::steady_clock;
 
 [[noreturn]] void fail(const std::string& message) { throw std::runtime_error(message); }
+using CancelFlag = std::shared_ptr<std::atomic_bool>;
+void check_cancelled(const CancelFlag& cancelled) {
+    if (cancelled && cancelled->load()) fail("request cancelled; nothing was written");
+}
 
 // CONTRACT: read_file, file_info and edit_file decode whole files; larger files are refused, never cut.
 constexpr uint64_t max_text_bytes = 64ull << 20;
@@ -130,33 +135,49 @@ std::string format_mtime(int64_t filetime) {
     return buffer;
 }
 
+// Incremental SHA-256, so a file read in pieces hashes like one read whole.
+class Sha256 {
+public:
+    Sha256() {
+        static const BCRYPT_ALG_HANDLE algorithm = [] {
+            BCRYPT_ALG_HANDLE handle = nullptr;
+            return BCRYPT_SUCCESS(BCryptOpenAlgorithmProvider(&handle, BCRYPT_SHA256_ALGORITHM, nullptr, 0)) ? handle
+                                                                                                             : nullptr;
+        }();
+        if (!algorithm || !BCRYPT_SUCCESS(BCryptCreateHash(algorithm, &hash_, nullptr, 0, nullptr, 0, 0)))
+            fail("SHA-256 is unavailable");
+    }
+    ~Sha256() { if (hash_) BCryptDestroyHash(hash_); }
+    Sha256(const Sha256&) = delete;
+    Sha256& operator=(const Sha256&) = delete;
+    void add(std::string_view data) {
+        for (size_t offset = 0; offset < data.size();) {
+            const auto chunk = static_cast<ULONG>(std::min<size_t>(data.size() - offset, size_t{1} << 30));
+            if (!BCRYPT_SUCCESS(BCryptHashData(hash_, reinterpret_cast<PUCHAR>(const_cast<char*>(data.data() + offset)),
+                                               chunk, 0))) fail("SHA-256 failed");
+            offset += chunk;
+        }
+    }
+    std::string hex() {
+        unsigned char digest[32];
+        if (!BCRYPT_SUCCESS(BCryptFinishHash(hash_, digest, sizeof(digest), 0))) fail("SHA-256 failed");
+        constexpr char digits[] = "0123456789abcdef";
+        std::string out;
+        for (unsigned char c : digest) {
+            out.push_back(digits[c >> 4]);
+            out.push_back(digits[c & 15]);
+        }
+        return out;
+    }
+
+private:
+    BCRYPT_HASH_HANDLE hash_ = nullptr;
+};
+
 std::string sha256_hex(std::string_view data) {
-    static const BCRYPT_ALG_HANDLE algorithm = [] {
-        BCRYPT_ALG_HANDLE handle = nullptr;
-        return BCRYPT_SUCCESS(BCryptOpenAlgorithmProvider(&handle, BCRYPT_SHA256_ALGORITHM, nullptr, 0)) ? handle
-                                                                                                         : nullptr;
-    }();
-    BCRYPT_HASH_HANDLE hash = nullptr;
-    if (!algorithm || !BCRYPT_SUCCESS(BCryptCreateHash(algorithm, &hash, nullptr, 0, nullptr, 0, 0)))
-        fail("SHA-256 is unavailable");
-    unsigned char digest[32];
-    bool ok = true;
-    for (size_t offset = 0; ok && offset < data.size();) {
-        const auto chunk = static_cast<ULONG>(std::min<size_t>(data.size() - offset, size_t{1} << 30));
-        ok = BCRYPT_SUCCESS(BCryptHashData(hash, reinterpret_cast<PUCHAR>(const_cast<char*>(data.data() + offset)),
-                                           chunk, 0));
-        offset += chunk;
-    }
-    ok = ok && BCRYPT_SUCCESS(BCryptFinishHash(hash, digest, sizeof(digest), 0));
-    BCryptDestroyHash(hash);
-    if (!ok) fail("SHA-256 failed");
-    constexpr char hex[] = "0123456789abcdef";
-    std::string out;
-    for (unsigned char c : digest) {
-        out.push_back(hex[c >> 4]);
-        out.push_back(hex[c & 15]);
-    }
-    return out;
+    Sha256 hash;
+    hash.add(data);
+    return hash.hex();
 }
 
 // ---- Arguments ----
@@ -370,9 +391,12 @@ Handle open_root(const Target& target) {
 // SAFETY: walks down from the configured root one component at a time, each opened relative to its parent's
 // handle with FILE_OPEN_REPARSE_POINT and refused if it is a reparse point. No symbolic link or junction below
 // the root is ever followed, and no path string is resolved again between the check and the use.
-Handle open_parent(const Target& target, bool create_missing, std::vector<std::string>* created = nullptr) {
+Handle open_parent(const Target& target, bool create_missing, std::vector<std::string>* created = nullptr,
+                   const CancelFlag& cancelled = {}) {
+    check_cancelled(cancelled);
     Handle directory = open_root(target);
     for (size_t i = 0; i + 1 < target.parts.size(); ++i) {
+        check_cancelled(cancelled);
         Handle child;
         ULONG_PTR information = 0;
         const NTSTATUS status = nt_open(directory.h, target.parts[i], directory_access, share_all,
@@ -398,7 +422,9 @@ Handle open_file(HANDLE directory, const Target& target, ULONG share) {
 }
 
 // Reads the whole file into data. Returns false, with data unspecified, when it is larger than limit.
-bool read_all(HANDLE file, const std::string& path, uint64_t limit, std::string& data) {
+bool read_all(HANDLE file, const std::string& path, uint64_t limit, std::string& data,
+              const CancelFlag& cancelled = {}) {
+    check_cancelled(cancelled);
     LARGE_INTEGER size{};
     if (!GetFileSizeEx(file, &size)) {
         const DWORD code = GetLastError();
@@ -409,6 +435,7 @@ bool read_all(HANDLE file, const std::string& path, uint64_t limit, std::string&
     data.reserve(static_cast<size_t>(size.QuadPart));
     constexpr DWORD chunk = 1 << 20;
     for (;;) {
+        check_cancelled(cancelled);
         const size_t used = data.size();
         data.resize(used + chunk);
         DWORD got = 0;
@@ -618,23 +645,130 @@ size_t max_output_arg(const Json& args) {
     return static_cast<size_t>(int_arg(args, "max_output_bytes", 65536, 512, 1048576));
 }
 
-std::string file_header(const std::string& path, const std::string& raw, const TextFile& text,
+std::string file_header(const std::string& path, uint64_t bytes, const std::string& sha256, const TextFile& text,
                         const FILE_BASIC_INFO& basic) {
-    std::string header = "[file " + path + " | " + std::to_string(text.lines) + " lines, " + std::to_string(raw.size()) +
+    std::string header = "[file " + path + " | " + std::to_string(text.lines) + " lines, " + std::to_string(bytes) +
                          " bytes | " + encoding_name(text.encoding) + ", " + eol_name(text) + ", " +
                          (text.final_newline ? "final newline" : "no final newline");
     if (text.invalid)
         header += ", " + std::to_string(text.invalid) + " invalid byte sequences shown as U+FFFD (edit_file refuses "
                   "this file)";
-    return header + " | mtime " + format_mtime(basic.LastWriteTime.QuadPart) + " | sha256 " + sha256_hex(raw) + "]\n";
+    return header + " | mtime " + format_mtime(basic.LastWriteTime.QuadPart) + " | sha256 " + sha256 + "]\n";
+}
+std::string file_header(const std::string& path, const std::string& raw, const TextFile& text,
+                        const FILE_BASIC_INFO& basic) {
+    return file_header(path, raw.size(), sha256_hex(raw), text, basic);
 }
 
 // ---- read_file ----
 
 struct ReadOptions {
-    uint64_t offset = 1, limit = 200;
+    uint64_t offset = 1, limit = UINT64_MAX;
     bool numbers = true;
 };
+
+constexpr uint64_t max_streamed_text_bytes = 256ull << 20;
+
+// PERF: a UTF-8 file over max_text_bytes is read once in 1 MiB pieces. The header's counts and sha256 are computed
+//   on the way and only the requested window of lines is kept, so memory stays flat whatever the offset.
+// CONTRACT: the output equals render_file's for the same bytes; UTF-16 files this large are refused.
+void render_large_file(std::string& out, const std::string& path, HANDLE file, const FILE_BASIC_INFO& basic,
+                       const ReadOptions& options) {
+    Sha256 hash;
+    TextFile counts;  // everything but text
+    uint64_t bytes = 0, decoded_size = 0, number = 1, shown = 0, line_bytes = 0;
+    std::string window, line, carry;
+    bool first = true, pending_cr = false, more = false;
+    char last = 0;
+    auto emit_line = [&](bool had_newline) {
+        if (had_newline && !line.empty() && line.back() == '\r') line.pop_back();
+        if (options.numbers) {
+            char prefix[32];
+            std::snprintf(prefix, sizeof(prefix), "%6llu", static_cast<unsigned long long>(number));
+            window += prefix;
+            window += "\xE2\x86\x92";
+        }
+        window += line;
+        window.push_back('\n');
+        line.clear();
+        ++shown;
+    };
+    // Decoded text arrives here, in order; it mirrors count_lines and render_file's line walk.
+    auto consume = [&](std::string_view text) {
+        for (const char c : text) {
+            if (pending_cr) {
+                pending_cr = false;
+                if (c == '\n') ++counts.crlf;
+                else ++counts.cr;
+            }
+            if (c == '\r') pending_cr = true;
+            if (c == '\n' && last != '\r') ++counts.lf;
+            // CONTRACT: subtract only after the offset check; an unlimited read must not overflow an end line.
+            const bool inside = number >= options.offset && number - options.offset < options.limit;
+            if (shown == options.limit) more = true;
+            if (inside) line.push_back(c);
+            ++line_bytes;
+            if (c == '\n') {
+                if (inside) { line.pop_back(); emit_line(true); }
+                ++number;
+                line_bytes = 0;
+            }
+            last = c;
+        }
+        decoded_size += text.size();
+    };
+    std::string piece(1u << 20, '\0');
+    for (;;) {
+        DWORD got = 0;
+        if (!ReadFile(file, piece.data(), static_cast<DWORD>(piece.size()), &got, nullptr)) {
+            const DWORD code = GetLastError();
+            fail(path + ": read failed (" + win32_text(code) + ")");
+        }
+        const bool end = got == 0;
+        std::string_view raw(piece.data(), got);
+        hash.add(raw);
+        bytes += got;
+        if (bytes > max_streamed_text_bytes) fail(path + " is larger than 256 MiB; use search");
+        if (first && !end) {
+            first = false;
+            if (raw.starts_with("\xFF\xFE") || raw.starts_with("\xFE\xFF"))
+                fail(path + " is UTF-16 and larger than 64 MiB; read it with search");
+            if (raw.starts_with("\xEF\xBB\xBF")) { counts.encoding = Encoding::utf8_bom; raw.remove_prefix(3); }
+        }
+        if (std::memchr(raw.data(), 0, raw.size())) fail(path + " is binary; use search_bytes");
+        // Repairs invalid UTF-8 like decode(); a sequence split between pieces waits in carry for the next one.
+        std::string buffer = carry + std::string(raw);
+        carry.clear();
+        const auto* p = reinterpret_cast<const unsigned char*>(buffer.data());
+        size_t i = 0, run = 0;
+        while (i < buffer.size()) {
+            if (p[i] < 0x80) { ++i; continue; }
+            if (const size_t length = utf8_length(p + i, buffer.size() - i)) { i += length; continue; }
+            if (!end && buffer.size() - i < 4) break;
+            consume(std::string_view(buffer).substr(run, i - run));
+            consume("\xEF\xBF\xBD");
+            ++counts.invalid;
+            run = ++i;
+        }
+        consume(std::string_view(buffer).substr(run, i - run));
+        carry.assign(buffer, i, std::string::npos);
+        if (end) break;
+    }
+    if (pending_cr) ++counts.cr;
+    if (line_bytes && number >= options.offset && number - options.offset < options.limit && shown < options.limit) emit_line(false);
+    counts.lines = decoded_size == 0 ? 0 : counts.lf + counts.crlf + (last == '\n' ? 0 : 1);
+    counts.final_newline = decoded_size != 0 && (last == '\n' || last == '\r');
+    out += file_header(path, bytes, hash.hex(), counts, basic);
+    if (options.offset > counts.lines && !(counts.lines == 0 && options.offset == 1)) {
+        out += "[offset " + std::to_string(options.offset) + " is past the end: the file has " + std::to_string(counts.lines) + " lines]\n";
+        return;
+    }
+    out += window;
+    if (more)
+        out += "[status limit: showed lines " + std::to_string(options.offset) + "-" + std::to_string(options.offset + shown - 1) +
+               " of " + std::to_string(counts.lines) + " (limit=" + std::to_string(options.limit) +
+               "); continue with offset=" + std::to_string(options.offset + shown) + "]\n";
+}
 
 void render_file(std::string& out, const Target& target, const ReadOptions& options) {
     const std::string path = target.display();
@@ -645,6 +779,12 @@ void render_file(std::string& out, const Target& target, const ReadOptions& opti
         Handle directory = open_parent(target, false);
         Handle file = open_file(directory.h, target, share_all);
         basic = basic_info(file.h, path);
+        LARGE_INTEGER size{};
+        if (GetFileSizeEx(file.h, &size) && static_cast<uint64_t>(size.QuadPart) > max_text_bytes) {
+            if (static_cast<uint64_t>(size.QuadPart) > max_streamed_text_bytes) fail(path + " is larger than 256 MiB; use search");
+            render_large_file(out, path, file.h, basic, options);
+            return;
+        }
         if (!read_all(file.h, path, max_text_bytes, raw)) fail(path + " is larger than 64 MiB; use search");
     }
     const TextFile text = decode(raw);
@@ -683,16 +823,65 @@ void render_file(std::string& out, const Target& target, const ReadOptions& opti
                "); continue with offset=" + std::to_string(first + shown) + "]\n";
 }
 
+// "compact" (default) or "json": how a symbol overview is shown.
+std::string outline_format(const Json& args) {
+    const std::string format = args.get("format") ? string_arg(args, "format") : "compact";
+    if (format != "compact" && format != "json") fail("format must be compact or json");
+    return format;
+}
+
+// PERF: an overview as one line per symbol, "LINE kind name_path", about a fifth of the json with its ranges. The
+//   name_path is exactly what read_file name_path, search and edit_file take next.
+std::string compact_outline(const Json& result) {
+    static constexpr const char* kinds[] = {"?", "file", "module", "namespace", "package", "class", "method", "property",
+        "field", "ctor", "enum", "interface", "fn", "var", "const", "string", "number", "bool", "array", "object", "key",
+        "null", "member", "struct", "event", "operator", "typeparam"};
+    const Json* items = result.get("results");
+    const size_t count = items ? items->array().size() : 0;
+    std::string out;
+    const Json* file = result.get("path");
+    if (file) {
+        out = "[outline " + file->string() + " | " + std::to_string(count) + " symbols";
+        if (const Json* mtime = result.get("mtime")) out += " | mtime " + mtime->string();
+        if (const Json* sha = result.get("sha256")) out += " | sha256 " + sha->string();
+        out += "]\n";
+    } else {
+        std::set<std::string> files;
+        if (items) for (const auto& item : items->array()) if (const Json* p = item.get("path")) files.insert(p->string());
+        out = "[outline | " + std::to_string(count) + " symbols in " + std::to_string(files.size()) + " files]\n";
+    }
+    std::string current;
+    if (items) for (const auto& item : items->array()) {
+        const Json* path = item.get("path");
+        if (!file && path && path->string() != current) {
+            current = path->string();
+            out += current + "\n";
+        }
+        const Json* kind = item.get("kind");
+        const int64_t k = kind && std::holds_alternative<int64_t>(kind->value) ? kind->integer() : 0;
+        char line[16];
+        std::snprintf(line, sizeof(line), "%6lld ", static_cast<long long>(item.get("line") ? item.get("line")->integer() : 0));
+        std::string name = kinds[k >= 1 && k <= 26 ? k : 0];
+        name.resize(std::max<size_t>(name.size(), 9), ' ');
+        out += (file ? "" : "  ") + std::string(line) + name + " " + (item.get("name_path") ? item.get("name_path")->string() : "") + "\n";
+    }
+    if (!count) out += "(no symbols)\n";
+    return out;
+}
+
 Json read_file(const Json& args, const SearchContext& context, const std::shared_ptr<std::atomic_bool>& cancelled) {
     const std::vector<std::string> paths = path_args(args);
     ReadOptions options;
     options.offset = static_cast<uint64_t>(int_arg(args, "offset", 1, 1, INT64_MAX));
-    options.limit = static_cast<uint64_t>(int_arg(args, "limit", 200, 1, INT64_MAX));
+    options.limit = args.get("limit") ? static_cast<uint64_t>(int_arg(args, "limit", 1, 1, INT64_MAX)) : UINT64_MAX;
     options.numbers = bool_arg(args, "line_numbers", true);
     const std::string operation = args.get("operation") ? string_arg(args, "operation") : "auto";
     if (operation != "auto" && operation != "text" && operation != "overview" && operation != "symbol")
         fail("read_file operation must be auto, text, overview, or symbol");
     if (operation == "text" && args.get("name_path")) fail("operation=text does not accept name_path");
+    const bool json_format = outline_format(args) == "json";
+    if (args.get("format") && (operation == "text" || args.get("offset") || args.get("limit") || args.get("name_path")))
+        fail("format is only for symbol overviews");
     const bool text_mode = operation == "text" || args.get("offset") || args.get("limit");
     if (text_mode && (args.get("depth") || args.get("include_kinds") || args.get("exclude_kinds")))
         fail("depth/include_kinds/exclude_kinds require a symbol read");
@@ -703,25 +892,43 @@ Json read_file(const Json& args, const SearchContext& context, const std::shared
         if (cancelled && cancelled->load()) fail("read_file cancelled");
         auto read = [&] {
             const bool text_range = operation == "text" || args.get("offset") || args.get("limit");
+            // CONTRACT: when the language server fails on a file, the read falls back to the file's text under the
+            //   failure banner; a folder outline has no text fallback and fails with the banner.
+            std::string failure;
             if (!text_range) {
                 bool directory = false;
                 const SourceText descriptor = source_descriptor(context, path, &directory);
-                if (directory || operation != "auto" || args.get("name_path") || lsp_configured(descriptor, context)) {
+                bool semantic = directory || operation != "auto" || args.get("name_path");
+                if (!semantic) {
+                    try { semantic = lsp_configured(descriptor, context); }
+                    catch (const LspFailure& e) { failure = e.what(); }
+                }
+                if (semantic) {
                     if (operation == "symbol" && !args.get("name_path")) fail("symbol read requires name_path");
                     if (args.get("line_numbers")) fail("line_numbers is only for text reads");
                     Json::Object query = args.object();
-                    query.erase("paths"); query["path"] = path;
+                    query.erase("paths"); query.erase("format"); query["path"] = path;
                     query["include_body"] = args.get("name_path") != nullptr;
-                    const Json result = lsp_query(args.get("name_path") ? "symbols" : "overview", query, context, cancelled);
-                    out += result.dump() + "\n";
-                    return;
+                    try {
+                        const Json result = lsp_query(args.get("name_path") ? "symbols" : "overview", query, context, cancelled);
+                        out += args.get("name_path") || json_format ? result.dump() + "\n" : compact_outline(result);
+                        return;
+                    } catch (const LspFailure& e) {
+                        if (directory) throw;
+                        failure = e.what();
+                    }
                 }
             }
+            if (!failure.empty())
+                out += lsp_failure_banner(failure, args.get("name_path")
+                    ? "Fallback below: the file's text; locate the symbol with search operation=text"
+                    : "Fallback below: the file's text instead of its symbol outline");
             render_file(out, resolve(context, path), options);
         };
         if (!args.get("paths")) read();
         else {
             try { read(); }
+            catch (const LspFailure& e) { out += lsp_failure_banner(path + ": " + e.what(), "No fallback exists for a folder outline"); }
             catch (const std::exception& e) { out += "[error " + std::string(e.what()) + "]\n"; }
         }
     }
@@ -822,7 +1029,7 @@ struct Listing {
 // CONTRACT: same selection as search's walker: hidden items and .gitignore/.ignore matches are skipped unless
 // asked for, reparse points are listed but never entered.
 void list_tree(Listing& s, HANDLE directory, const std::wstring& path, const std::string& relative,
-               std::shared_ptr<const IgnoreScope> scope, uint32_t depth) {
+               const std::string& ignore_relative, std::shared_ptr<const IgnoreScope> scope, uint32_t depth) {
     std::vector<DirEntry> entries;
     if (!list_directory(directory, s.buffer, entries)) ++s.errors;
     if (!s.no_ignore) {
@@ -835,7 +1042,7 @@ void list_tree(Listing& s, HANDLE directory, const std::wstring& path, const std
         if (gitignore || dotignore) {
             auto next = std::make_shared<IgnoreScope>();
             next->parent = scope;
-            read_ignore_rules(path, relative == "." ? std::string() : relative, gitignore, dotignore, next->rules);
+            read_ignore_rules(path, ignore_relative, gitignore, dotignore, next->rules);
             if (!next->rules.empty()) scope = std::move(next);
         }
     }
@@ -854,7 +1061,8 @@ void list_tree(Listing& s, HANDLE directory, const std::wstring& path, const std
         const bool link = (entry.attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
         child = relative == "." ? name : relative + "/" + name;
         if (!s.hidden && (name.front() == '.' || (entry.attributes & FILE_ATTRIBUTE_HIDDEN))) { ++s.hidden_skipped; continue; }
-        if (!s.no_ignore && ignored_path(scope.get(), child, is_directory)) { ++s.ignored_skipped; continue; }
+        const std::string ignore_child = ignore_relative.empty() ? name : ignore_relative + "/" + name;
+        if (!s.no_ignore && ignored_path(scope.get(), ignore_child, is_directory)) { ++s.ignored_skipped; continue; }
         if (link) line = "l " + child + (is_directory ? "/" : "") + "\n";
         else if (is_directory) line = "d " + child + "/\n";
         else line = "f " + child + " " + std::to_string(entry.size) + "\n";
@@ -867,7 +1075,7 @@ void list_tree(Listing& s, HANDLE directory, const std::wstring& path, const std
         bool denied = false;
         Handle sub(open_relative(directory, entry.name, true, denied));
         if (!sub) { ++s.errors; continue; }
-        list_tree(s, sub.h, join_path(path, entry.name), child, scope, depth - 1);
+        list_tree(s, sub.h, join_path(path, entry.name), child, ignore_child, scope, depth - 1);
     }
 }
 
@@ -884,19 +1092,31 @@ Json list_dir(const Json& args, const SearchContext& context, const std::shared_
     s.deadline = Clock::now() + std::chrono::milliseconds(timeout);
     s.cancelled = &cancelled;
     const std::string path = target.display();
-    Handle directory;
-    if (target.parts.empty()) directory = open_root(target);
-    else {
-        Handle parent = open_parent(target, false);
-        const NTSTATUS status = nt_open(parent.h, target.name(), directory_access, share_all, disposition_open,
-                                        option_directory | option_open_reparse_point, 0, directory);
+    Handle directory = open_root(target);
+    std::shared_ptr<const IgnoreScope> scope;
+    std::string ignore_relative;
+    // CONTRACT: ignore coordinates stay relative to the configured root; output stays relative to the listing.
+    for (size_t i = 0; i < target.parts.size(); ++i) {
+        if (cancelled && cancelled->load()) fail("request cancelled");
+        if (Clock::now() > s.deadline) fail("listing timed out while opening its directory");
+        if (!s.no_ignore) {
+            auto ancestor = std::make_shared<IgnoreScope>();
+            ancestor->parent = scope;
+            read_ignore_rules(final_path(directory.h), ignore_relative, true, true, ancestor->rules);
+            if (!ancestor->rules.empty()) scope = std::move(ancestor);
+        }
+        Handle child;
+        const NTSTATUS status = nt_open(directory.h, target.parts[i], directory_access, share_all, disposition_open,
+                                        option_directory | option_open_reparse_point, 0, child);
         if (status == status_not_directory) fail(path + " is a file; use read_file or file_info");
         if (status < 0) fail(path + ": " + status_text(status));
-        refuse_link(directory.h, path);
+        refuse_link(child.h, target.display(i + 1));
+        directory = std::move(child);
+        ignore_relative = target.relative(i + 1);
     }
     const std::string header = "[dir " + path + " | depth " + std::to_string(depth) + "]\n";
     s.budget.take(header);
-    list_tree(s, directory.h, target.full(target.parts.size()), ".", nullptr, depth);
+    list_tree(s, directory.h, final_path(directory.h), ".", ignore_relative, scope, depth);
     std::string out = header + s.out;
     if (s.entries == 0 && s.status.empty()) out += "(no entries shown)\n";
     if (s.hidden_skipped || s.ignored_skipped) {
@@ -1011,8 +1231,28 @@ struct StagedWrite {
         }
     }
 };
-std::unique_ptr<StagedWrite> stage_write(HANDLE directory, const Target& target,
-                                          const std::string& bytes, DWORD attributes) {
+// SAFETY: a replacement takes the original's DACL, including whether it is protected from inheritance, so an edit
+//   never widens access to the folder's inherited permissions. Volumes without ACLs (FAT, exFAT) have none to copy.
+void copy_permissions(HANDLE from, HANDLE to, const std::string& path) {
+    PACL dacl = nullptr;
+    PSECURITY_DESCRIPTOR descriptor = nullptr;
+    DWORD code = GetSecurityInfo(from, SE_FILE_OBJECT, DACL_SECURITY_INFORMATION, nullptr, nullptr, &dacl, nullptr, &descriptor);
+    if (code == ERROR_NOT_SUPPORTED || code == ERROR_INVALID_FUNCTION) return;
+    if (code != ERROR_SUCCESS) fail(path + ": cannot read its permissions (" + win32_text(code) + "); nothing was written");
+    SECURITY_DESCRIPTOR_CONTROL control = 0;
+    DWORD revision = 0;
+    if (!GetSecurityDescriptorControl(descriptor, &control, &revision)) control = 0;
+    const SECURITY_INFORMATION what = DACL_SECURITY_INFORMATION |
+        ((control & SE_DACL_PROTECTED) ? PROTECTED_DACL_SECURITY_INFORMATION : UNPROTECTED_DACL_SECURITY_INFORMATION);
+    code = SetSecurityInfo(to, SE_FILE_OBJECT, what, nullptr, nullptr, dacl, nullptr);
+    LocalFree(descriptor);
+    if (code != ERROR_SUCCESS) fail(path + ": cannot carry its permissions over (" + win32_text(code) + "); nothing was written");
+}
+
+std::unique_ptr<StagedWrite> stage_write(HANDLE directory, const Target& target, const std::string& bytes,
+                                          DWORD attributes, HANDLE permissions_from = nullptr,
+                                          const CancelFlag& cancelled = {}) {
+    check_cancelled(cancelled);
     static std::atomic<uint32_t> counter{0};
     const std::string path = target.display();
     auto staged = std::make_unique<StagedWrite>();
@@ -1020,7 +1260,7 @@ std::unique_ptr<StagedWrite> stage_write(HANDLE directory, const Target& target,
     for (int attempt = 0;; ++attempt) {
         const std::wstring temp_name = L".shgrep-" + std::to_wstring(GetCurrentProcessId()) + L"-" +
                                        std::to_wstring(++counter) + L".tmp";
-        const NTSTATUS status = nt_open(directory, temp_name, DELETE | FILE_GENERIC_WRITE | FILE_READ_ATTRIBUTES, 0,
+        const NTSTATUS status = nt_open(directory, temp_name, DELETE | WRITE_DAC | FILE_GENERIC_WRITE | FILE_READ_ATTRIBUTES, 0,
                                         disposition_create, option_non_directory,
                                         attributes ? attributes : FILE_ATTRIBUTE_NORMAL, temp);
         if (status >= 0) break;
@@ -1028,7 +1268,9 @@ std::unique_ptr<StagedWrite> stage_write(HANDLE directory, const Target& target,
             fail(path + ": cannot create a temporary file in its folder (" + status_text(status) +
                  "); nothing was written");
     }
+    if (permissions_from) copy_permissions(permissions_from, temp.h, path);
     for (size_t offset = 0; offset < bytes.size();) {
+        check_cancelled(cancelled);
         const auto chunk = static_cast<DWORD>(std::min<size_t>(bytes.size() - offset, size_t{1} << 24));
         DWORD written = 0;
         if (!WriteFile(temp.h, bytes.data() + offset, chunk, &written, nullptr) || written == 0) {
@@ -1037,15 +1279,39 @@ std::unique_ptr<StagedWrite> stage_write(HANDLE directory, const Target& target,
         }
         offset += written;
     }
+    check_cancelled(cancelled);
     if (!FlushFileBuffers(temp.h)) {
         const DWORD code = GetLastError();
         fail(path + ": flush failed (" + win32_text(code) + "); nothing was written");
     }
     return staged;
 }
+bool same_file(HANDLE a, HANDLE b) {
+    FILE_ID_INFO x{}, y{};
+    if (GetFileInformationByHandleEx(a, FileIdInfo, &x, sizeof(x)) && GetFileInformationByHandleEx(b, FileIdInfo, &y, sizeof(y)))
+        return x.VolumeSerialNumber == y.VolumeSerialNumber && std::memcmp(&x.FileId, &y.FileId, sizeof(x.FileId)) == 0;
+    BY_HANDLE_FILE_INFORMATION p{}, q{};  // volumes without 128-bit file ids
+    return GetFileInformationByHandle(a, &p) && GetFileInformationByHandle(b, &q) &&
+           p.dwVolumeSerialNumber == q.dwVolumeSerialNumber && p.nFileIndexHigh == q.nFileIndexHigh &&
+           p.nFileIndexLow == q.nFileIndexLow;
+}
+// SAFETY: the original stays open with share-delete, so another program can rename a new file over its path, as an
+//   editor's atomic save does. The commit goes ahead only while the path still names the file whose bytes were
+//   checked; otherwise that save would be silently overwritten.
+void require_unreplaced(HANDLE directory, const Target& target, HANDLE original) {
+    Handle current;
+    const NTSTATUS status = nt_open(directory, target.name(), FILE_READ_ATTRIBUTES, share_all, disposition_open,
+                                    option_open_reparse_point, 0, current);
+    if (status < 0 || !same_file(current.h, original))
+        fail(target.display() + " was replaced by another program after it was read; read it again. Nothing was written");
+}
+
 FILE_BASIC_INFO atomic_write(HANDLE directory, const Target& target, const std::string& bytes, bool replace,
-                             DWORD attributes, Handle* original) {
-    auto staged = stage_write(directory, target, bytes, attributes);
+                             DWORD attributes, Handle* original, const CancelFlag& cancelled = {}) {
+    auto staged = stage_write(directory, target, bytes, attributes, original && *original ? original->h : nullptr, cancelled);
+    if (original && *original) require_unreplaced(directory, target, original->h);
+    // CONTRACT: cancellation wins until the atomic rename; after commit report the applied change.
+    check_cancelled(cancelled);
     if (const DWORD code = rename_handle(staged->file.h, directory, target.name(), replace, original))
         fail(target.display() + ": " + rename_error(code) + "; nothing was written");
     staged->armed = false;
@@ -1076,9 +1342,10 @@ void check_guards(const Json& args, const std::string& path, const std::string& 
 
 // ---- Unified diff ----
 
-std::vector<std::string_view> split_lines(std::string_view text) {
+std::vector<std::string_view> split_lines(std::string_view text, const CancelFlag& cancelled = {}) {
     std::vector<std::string_view> lines;
     for (size_t pos = 0; pos < text.size();) {
+        check_cancelled(cancelled);
         const size_t newline = text.find('\n', pos);
         const size_t end = newline == std::string_view::npos ? text.size() : newline + 1;
         lines.push_back(text.substr(pos, end - pos));
@@ -1088,12 +1355,14 @@ std::vector<std::string_view> split_lines(std::string_view text) {
 }
 
 // Myers' O(ND) shortest edit script over a and b; false when it needs more than max_d edits.
-bool myers(const std::string_view* a, int n, const std::string_view* b, int m, int max_d, std::string& script) {
+bool myers(const std::string_view* a, int n, const std::string_view* b, int m, int max_d, std::string& script,
+           const CancelFlag& cancelled) {
     const int offset = max_d + 1;
     std::vector<int> v(static_cast<size_t>(2 * max_d + 3), 0);
     std::vector<std::vector<int>> trace;  // trace[d][k + d]: furthest x on diagonal k after d edits
     int found = -1;
     for (int d = 0; d <= max_d && found < 0; ++d) {
+        check_cancelled(cancelled);
         for (int k = -d; k <= d; k += 2) {
             int x = (k == -d || (k != d && v[offset + k - 1] < v[offset + k + 1])) ? v[offset + k + 1]
                                                                                    : v[offset + k - 1] + 1;
@@ -1135,23 +1404,30 @@ struct Diff {
 
 // PERF: the common prefix and suffix are trimmed first, so an edit costs O(changed lines) for the script. Very
 // large or very different middles fall back to replacing the whole changed block.
-Diff unified_diff(std::string_view old_text, std::string_view new_text, const std::string& label) {
+Diff unified_diff(std::string_view old_text, std::string_view new_text, const std::string& label,
+                  const CancelFlag& cancelled = {}) {
+    check_cancelled(cancelled);
     constexpr size_t context = 3;
-    const auto a = split_lines(old_text), b = split_lines(new_text);
+    const auto a = split_lines(old_text, cancelled), b = split_lines(new_text, cancelled);
     size_t prefix = 0;
-    while (prefix < a.size() && prefix < b.size() && a[prefix] == b[prefix]) ++prefix;
+    while (prefix < a.size() && prefix < b.size() && a[prefix] == b[prefix]) {
+        check_cancelled(cancelled); ++prefix;
+    }
     size_t suffix = 0;
     while (suffix < a.size() - prefix && suffix < b.size() - prefix &&
-           a[a.size() - 1 - suffix] == b[b.size() - 1 - suffix]) ++suffix;
+           a[a.size() - 1 - suffix] == b[b.size() - 1 - suffix]) {
+        check_cancelled(cancelled); ++suffix;
+    }
     const size_t n = a.size() - prefix - suffix, m = b.size() - prefix - suffix;
     std::vector<DiffOp> ops;
     for (size_t i = prefix - std::min(prefix, context); i < prefix; ++i) ops.push_back({' ', i, i});
     std::string script;
     if (n + m > 20000 || !myers(a.data() + prefix, static_cast<int>(n), b.data() + prefix, static_cast<int>(m),
-                                static_cast<int>(std::min<size_t>(n + m, 2000)), script))
+                                static_cast<int>(std::min<size_t>(n + m, 2000)), script, cancelled))
         script = std::string(n, '-') + std::string(m, '+');
     size_t x = prefix, y = prefix;
     for (char kind : script) {
+        check_cancelled(cancelled);
         ops.push_back({kind, x, y});
         if (kind != '+') ++x;
         if (kind != '-') ++y;
@@ -1167,6 +1443,7 @@ Diff unified_diff(std::string_view old_text, std::string_view new_text, const st
     };
     size_t i = 0;
     while (i < ops.size()) {
+        check_cancelled(cancelled);
         while (i < ops.size() && ops[i].kind == ' ') ++i;
         if (i == ops.size()) break;
         const size_t start = i >= context ? i - context : 0;
@@ -1186,6 +1463,7 @@ Diff unified_diff(std::string_view old_text, std::string_view new_text, const st
         }
         diff.text += "@@ -" + range(ops[start].a, a_count) + " +" + range(ops[start].b, b_count) + " @@\n";
         for (size_t k = start; k < stop; ++k) {
+            check_cancelled(cancelled);
             const std::string_view line = ops[k].kind == '+' ? b[ops[k].b] : a[ops[k].a];
             std::string_view shown = line;
             if (shown.ends_with('\n')) shown.remove_suffix(1);
@@ -1248,9 +1526,11 @@ std::vector<Edit> parse_edits(const Json& args) {
     return edits;
 }
 
-size_t count_matches(std::string_view text, std::string_view needle) {
+size_t count_matches(std::string_view text, std::string_view needle, const CancelFlag& cancelled) {
     size_t count = 0;
-    for (size_t pos = text.find(needle); pos != std::string_view::npos; pos = text.find(needle, pos + needle.size())) ++count;
+    for (size_t pos = text.find(needle); pos != std::string_view::npos; pos = text.find(needle, pos + needle.size())) {
+        check_cancelled(cancelled); ++count;
+    }
     return count;
 }
 
@@ -1260,7 +1540,8 @@ uint64_t line_at(std::string_view text, size_t pos) {
 
 // Applies one edit to content. The old_text forms tried follow the file's line endings, so text written with
 // LF matches a CRLF file and new_text is inserted with the same endings.
-void apply_edit(std::string& content, const Edit& edit, Eol eol, size_t index, size_t total, uint64_t& replacements) {
+void apply_edit(std::string& content, const Edit& edit, Eol eol, size_t index, size_t total, uint64_t& replacements,
+                const CancelFlag& cancelled) {
     const std::string where = total > 1 ? "edit " + std::to_string(index + 1) + " of " + std::to_string(total) : "the edit";
     if (edit.old_text.empty()) fail(where + ": old_text is empty");
     if (edit.old_text == edit.new_text) fail(where + ": old_text and new_text are identical");
@@ -1280,7 +1561,7 @@ void apply_edit(std::string& content, const Edit& edit, Eol eol, size_t index, s
     const std::pair<std::string, std::string>* chosen = nullptr;
     size_t count = 0;
     for (const auto& form : forms) {
-        if ((count = count_matches(content, form.first)) != 0) { chosen = &form; break; }
+        if ((count = count_matches(content, form.first, cancelled)) != 0) { chosen = &form; break; }
     }
     if (!chosen) {
         std::string message = where + ": old_text was not found";
@@ -1314,6 +1595,7 @@ void apply_edit(std::string& content, const Edit& edit, Eol eol, size_t index, s
     size_t pos = 0;
     for (size_t at = content.find(chosen->first); at != std::string::npos;
          at = edit.replace_all ? content.find(chosen->first, at + chosen->first.size()) : std::string::npos) {
+        check_cancelled(cancelled);
         next.append(content, pos, at - pos);
         next += chosen->second;
         pos = at + chosen->first.size();
@@ -1323,20 +1605,22 @@ void apply_edit(std::string& content, const Edit& edit, Eol eol, size_t index, s
     replacements += edit.replace_all ? count : 1;
 }
 
-Json edit_file(const Json& args, const SearchContext& context) {
+Json edit_file(const Json& args, const SearchContext& context, const CancelFlag& cancelled) {
     const Target target = resolve(context, string_arg(args, "path"));
     if (target.parts.empty()) fail("path names a configured root, not a file");
     const std::vector<Edit> edits = parse_edits(args);
     const bool dry_run = bool_arg(args, "dry_run", false);
     Budget budget(max_output_arg(args));
     const std::string path = target.display();
-    std::lock_guard lock(write_mutex());
-    Handle directory = open_parent(target, false);
+    std::unique_lock lock(write_mutex(), std::defer_lock);
+    while (!lock.try_lock()) { check_cancelled(cancelled); Sleep(1); }
+    check_cancelled(cancelled);
+    Handle directory = open_parent(target, false, nullptr, cancelled);
     // CONTRACT: no other process may open the file for writing between this read and the rename.
     Handle file = open_file(directory.h, target, FILE_SHARE_READ | FILE_SHARE_DELETE);
     const FILE_BASIC_INFO basic = basic_info(file.h, path);
     std::string raw;
-    if (!read_all(file.h, path, max_text_bytes, raw)) fail(path + " is larger than 64 MiB; edit_file does not edit it");
+    if (!read_all(file.h, path, max_text_bytes, raw, cancelled)) fail(path + " is larger than 64 MiB; edit_file does not edit it");
     check_guards(args, path, raw, basic);
     const TextFile text = decode(raw);
     if (text.binary) fail(path + " is binary (NUL byte at offset " + std::to_string(text.nul_offset) + "); edit_file edits text only");
@@ -1346,15 +1630,20 @@ Json edit_file(const Json& args, const SearchContext& context) {
     if (!dry_run && (basic.FileAttributes & FILE_ATTRIBUTE_READONLY)) fail(path + " is read-only; nothing was written");
     std::string content = text.text;
     uint64_t replacements = 0;
-    for (size_t i = 0; i < edits.size(); ++i) apply_edit(content, edits[i], eol_style(text), i, edits.size(), replacements);
+    for (size_t i = 0; i < edits.size(); ++i) {
+        check_cancelled(cancelled);
+        apply_edit(content, edits[i], eol_style(text), i, edits.size(), replacements, cancelled);
+    }
+    check_cancelled(cancelled);
     const std::string bytes = encode(content, text.encoding);
+    check_cancelled(cancelled);
     if (bytes == raw) return Json::Object{{"text", "No change: the edits leave " + path + " as it was; nothing was written.\n"}};
     TextFile after;
     after.text = content;
     count_lines(after);
-    const Diff diff = unified_diff(text.text, content, target.relative());
+    const Diff diff = unified_diff(text.text, content, target.relative(), cancelled);
     FILE_BASIC_INFO written = basic;
-    if (!dry_run) written = atomic_write(directory.h, target, bytes, true, basic.FileAttributes & kept_attributes, &file);
+    if (!dry_run) written = atomic_write(directory.h, target, bytes, true, basic.FileAttributes & kept_attributes, &file, cancelled);
     std::string summary = std::string(dry_run ? "Dry run, nothing written. Would edit " : "Edited ") + path + ": " +
                           std::to_string(edits.size()) + (edits.size() == 1 ? " edit, " : " edits, ") +
                           std::to_string(replacements) + (replacements == 1 ? " replacement" : " replacements") +
@@ -1370,7 +1659,7 @@ Json edit_file(const Json& args, const SearchContext& context) {
 
 // ---- write_file ----
 
-Json write_file(const Json& args, const SearchContext& context) {
+Json write_file(const Json& args, const SearchContext& context, const CancelFlag& cancelled) {
     const Target target = resolve(context, string_arg(args, "path"));
     if (target.parts.empty()) fail("path names a configured root, not a file");
     const std::string content = string_arg(args, "content");
@@ -1383,9 +1672,11 @@ Json write_file(const Json& args, const SearchContext& context) {
     bool encoding_given = args.get("encoding") != nullptr;
     Encoding encoding = encoding_given ? parse_encoding(string_arg(args, "encoding")) : Encoding::utf8;
     const std::string path = target.display();
-    std::lock_guard lock(write_mutex());
+    std::unique_lock lock(write_mutex(), std::defer_lock);
+    while (!lock.try_lock()) { check_cancelled(cancelled); Sleep(1); }
+    check_cancelled(cancelled);
     std::vector<std::string> created;
-    Handle directory = open_parent(target, true, &created);
+    Handle directory = open_parent(target, true, &created, cancelled);
     Handle existing;
     const NTSTATUS status = nt_open(directory.h, target.name(), FILE_GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE,
                                     disposition_open, option_non_directory | option_open_reparse_point, 0, existing);
@@ -1402,7 +1693,7 @@ Json write_file(const Json& args, const SearchContext& context) {
         if (basic.FileAttributes & FILE_ATTRIBUTE_READONLY) fail(path + " is read-only; nothing was written");
         attributes = basic.FileAttributes & kept_attributes;
         std::string raw;
-        const bool whole = read_all(existing.h, path, max_text_bytes, raw);
+        const bool whole = read_all(existing.h, path, max_text_bytes, raw, cancelled);
         if (whole) check_guards(args, path, raw, basic);
         else if (args.get("expected_sha256") || args.get("expected_mtime"))
             fail(path + " is larger than 64 MiB, so expected_sha256/expected_mtime cannot be checked; nothing was written");
@@ -1425,7 +1716,7 @@ Json write_file(const Json& args, const SearchContext& context) {
     const std::string text = endings.empty() ? content : replace_newlines(content, endings == "crlf" ? "\r\n" : "\n");
     const std::string bytes = encode(text, encoding);
     const FILE_BASIC_INFO written = atomic_write(directory.h, target, bytes, exists, attributes,
-                                                 exists ? &existing : nullptr);
+                                                 exists ? &existing : nullptr, cancelled);
     TextFile result;
     result.text = text;
     count_lines(result);
@@ -1533,12 +1824,29 @@ SourceText source_descriptor(const SearchContext& context, const std::string& pa
     return {fs::path(target.full(target.parts.size())), fs::path(target.root), {}, {}};
 }
 
+namespace {
+thread_local bool request_deadline_set = false;
+thread_local Clock::time_point current_request_deadline;
+}
+Clock::time_point request_deadline(Clock::time_point stage) {
+    return request_deadline_set ? std::min(stage, current_request_deadline) : stage;
+}
+RequestDeadline::RequestDeadline(Clock::time_point deadline)
+    : had_previous_(request_deadline_set), previous_(current_request_deadline) {
+    current_request_deadline = had_previous_ ? std::min(deadline, previous_) : deadline;
+    request_deadline_set = true;
+}
+RequestDeadline::~RequestDeadline() {
+    request_deadline_set = had_previous_;
+    current_request_deadline = previous_;
+}
+
 Json apply_source_changes(const std::vector<SourceChange>& changes, const Json& arguments,
                           const SearchContext& context, const std::shared_ptr<std::atomic_bool>& cancelled,
                           const Json* move_arguments) {
     if (context.read_only) fail("writes are disabled: --read-only");
     const bool dry = bool_arg(arguments, "dry_run", false);
-    const auto deadline = Clock::now() + std::chrono::milliseconds(int_arg(arguments, "timeout_ms", 30000, 1, 300000));
+    const auto deadline = request_deadline(Clock::now() + std::chrono::milliseconds(int_arg(arguments, "timeout_ms", 30000, 1, 300000)));
     auto check = [&] {
         if (cancelled && cancelled->load()) fail("edit cancelled before commit");
         if (Clock::now() >= deadline) fail("edit timed out before commit");
@@ -1585,8 +1893,8 @@ Json apply_source_changes(const std::vector<SourceChange>& changes, const Json& 
     // Stage every replacement and recovery before the first target is changed.
     for (auto& p : pending) {
         check();
-        p->replacement = stage_write(p->parent.h, p->target, p->new_bytes, p->basic.FileAttributes & kept_attributes);
-        p->recovery = stage_write(p->parent.h, p->target, p->old_bytes, p->basic.FileAttributes & kept_attributes);
+        p->replacement = stage_write(p->parent.h, p->target, p->new_bytes, p->basic.FileAttributes & kept_attributes, p->original.h);
+        p->recovery = stage_write(p->parent.h, p->target, p->old_bytes, p->basic.FileAttributes & kept_attributes, p->original.h);
         if (!SetFileInformationByHandle(p->recovery->file.h, FileBasicInfo, &p->basic, sizeof(p->basic)))
             fail("cannot prepare recovery metadata; nothing was written");
     }
@@ -1594,6 +1902,7 @@ Json apply_source_changes(const std::vector<SourceChange>& changes, const Json& 
         check();
         for (auto& p : pending) {
             check();
+            require_unreplaced(p->parent.h, p->target, p->original.h);
             if (const DWORD code = rename_handle(p->replacement->file.h, p->parent.h, p->target.name(), true, &p->original))
                 fail(p->target.display() + ": " + rename_error(code));
             p->replacement->armed = false;
@@ -1635,6 +1944,27 @@ Json apply_source_changes(const std::vector<SourceChange>& changes, const Json& 
              "; recovery incomplete, inspect these files:" + recovery_errors));
     }
     return Json::Object{{"text", "Applied " + std::to_string(pending.size()) + " file changes.\n" + out}};
+}
+
+void write_workspace_metadata(const SearchContext& context, const fs::path& path, const std::string& bytes) {
+    if (context.read_only) fail("writes are disabled: --read-only");
+    const Target target = resolve(context, utf8(path.wstring()));
+    if (target.parts.empty()) fail("metadata path names a configured root");
+    std::lock_guard lock(write_mutex());
+    Handle parent = open_parent(target, true);
+    Handle original;
+    const NTSTATUS status = nt_open(parent.h, target.name(), FILE_GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE,
+                                    disposition_open, option_non_directory | option_open_reparse_point, 0, original);
+    DWORD attributes = 0;
+    if (status >= 0) {
+        refuse_link(original.h, target.display());
+        const FILE_BASIC_INFO basic = basic_info(original.h, target.display());
+        std::string current;
+        if (read_all(original.h, target.display(), static_cast<uint64_t>(bytes.size()), current) && current == bytes) return;
+        if (basic.FileAttributes & FILE_ATTRIBUTE_READONLY) fail(target.display() + " is read-only");
+        attributes = basic.FileAttributes & kept_attributes;
+    } else if (static_cast<uint32_t>(status) != 0xC0000034) fail(target.display() + ": " + status_text(status));
+    (void)atomic_write(parent.h, target, bytes, static_cast<bool>(original), attributes, original ? &original : nullptr);
 }
 
 SourceText read_source_text(const SearchContext& context, const std::string& path) {
@@ -1728,13 +2058,27 @@ Json run_file_tool(const std::string& name, const Json& arguments, const SearchC
     const std::string operation = arguments.get("operation") ? string_arg(arguments, "operation") : "auto";
     if (name == "read_file") return read_file(arguments, context, cancelled);
     if (name == "list_dir") {
-        if (operation == "auto" || operation == "filesystem") return list_dir(arguments, context, cancelled);
+        if (operation == "auto" || operation == "filesystem") {
+            if (arguments.get("format")) fail("format is only for operation=overview");
+            return list_dir(arguments, context, cancelled);
+        }
         if (operation != "overview") fail("list_dir operation must be filesystem or overview");
         for (const char* key : {"hidden", "no_ignore", "max_results", "max_output_bytes"})
             if (arguments.get(key)) fail(std::string(key) + " is only for filesystem listing");
         Json::Object query = arguments.object();
         if (!query.contains("path")) query.emplace("path", ".");
-        return Json::Object{{"text", lsp_query("overview", query, context, cancelled).dump() + "\n"}};
+        const bool json_format = outline_format(arguments) == "json";
+        query.erase("format");
+        try {
+            const Json result = lsp_query("overview", query, context, cancelled);
+            return Json::Object{{"text", json_format ? result.dump() + "\n" : compact_outline(result)}};
+        }
+        catch (const LspFailure& e) {
+            Json listing = list_dir(Json(Json::Object{{"path", query.at("path")}}), context, cancelled);
+            auto& text = std::get<Json::Object>(listing.value).at("text");
+            text = lsp_failure_banner(e.what(), "Fallback below: the plain folder listing instead of symbols") + text.string();
+            return listing;
+        }
     }
     if (name == "file_info") {
         if (operation == "auto" || operation == "metadata") {
@@ -1752,6 +2096,7 @@ Json run_file_tool(const std::string& name, const Json& arguments, const SearchC
         for (const auto& path : path_args(arguments)) {
             Json::Object query = arguments.object(); query.erase("paths"); query["path"] = path;
             try { out += lsp_query(method, query, context, cancelled).dump() + "\n"; }
+            catch (const LspFailure& e) { out += lsp_failure_banner(path + ": " + e.what(), "No fallback exists for this request"); }
             catch (const std::exception& e) { out += "[error " + path + ": " + e.what() + "]\n"; }
         }
         return Json::Object{{"text", std::move(out)}};
@@ -1769,10 +2114,22 @@ Json run_file_tool(const std::string& name, const Json& arguments, const SearchC
         } else {
             for (const char* key : {"name_path", "new_text", "new_name", "line", "column"})
                 if (arguments.get(key)) fail(std::string(key) + " is only for semantic edits");
-            result = edit_file(arguments, context);
+            result = edit_file(arguments, context, cancelled);
         }
-    } else if (name == "write_file") result = write_file(arguments, context);
-    else if (name == "move_file") result = lsp_move(arguments, context, cancelled);
+    } else if (name == "write_file") result = write_file(arguments, context, cancelled);
+    else if (name == "move_file") {
+        try { result = lsp_move(arguments, context, cancelled); }
+        catch (const LspFailure& e) {
+            // Import planning failed before anything was written; auto moves still happen, without import edits.
+            if (operation != "auto") throw;
+            Json::Object plain = arguments.object();
+            plain["operation"] = "filesystem";
+            result = lsp_move(Json(std::move(plain)), context, cancelled);
+            auto& text = std::get<Json::Object>(result.value).at("text");
+            text = lsp_failure_banner(e.what(), "Fallback: the move was done without import updates; check references by hand") +
+                   text.string();
+        }
+    }
     else if (name == "create_directory") result = create_directory(arguments, context);
     else fail("unknown tool");
     if (!dry_run) {
@@ -1783,6 +2140,10 @@ Json run_file_tool(const std::string& name, const Json& arguments, const SearchC
                 if (const Json* timeout = arguments.get("timeout_ms")) query.emplace("timeout_ms", *timeout);
                 auto& text = std::get<Json::Object>(result.value).at("text");
                 text = text.string() + lsp_query("diagnostics", query, context, cancelled).dump() + "\n";
+            } catch (const LspFailure& e) {
+                auto& text = std::get<Json::Object>(result.value).at("text");
+                text = text.string() + lsp_failure_banner(std::string("diagnostics after the write failed: ") + e.what(),
+                                                          "The write itself succeeded");
             } catch (const std::exception& e) {
                 auto& text = std::get<Json::Object>(result.value).at("text");
                 text = text.string() + "[warning: write applied; diagnostics unavailable: " + e.what() + "]\n";
@@ -1818,17 +2179,18 @@ Json file_tool_definitions(bool read_only) {
 
     Json::Array tools;
     tools.push_back(Json::Object{{"name", "read_file"}, {"description",
-        "Read live code through LSP: symbol overview by default, or name_path for a symbol body. "
-        "Explicit offset/limit or operation=text reads lines (default 200). Unconfigured formats use text. "
-        "No output byte cap. Text header includes encoding, mtime and sha256; binary and >64 MiB refused." + common_paths},
+        "Read live code through LSP: symbol overview by default (one \"LINE kind name_path\" line each; format=json for ranges), or name_path for a symbol body. "
+        "Explicit offset/limit or operation=text reads lines (all remaining lines unless limit is set). Unconfigured formats use text. "
+        "No output byte cap. Text header includes encoding, mtime and sha256; binary and >256 MiB refused (UTF-16 >64 MiB)." + common_paths},
         {"inputSchema", schema(Json::Object{{"path", path}, {"paths", paths},
             {"offset", field("integer", "First line, from 1.")},
-            {"limit", field("integer", "Text lines per file; default 200, increase for larger reads.")},
+            {"limit", field("integer", "Optional text line limit per file; default all remaining lines.")},
             {"operation", choice(Json::Array{"auto", "overview", "symbol", "text"}, "Default auto: LSP if configured, otherwise text.")},
             {"name_path", field("string", "Read this symbol's complete body; slash-separated parent/name with optional overload [i].")},
             {"include_kinds", Json::Object{{"type", "array"}, {"items", Json::Object{{"type", "integer"}}}, {"description", "LSP kinds 1-26 to include."}}},
             {"exclude_kinds", Json::Object{{"type", "array"}, {"items", Json::Object{{"type", "integer"}}}, {"description", "LSP kinds to exclude."}}},
-            {"depth", field("integer", "Overview child depth; default 0, -1 all.")},
+            {"depth", field("integer", "Overview child depth; default -1 (all).")},
+            {"format", choice(Json::Array{"compact", "json"}, "Overview: compact lines \"LINE kind name_path\" (default) or json with ranges.")},
             {"timeout_ms", field("integer", "LSP deadline, 1-300000; default 30000.")},
             {"line_numbers", field("boolean", "Text line numbers; default true.")}})}});
     tools.push_back(Json::Object{{"name", "list_dir"}, {"description",
@@ -1836,7 +2198,8 @@ Json file_tool_definitions(bool read_only) {
         {"inputSchema", schema(Json::Object{
             {"path", field("string", "Folder; default the first root.")},
             {"operation", choice(Json::Array{"filesystem", "overview"}, "Default filesystem; overview returns live LSP symbols by file.")},
-            {"depth", field("integer", "Filesystem: 1-32, default 1. Overview: child depth, default 0, -1 all.")},
+            {"depth", field("integer", "Filesystem: 1-32, default 1. Overview: child depth, default -1 (all).")},
+            {"format", choice(Json::Array{"compact", "json"}, "Overview: compact lines per file (default) or json with ranges.")},
             {"hidden", field("boolean", "Include hidden entries.")},
             {"no_ignore", field("boolean", "Include .gitignore/.ignore'd entries.")},
             {"max_results", field("integer", "Optional entry limit, 1-10000; default unlimited.")},
@@ -1859,7 +2222,7 @@ Json file_tool_definitions(bool read_only) {
             {"new_text", field("string", "Replacement.")},
             {"replace_all", field("boolean", "Replace every match.")}}}};
     tools.push_back(Json::Object{{"name", "edit_file"}, {"description",
-        "Live LSP symbol replace, insert_before/insert_after, rename across files, or reference-checked safe_delete. "
+        "Live LSP symbol replace, insert_before/insert_after, rename across files (listing same-name mentions it leaves, e.g. other languages), or reference-checked safe_delete. "
         "Text edits remain available. Snapshot guards, encoding preservation, dry-run diffs and rollback on commit failure; atomic per file." + common_paths},
         {"inputSchema", schema(Json::Object{{"path", path},
             {"edits", Json::Object{{"type", "array"}, {"items", edit_item}, {"description", "1-256 edits."}}},

@@ -9,12 +9,31 @@
 #include <string>
 
 namespace shgrep {
+// CONTRACT: one absolute deadline per tool request (timeout_ms from when run_tool received it). Each stage clamps its
+//   own deadline with request_deadline, so locking, LSP work and commits together never outlast the request.
+std::chrono::steady_clock::time_point request_deadline(std::chrono::steady_clock::time_point stage);
+class RequestDeadline {
+public:
+    explicit RequestDeadline(std::chrono::steady_clock::time_point deadline);
+    ~RequestDeadline();
+    RequestDeadline(const RequestDeadline&) = delete;
+    RequestDeadline& operator=(const RequestDeadline&) = delete;
+
+private:
+    bool had_previous_;
+    std::chrono::steady_clock::time_point previous_;
+};
+
 // Validated disk snapshots used to synchronize language servers, never a content cache.
 struct SourceText {
     std::filesystem::path path, root;
     std::string text, sha256, mtime;
 };
 SourceText read_source_text(const SearchContext& context, const std::string& path);
+// Generated build metadata uses the same root checks, no-link traversal and atomic replacement as file tools.
+// Leaves an identical existing file untouched. Does not notify LSP about its own configuration files.
+void write_workspace_metadata(const SearchContext& context, const std::filesystem::path& path,
+                              const std::string& bytes);
 // Resolve metadata without reading source; validates existing paths and all parent handles.
 SourceText source_descriptor(const SearchContext& context, const std::string& path, bool* directory = nullptr,
                              bool allow_missing = false, bool* exists = nullptr);

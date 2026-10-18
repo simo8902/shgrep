@@ -103,6 +103,7 @@ int wmain(int argc, wchar_t** argv) {
     _setmode(_fileno(stdin), _O_BINARY);
     _setmode(_fileno(stdout), _O_BINARY);
     shgrep::SearchContext context;
+    context.laya_required = true;
     for (int i = 1; i < argc; ++i) {
         if (std::wstring(argv[i]) == L"--root" && i + 1 < argc) context.allowed_roots.emplace_back(argv[++i]);
         else if (std::wstring(argv[i]) == L"--read-only") context.read_only = true;

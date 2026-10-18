@@ -1,5 +1,52 @@
 # shgrep
 
+## Required local Laya
+
+MCP search with operation="text" requires intent and a local llama-server running the Laya GGUF. There is no MCP opt-out or raw fallback. LSP navigation, explicit file reads, binary search and filename search keep their existing contracts. The native CLI remains the raw engine used by comparison benchmarks.
+
+Start llama-server on the GPU (check `llama-server --list-devices` lists it; `-c 8192 -np 4` gives each slot 2048 tokens, more than one decision needs):
+
+    llama-server -m Laya-Q8_0.gguf -ngl 99 -c 8192 -np 4 --host 127.0.0.1 --port 8080
+
+shgrep talks to it directly over loopback; there is no bridge process.
+
+| Setting | Default | Effect |
+|---|---|---|
+| SHGREP_LAYA_PORT | 8080 | llama-server port on 127.0.0.1 |
+| SHGREP_LAYA_TOKEN | unset | sent as `Authorization: Bearer`, for llama-server `--api-key` |
+| SHGREP_LAYA_BUDGET_MS | 2000 | Laya time per search, capped at half the remaining timeout_ms |
+| SHGREP_LAYA_POOL | 24 | best keyword candidates kept, at most 3 per file (0 = all, no per-file cap) |
+| SHGREP_LAYA_SCORE | 16 | of those, how many Laya scores (0 = all) |
+| SHGREP_LAYA_RETURN | 10 | most hunks returned (0 = the whole pool, no P filter) |
+| SHGREP_LAYA_FILTER | 0 | minimum P in percent for a scored hunk to be kept, at least 3 kept (0 = no filter, order only; 50 cost 10 points of recall in the 30-question eval) |
+| SHGREP_LAYA_WEIGHT | 100 | weight of Laya's rank against the keyword rank in the RRF fusion, in percent (100 = equal, 0 = keyword order) |
+
+How a search is ranked (the laya-codex design, so a converted laya-code GGUF needs no change):
+
+1. The live scan's findings become candidates: text hunks (groups between `--` separators, or nearby matched lines), or json results grouped where their context overlaps.
+2. Request-local BM25 of the intent over each candidate's path and code orders them; the top SHGREP_LAYA_POOL stay, at most 3 per file.
+3. The best SHGREP_LAYA_SCORE get one Laya `noul` decision each, in parallel up to the server's slots: `Is this source code relevant to the software change: "<intent>"?` over `file: <path> (lines a-b)` and the first 400 bytes of code (about 128 tokens).
+4. Scored candidates are ordered by RRF (k = 60) of their keyword and Laya ranks. With SHGREP_LAYA_FILTER set, hunks below that P are dropped (at least 3 kept). When the budget ends first, unscored candidates keep keyword order below the scored ones; the report says `laya-partial` or `lexical`. That is not an error.
+5. At most SHGREP_LAYA_RETURN come back best first with their original output text; json results carry `laya: {rank, lexical_rank, p, score}`.
+
+An unreachable or failing llama-server, cancellation and the request timeout are errors. A final live scan verifies the findings after inference; changed findings cause a retry error. Responses include the laya report (a leading [laya selection ...] line for text): mode, candidates, pool, scored, unscored, returned, budget and Laya time. summary.matches_found describes the raw scan; matches_returned describes the returned matches after explicit limits. Scores are comparative and are not calibrated for code retrieval.
+
+No searched text, decisions or results persist between requests. The running llama-server owns model memory and model files.
+
+Example text search:
+
+    {"operation":"text","patterns":["combat","transaction"],"intent":"Locate where a combat tick emits its transaction"}
+
+User-run checks against the real model (llama-server running):
+
+    python tests\laya_checks.py build-rel\shgrep.exe
+
+Retrieval quality, Laya against keyword-only ranking on the same pool:
+
+    python tests\retrieval_eval.py build-rel\shgrep.exe "C:\Users\Simeon\Documents\rust-experimental" --count 30
+
+The source/protocol regression clients (smoke.py, lsp_smoke.py) also need llama-server. They run with a zero budget and no pool or return limit, so every finding comes back in scan order.
+
 ## mcp__shgrep__create_directory
 
 Create a folder and its parents (mkdir -p). Links are never followed.
@@ -14,7 +61,7 @@ declare const tools: { mcp__shgrep__create_directory(args: {
 
 ## mcp__shgrep__edit_file
 
-Live LSP symbol replace, insert_before/insert_after, rename across files, or reference-checked safe_delete. Text edits remain available. Snapshot guards, encoding preservation, dry-run diffs and rollback on commit failure; atomic per file. Links are never followed.
+Live LSP symbol replace, insert_before/insert_after, rename across files (listing same-name mentions it leaves, e.g. other languages), or reference-checked safe_delete. Text edits remain available. Snapshot guards, encoding preservation, dry-run diffs and rollback on commit failure; atomic per file. Links are never followed.
 
 exec tool declaration:
 ```ts
@@ -142,7 +189,7 @@ List files and folders: "d sub/", "f name SIZE", "l link". Links are never follo
 exec tool declaration:
 ```ts
 declare const tools: { mcp__shgrep__list_dir(args: {
-  // Filesystem: 1-32, default 1. Overview: child depth, default 0, -1 all.
+  // Filesystem: 1-32, default 1. Overview: child depth, default -1 (all).
   depth?: number;
   // Include hidden entries.
   hidden?: boolean;
@@ -185,18 +232,18 @@ declare const tools: { mcp__shgrep__move_file(args: {
 
 ## mcp__shgrep__read_file
 
-Read live code through LSP: symbol overview by default, or name_path for a symbol body. Explicit offset/limit or operation=text reads lines (default 200). Unconfigured formats use text. No output byte cap. Text header includes encoding, mtime and sha256; binary and >64 MiB refused. Links are never followed.
+Read live code through LSP: complete symbol overview by default (one "LINE kind name_path" line each; format=json for ranges), or name_path for a symbol body. Explicit offset/limit or operation=text reads lines (all remaining lines unless limit is set). Unconfigured formats use text. No output byte cap. Text header includes encoding, mtime and sha256; binary and >256 MiB refused (UTF-16 >64 MiB). Links are never followed.
 
 exec tool declaration:
 ```ts
 declare const tools: { mcp__shgrep__read_file(args: {
-  // Overview child depth; default 0, -1 all.
+  // Overview child depth; default -1 (all).
   depth?: number;
   // LSP kinds to exclude.
   exclude_kinds?: Array<number>;
   // LSP kinds 1-26 to include.
   include_kinds?: Array<number>;
-  // Text lines per file; default 200, increase for larger reads.
+  // Optional text line limit per file; default all remaining lines.
   limit?: number;
   // Text line numbers; default true.
   line_numbers?: boolean;
@@ -217,11 +264,11 @@ declare const tools: { mcp__shgrep__read_file(args: {
 
 ## mcp__shgrep__search
 
-Navigate live code through LSP: symbols, definition/declaration/type_definition, implementation, references, or hover. Bodies are opt-in; no LSP output cap. Configure .shgrep/lsp.json. operation=text searches current disk text with the grep options below, including XML and files without a language server.
+Navigate live code through LSP: symbols, definition/declaration/type_definition, implementation, references, or hover. Bodies are opt-in; no LSP output cap. Lua, XML, C/C++, Rust and Python work out of the box; .shgrep/lsp.json adds or overrides servers. A failing server is reported in a leading [LSP FAILURE ...] line, to relay to the user, followed by whole-word text matches. operation=text requires intent and a local llama-server with Laya: findings are ranked by keywords, the best re-ranked by Laya, and the top hunks return best first with their original text; the laya report gives the counts. An unreachable Laya is an error. Grep filters apply, including XML and files without a language server.
 
 exec tool declaration:
 ```ts
-declare const tools: { mcp__shgrep__search(args: { after_lines?: number; before_lines?: number; block?: boolean; case_insensitive?: boolean; column?: number; context_after_bytes?: number; context_before_bytes?: number; context_bytes?: number; context_lines?: number; depth?: number; exclude?: Array<string>; exclude_kinds?: Array<number>; extensions?: Array<string>; hidden?: boolean; include?: Array<string>; include_body?: boolean; include_declaration?: boolean; include_info?: boolean; include_kinds?: Array<number>; index?: boolean; invert?: boolean; line?: number; line_numbers?: boolean; max_block_lines?: number; max_file_bytes?: number; max_line_bytes?: number; max_matches_per_file?: number; max_output_bytes?: number; max_results?: number; mode?: "regex" | "literal"; multiline?: boolean; name_path?: string; no_ignore?: boolean; operation?: "symbols" | "definition" | "declaration" | "type_definition" | "implementation" | "references" | "hover" | "text"; output?: "lines" | "files" | "files_without_match" | "count" | "json"; path?: string; path_filter?: string; paths?: "absolute" | "relative"; pattern?: string; patterns?: Array<string>; roots?: Array<string>; sniff_all?: boolean; substring_matching?: boolean; timeout_ms?: number; types?: Array<string>; word?: boolean; }): Promise<CallToolResult>; };
+declare const tools: { mcp__shgrep__search(args: { after_lines?: number; before_lines?: number; block?: boolean; case_insensitive?: boolean; column?: number; context_after_bytes?: number; context_before_bytes?: number; context_bytes?: number; context_lines?: number; intent?: string; depth?: number; exclude?: Array<string>; exclude_kinds?: Array<number>; extensions?: Array<string>; hidden?: boolean; include?: Array<string>; include_body?: boolean; include_declaration?: boolean; include_info?: boolean; include_kinds?: Array<number>; index?: boolean; invert?: boolean; line?: number; line_numbers?: boolean; max_block_lines?: number; max_file_bytes?: number; max_line_bytes?: number; max_matches_per_file?: number; max_output_bytes?: number; max_results?: number; mode?: "regex" | "literal"; multiline?: boolean; name_path?: string; no_ignore?: boolean; operation?: "symbols" | "definition" | "declaration" | "type_definition" | "implementation" | "references" | "hover" | "text"; output?: "lines" | "files" | "files_without_match" | "count" | "json"; path?: string; path_filter?: string; paths?: "absolute" | "relative"; pattern?: string; patterns?: Array<string>; roots?: Array<string>; sniff_all?: boolean; substring_matching?: boolean; timeout_ms?: number; types?: Array<string>; word?: boolean; }): Promise<CallToolResult>; };
 ```
 
 ## mcp__shgrep__search_bytes

@@ -80,6 +80,9 @@ inline std::wstring long_path(const std::wstring& path) {
     if (path.starts_with(L"\\\\")) return L"\\\\?\\UNC\\" + path.substr(2);
     return L"\\\\?\\" + path;
 }
+inline std::wstring absolute_long_path(const std::filesystem::path& path) {
+    return long_path(std::filesystem::absolute(path).lexically_normal().wstring());
+}
 inline std::wstring join_path(const std::wstring& directory, std::wstring_view name) {
     std::wstring out;
     out.reserve(directory.size() + 1 + name.size());

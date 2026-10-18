@@ -163,16 +163,39 @@ struct Parser {
         return n;
     }
 };
-bool needs_escape(unsigned char c) { return c == '"' || c == '\\' || c < 32; }
+bool needs_escape(unsigned char c) { return c == '"' || c == '\\' || c < 32 || c >= 0x80; }
+// Length of the valid UTF-8 sequence starting at p[0], or 0 when it is invalid or cut short.
+size_t utf8_sequence(const unsigned char* p, size_t n) {
+    const unsigned char c = p[0];
+    size_t length = 0;
+    unsigned char low = 0x80, high = 0xbf;
+    if (c >= 0xc2 && c <= 0xdf) length = 2;
+    else if (c >= 0xe0 && c <= 0xef) { length = 3; if (c == 0xe0) low = 0xa0; else if (c == 0xed) high = 0x9f; }
+    else if (c >= 0xf0 && c <= 0xf4) { length = 4; if (c == 0xf0) low = 0x90; else if (c == 0xf4) high = 0x8f; }
+    else return 0;
+    if (n < length || p[1] < low || p[1] > high) return 0;
+    for (size_t k = 2; k < length; ++k) if ((p[k] & 0xc0) != 0x80) return 0;
+    return length;
+}
 // PERF: runs of bytes that need no escaping are appended at once; MCP text responses are hundreds of KB.
+// SAFETY: the output is always valid UTF-8, as JSON requires: an invalid byte (a cut character, legacy text) is
+//   written as U+FFFD, so no caller can produce an invalid MCP response.
 void escape(const std::string& s, std::string& out) {
     constexpr char hex[] = "0123456789abcdef";
     out.reserve(out.size() + s.size() + 2);
     out.push_back('"');
     size_t run = 0;
+    const auto* bytes = reinterpret_cast<const unsigned char*>(s.data());
     for (size_t i = 0; i < s.size(); ++i) {
         const auto c = static_cast<unsigned char>(s[i]);
         if (!needs_escape(c)) continue;
+        if (c >= 0x80) {
+            if (const size_t length = utf8_sequence(bytes + i, s.size() - i)) { i += length - 1; continue; }
+            out.append(s, run, i - run);
+            out += "\xEF\xBF\xBD";
+            run = i + 1;
+            continue;
+        }
         out.append(s, run, i - run);
         run = i + 1;
         if (c == '"' || c == '\\') { out.push_back('\\'); out.push_back(static_cast<char>(c)); }
@@ -215,9 +238,15 @@ Json Json::parse(const std::string& input) {
 std::string Json::dump() const { std::string out; dump_value(*this, out); return out; }
 size_t Json::escaped_size(std::string_view s) {
     size_t size = s.size() + 2;
-    for (unsigned char c : s) {
+    const auto* bytes = reinterpret_cast<const unsigned char*>(s.data());
+    for (size_t i = 0; i < s.size(); ++i) {
+        const unsigned char c = bytes[i];
         if (c == '"' || c == '\\') size += 1;
         else if (c < 32) size += 5;
+        else if (c >= 0x80) {
+            if (const size_t length = utf8_sequence(bytes + i, s.size() - i)) i += length - 1;
+            else size += 2;  // written as the 3-byte U+FFFD
+        }
     }
     return size;
 }
