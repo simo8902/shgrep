@@ -2,7 +2,7 @@
 
 ## Ranked text search
 
-MCP search with operation="text" takes an optional `intent`, the user's task in words. With it, the findings are ranked against it and only the best come back; without it every finding returns in scan order, exactly as before. Ranking is local, needs no model or server, and keeps no state between requests.
+MCP search with operation="text" takes an optional `intent`, the user's task in words. With it, the findings are ranked against it and only the best come back; without it every finding returns in scan order, exactly as before. Ranking is local, needs no model or server by default, and keeps no state between requests. An optional reranker (below) can re-order the best candidates.
 
 How a ranked search works:
 
@@ -15,14 +15,26 @@ How a ranked search works:
 |---|---|---|
 | SHGREP_RANK_RETURN | 10 | most candidates returned (0 = all) |
 | SHGREP_RANK_PER_FILE | 3 | most candidates per file (0 = no cap) |
+| SHGREP_RERANK_PORT | unset | port of a llama-server on 127.0.0.1 started with `--reranking`; unset = no reranker |
+| SHGREP_RERANK_POOL | 24 | keyword candidates sent to the reranker (0 = all) |
+| SHGREP_RERANK_BUDGET_MS | 3000 | how long a search waits for the reranker |
 
-Measured on 30 doc-comment questions in a Rust and Python repository (`tests/retrieval_eval.py`): the right function was ranked first for 87% of questions (77% with `--hard`) and returned about 6,000 tokens instead of about 123,000 for grep plus reading the file. Models were tried as a second stage (Laya System One decision models, a Qwen reranker); none is part of shgrep. The Laya integration and its evals are in commit 1b89e50 ("SYSTEM ONE").
+### Optional reranker
+
+Any reranker model that llama-server serves works (Qwen3-Reranker-0.6B was tested). Start it, then give shgrep its port:
+
+    llama-server -m <reranker>.gguf --reranking --pooling rank --embedding -ngl 99 --host 127.0.0.1 --port 8081
+    set SHGREP_RERANK_PORT=8081
+
+The best SHGREP_RERANK_POOL keyword candidates (`file: <path> (lines a-b)` plus up to 2,000 bytes of code each) are scored in one `POST /v1/rerank`, and the top 10 come back in the reranker's order; json results carry `ranking.rerank_score`. The reranker never makes a search fail: if it is unreachable, slow or answers badly, the keyword order is returned and the ranking report carries `rerank_error`. A search cannot be cancelled while it waits for the reranker (at most the budget). The reranker's quality depends on its model; measure it with `tests\retrieval_eval.py ... --rerank-port 8081`.
+
+Measured on 30 doc-comment questions in a Rust and Python repository (`tests/retrieval_eval.py`): the right function was ranked first for 87% of questions (77% with `--hard`) and returned about 6,000 tokens instead of about 123,000 for grep plus reading the file. Second-stage models were compared: Laya System One decision models never beat keywords and were removed (the integration and its evals are in commit 1b89e50, "SYSTEM ONE"); a standard reranker did (Qwen3-Reranker-0.6B, 100 hard questions: first 90% vs 78%, top 3 100% vs 93%) and is the optional stage above.
 
 Example text search:
 
     {"operation":"text","patterns":["combat","transaction"],"intent":"Locate where a combat tick emits its transaction"}
 
-User-run ranking checks (no model, no server):
+User-run ranking checks (no model, no server; add `--rerank-port 8081` to check the real reranker stage too):
 
     python tests\rank_checks.py build-rel\shgrep.exe
 

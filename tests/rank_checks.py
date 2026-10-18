@@ -1,13 +1,16 @@
 """User-run checks of shgrep's keyword ranking; no model, no server.
 Usage: python tests/rank_checks.py build-rel/shgrep.exe
 Checks: an intent ranks hunks best first, no intent keeps scan order and every finding, the per-file cap and return
-limit (defaults and SHGREP_RANK_* settings), explicit max_results, bad settings, and that edits show up at once.
+limit (defaults and SHGREP_RANK_* settings), explicit max_results, bad settings, that edits show up at once, and that
+an unreachable reranker never fails a search. With --rerank-port N (a llama-server running a reranker model with
+--reranking --pooling rank) it also checks the real reranker stage.
 retrieval_eval.py measures ranking quality on a real repository.
 """
 import argparse
 import json
 import os
 from pathlib import Path
+import socket
 import sys
 import tempfile
 
@@ -117,9 +120,47 @@ def check_fresh(client, root):
         target.write_text(original, encoding="utf-8")
 
 
+def check_unreachable_reranker(executable, root):
+    # A bound but unlistened port refuses connections: the reranker is down, and the search must not notice.
+    with socket.socket() as reserved:
+        reserved.bind(("127.0.0.1", 0))
+        port = reserved.getsockname()[1]
+        client = Client(executable, root, environment={**os.environ, "SHGREP_RERANK_PORT": str(port),
+                                                       "SHGREP_RERANK_BUDGET_MS": "1000"})
+        try:
+            results, reply = results_of(client, pattern="def ", path="pair", include=["*.py"], intent=INTENT)
+            assert [Path(r["path"]).name for r in results] == ["intervals.py", "render.py"], results
+            report = reply["ranking"]
+            assert report["mode"] == "keyword" and report["rerank_error"] and report["rerank_scored"] == 0, report
+            assert all("rerank_score" not in r["ranking"] for r in results), results
+        finally:
+            client.close()
+
+
+def check_real_reranker(executable, root, port):
+    client = Client(executable, root, environment={**os.environ, "SHGREP_RERANK_PORT": str(port)})
+    try:
+        results, reply = results_of(client, pattern="def ", path="pair", include=["*.py"], intent=INTENT)
+        report = reply["ranking"]
+        assert report["mode"] == "rerank" and report["rerank_scored"] == 2 and "rerank_error" not in report, report
+        assert all("rerank_score" in r["ranking"] for r in results), results
+        assert Path(results[0]["path"]).name == "intervals.py", [(r["path"], r["ranking"]) for r in results]
+        print(f"  rerank scores {[round(r['ranking']['rerank_score'], 3) for r in results]} in {report['rerank_ms']} ms")
+
+        results, reply = results_of(client, pattern="def handler_", path="many", intent="handle the request")
+        report = reply["ranking"]
+        assert report["mode"] == "rerank" and report["rerank_scored"] == 24 and report["returned"] == 10, report
+        scores = [r["ranking"]["rerank_score"] for r in results]
+        assert scores == sorted(scores, reverse=True), scores
+        assert [r["ranking"]["rank"] for r in results] == list(range(1, 11)), results
+    finally:
+        client.close()
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("executable", type=Path)
+    parser.add_argument("--rerank-port", type=int, help="port of a running llama-server --reranking, to test the real stage")
     args = parser.parse_args()
     executable = args.executable.resolve()
     with tempfile.TemporaryDirectory(prefix="shgrep-rank-", ignore_cleanup_errors=True) as folder:
@@ -149,6 +190,11 @@ def main():
             client.close()
         check_settings(executable, root)
         print("ok  settings")
+        check_unreachable_reranker(executable, root)
+        print("ok  unreachable reranker falls back to keyword order")
+        if args.rerank_port:
+            check_real_reranker(executable, root, args.rerank_port)
+            print("ok  real reranker")
     print("Ranking checks passed")
 
 

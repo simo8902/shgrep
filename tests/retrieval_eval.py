@@ -1,11 +1,13 @@
 """Measures intent -> function retrieval on a real repository: shgrep's keyword ranking against unranked results.
-Usage: python tests/retrieval_eval.py dist/shgrep.exe <repo> [--count 30] [--seed 1] [--hard]
+Usage: python tests/retrieval_eval.py dist/shgrep.exe <repo> [--count 30] [--seed 1] [--hard] [--rerank-port 8081]
   Questions come from the repo's own doc comments (Rust ///, Python docstrings), with the function's own name
   removed; the answer is that function. With --hard, question words that also appear in the answer's code are
   dropped too (questions left with fewer than 3 words are skipped). For each question it measures:
     baseline  grep the intent's words (lines output) + read the answer's whole file: tokens an agent pays
     unranked  the same search without an intent: findings in scan order, candidates sorted by hit count
     ranked    the same search with the intent: BM25-ranked hunks (top 10, at most 3 per file), in returned order
+    reranked  with --rerank-port: the same, re-ordered by a reranker (llama-server --reranking --pooling rank) through
+              shgrep's own SHGREP_RERANK_PORT stage, so it sees the hunks shgrep sends, not whole functions
   Candidates are enclosing functions (LSP) or text hunks; a hunk overlapping the answer's lines counts as the answer.
   Top-three tokens are a comparison metric only. Tokens are estimated as characters / 4. Nothing in the repo is written.
 """
@@ -25,6 +27,7 @@ import time
 from lsp_smoke import Client
 
 SLOW = {"timeout_ms": 300000}
+EXTRA = {}  # extra search arguments for every ranked/unranked search, set from the command line
 SKIP = {"target", "node_modules", "libs", "third_party", "vendor", "build", "dist", "__pycache__"}
 STOP = set("""a an and are as at be by can for from has have if in into is it its of on or that the this to was
 when where which while with without not no will would should must may might each every one all any per than then
@@ -148,7 +151,7 @@ def lexical(client, keys, extensions, intent=None):
     """Candidates (functions via LSP, else text hunks) from one search. With an intent shgrep ranks the hunks and
     they come best first; without one the findings arrive in scan order and candidates sort by hit count."""
     arguments = {"operation": "text", "patterns": keys, "case_insensitive": True, "mode": "literal",
-                 "output": "json", "extensions": extensions, "index": False, **SLOW}
+                 "output": "json", "extensions": extensions, "index": False, **SLOW, **EXTRA}
     if intent:
         arguments["intent"] = intent
     reply = client.tool("search", arguments)
@@ -223,13 +226,20 @@ def main():
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--hard", action="store_true",
                         help="drop the question words that also appear in the answer's code; keep questions with 3+ words left")
+    parser.add_argument("--rerank-port", type=int, help="port of a running llama-server --reranking: adds a reranked arm")
+    parser.add_argument("--context-bytes", type=int,
+                        help="json context bytes around each match (default 80): the code a ranker and reranker see per hunk")
     args = parser.parse_args()
+    if args.context_bytes:
+        EXTRA["context_bytes"] = args.context_bytes
     repo = args.repo.resolve()
     asked = questions(repo, args.count, args.seed, args.hard)
     print(f"{len(asked)} questions from doc comments in {repo}")
     if not asked:
         return
     client = Client(args.executable.resolve(), repo, timeout=330)
+    rerank_client = Client(args.executable.resolve(), repo, timeout=330,
+                           environment={**os.environ, "SHGREP_RERANK_PORT": str(args.rerank_port)}) if args.rerank_port else None
     rows = []
     try:
         for q in asked:
@@ -239,6 +249,9 @@ def main():
             candidates, findings = lexical(client, keys, extensions, q["intent"])
             lexical_s = time.monotonic() - started
             unranked_candidates, _ = lexical(client, keys, extensions)
+            reranked_candidates = reranked_findings = None
+            if rerank_client:
+                reranked_candidates, reranked_findings = lexical(rerank_client, keys, extensions, q["intent"])
             # The comparison baseline uses the native CLI, never an MCP bypass.
             command = [str(args.executable.resolve()), "search", "--root", str(repo), "-F", "-i",
                        "--color", "never", "--timeout-ms", "300000"]
@@ -263,18 +276,26 @@ def main():
                    "search_hits": len(findings["results"]),
                    "unmapped_text_candidates": sum(c["kind"] == "text" for c in candidates),
                    "ranked_rank": rank_of(candidates, q), "unranked_rank": rank_of(unranked_candidates, q),
+                   "reranked_rank": rank_of(reranked_candidates, q) if reranked_candidates is not None else None,
                    "ranking": findings.get("ranking"),
+                   "rerank_report": reranked_findings.get("ranking") if reranked_findings else None,
                    "baseline_tokens": baseline, "mcp_tokens": tokens(json.dumps(findings, ensure_ascii=False)), "top3_tokens": answer_tokens, "lexical_s": round(lexical_s, 1)}
             rows.append(row)
             print(json.dumps(row), flush=True)
     finally:
         client.close()
+        if rerank_client:
+            rerank_client.close()
     n = len(rows)
     def share(key, k):
         return sum(1 for r in rows if r[key] and r[key] <= k) / n if n else 0
     print("\nsummary")
     print(f"  ranked   recall, top-1 / top-3     {share('ranked_rank', 10**9):.0%}, {share('ranked_rank', 1):.0%} / {share('ranked_rank', 3):.0%}")
     print(f"  unranked recall, top-1 / top-3     {share('unranked_rank', 10**9):.0%}, {share('unranked_rank', 1):.0%} / {share('unranked_rank', 3):.0%}")
+    if rerank_client:
+        print(f"  reranked recall, top-1 / top-3     {share('reranked_rank', 10**9):.0%}, {share('reranked_rank', 1):.0%} / {share('reranked_rank', 3):.0%}")
+        failed = sum(1 for r in rows if r['rerank_report'] and r['rerank_report'].get('rerank_error'))
+        print(f"  searches where the reranker failed {failed} of {n} (those fell back to keyword order)")
     print(f"  ranked search time per question    {sum(r['lexical_s'] for r in rows) / n:.1f} s")
     print(f"  tokens: MCP selected evidence    {sum(r['mcp_tokens'] for r in rows) // n} per question")
     print(f"  tokens: baseline grep+read        {sum(r['baseline_tokens'] for r in rows) // n} per question")

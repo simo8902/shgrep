@@ -6050,9 +6050,10 @@ Json run_unlocked(const std::string& name, const Json& arguments, const SearchCo
                 const Ranked& pick = ranked[position];
                 for (size_t i : pieces[pick.index].items) {
                     Json item = std::move(results[i]);
-                    std::get<Json::Object>(item.value).emplace("ranking", Json::Object{
-                        {"rank", static_cast<int64_t>(position + 1)},
-                        {"keyword_rank", static_cast<int64_t>(pick.keyword_rank + 1)}, {"score", pick.score}});
+                    Json::Object ranking{{"rank", static_cast<int64_t>(position + 1)},
+                                         {"keyword_rank", static_cast<int64_t>(pick.keyword_rank + 1)}, {"score", pick.score}};
+                    if (pick.reranked) ranking.emplace("rerank_score", pick.rerank_score);
+                    std::get<Json::Object>(item.value).emplace("ranking", std::move(ranking));
                     kept_results.push_back(std::move(item));
                 }
             }
@@ -6310,8 +6311,9 @@ Json tool_definitions() {
             "Navigate live code through LSP: symbols, definition/declaration/type_definition, implementation, references, or hover. "
             "Bodies are opt-in; no LSP output cap. Lua, XML, C/C++, Rust and Python work out of the box; .shgrep/lsp.json adds or overrides servers. "
             "A failing server is reported in a leading [LSP FAILURE ...] line, to relay to the user, followed by whole-word text matches. "
-            "operation=text takes an optional intent: with it, hunks are ranked by BM25 against the task and the best 10 return first "
-            "(at most 3 per file) with their original text; without it every finding returns in scan order. "
+            "operation=text takes an optional intent: with it, hunks are ranked by BM25 against the task (and re-ordered by a local "
+            "reranker when SHGREP_RERANK_PORT is set) and the best 10 return first (at most 3 per file) with their original text; "
+            "without it every finding returns in scan order. "
             "Grep filters apply, including XML and files without a language server."},
             {"inputSchema", schema(search_props)}},
         Json::Object{{"name", "search_bytes"}, {"description",

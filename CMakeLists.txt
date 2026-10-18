@@ -74,7 +74,7 @@ target_include_directories(shgrep PRIVATE "${SHGREP_HYPERSCAN_DIR}/src" "${CMAKE
 # ntdll provides NtCreateFile for opening entries relative to their parent directory handle; bcrypt provides the
 # SHA-256 that read_file reports and edit_file/write_file check with expected_sha256; advapi32 copies a replaced
 # file's permissions onto its replacement.
-target_link_libraries(shgrep PRIVATE hs ntdll bcrypt advapi32)
+target_link_libraries(shgrep PRIVATE hs ntdll bcrypt advapi32 winhttp)
 if(TARGET pcre2-8-static)
     target_link_libraries(shgrep PRIVATE pcre2-8-static)
     target_compile_definitions(shgrep PRIVATE SHGREP_PCRE2 PCRE2_CODE_UNIT_WIDTH=8)
