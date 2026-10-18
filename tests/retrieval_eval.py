@@ -1,14 +1,11 @@
-"""Measures intent -> function retrieval on a real repository: shgrep's keyword ranking against unranked results.
-Usage: python tests/retrieval_eval.py dist/shgrep.exe <repo> [--count 30] [--seed 1] [--hard] [--rerank-port 8081]
+"""Measures Laya-ranked intent -> function retrieval on a real repository, against the real llama-server.
+Usage: python tests/retrieval_eval.py dist/shgrep.exe <repo> [--count 30] [--seed 1] [--budget-ms 120000]
   Questions come from the repo's own doc comments (Rust ///, Python docstrings), with the function's own name
-  removed; the answer is that function. With --hard, question words that also appear in the answer's code are
-  dropped too (questions left with fewer than 3 words are skipped). For each question it measures:
+  removed; the answer is that function. For each question it measures:
     baseline  grep the intent's words (lines output) + read the answer's whole file: tokens an agent pays
-    unranked  the same search without an intent: findings in scan order, candidates sorted by hit count
-    ranked    the same search with the intent: BM25-ranked hunks (top 10, at most 3 per file), in returned order
-    reranked  with --rerank-port: the same, re-ordered by a reranker (llama-server --reranking --pooling rank) through
-              shgrep's own SHGREP_RERANK_PORT stage, so it sees the hunks shgrep sends, not whole functions
-  Candidates are enclosing functions (LSP) or text hunks; a hunk overlapping the answer's lines counts as the answer.
+    pipeline  shgrep's ranked hunks (BM25 pool, Laya re-rank) -> enclosing functions (LSP), in returned order
+  Start llama-server with the Laya GGUF first (SHGREP_LAYA_PORT, default 8080). The default budget lets a
+  CPU-only server score every candidate; pass --budget-ms 2000 to measure the interactive default.
   Top-three tokens are a comparison metric only. Tokens are estimated as characters / 4. Nothing in the repo is written.
 """
 import argparse
@@ -24,10 +21,10 @@ import sys
 import subprocess
 import time
 
+from laya_fixture import require_server
 from lsp_smoke import Client
 
 SLOW = {"timeout_ms": 300000}
-EXTRA = {}  # extra search arguments for every ranked/unranked search, set from the command line
 SKIP = {"target", "node_modules", "libs", "third_party", "vendor", "build", "dist", "__pycache__"}
 STOP = set("""a an and are as at be by can for from has have if in into is it its of on or that the this to was
 when where which while with without not no will would should must may might each every one all any per than then
@@ -147,24 +144,18 @@ def keywords(intent):
     return list(dict.fromkeys(words + joined))
 
 
-def lexical(client, keys, extensions, intent=None):
-    """Candidates (functions via LSP, else text hunks) from one search. With an intent shgrep ranks the hunks and
-    they come best first; without one the findings arrive in scan order and candidates sort by hit count."""
-    arguments = {"operation": "text", "patterns": keys, "case_insensitive": True, "mode": "literal",
-                 "output": "json", "extensions": extensions, "index": False, **SLOW, **EXTRA}
-    if intent:
-        arguments["intent"] = intent
-    reply = client.tool("search", arguments)
+def lexical(client, keys, extensions, intent="Inspect all matching source"):
+    reply = client.tool("search", {"operation": "text", "patterns": keys, "case_insensitive": True, "mode": "literal",
+                                   "output": "json", "extensions": extensions, "index": False, "intent": intent, **SLOW})
     summary = reply["summary"]
     if summary["status"] != "complete" or summary.get("truncated"):
         raise RuntimeError(f"Incomplete search; refusing to report full-retrieval metrics: {summary}")
     by_file = {}
-    best = {}  # (path, line) -> rank of the hunk that returned it; ranked results arrive best first
+    best = {}  # (path, line) -> Laya rank of the group that returned it; results arrive best first
     for item in reply["results"]:
         path = item["path"].replace("\\", "/")
         by_file.setdefault(path, []).append(item["line"])
-        if intent:
-            best.setdefault((path, item["line"]), item["ranking"]["rank"])
+        best.setdefault((path, item["line"]), item["laya"]["rank"])
     candidates = []
     for path in sorted(by_file, key=lambda p: (-len(by_file[p]), p)):
         hit_lines = sorted(by_file[path])
@@ -197,12 +188,9 @@ def lexical(client, keys, extensions, intent=None):
                 pending = {"path": path, "name": "", "name_path": None,
                            "first": line, "last": line, "hits": hits, "kind": "text"}
                 candidates.append(pending)
-    if intent:
-        for c in candidates:
-            c["rank"] = min(r for (p, line), r in best.items() if p == c["path"] and c["first"] <= line <= c["last"])
-        candidates.sort(key=lambda c: (c["rank"], -c["hits"]))
-    else:
-        candidates.sort(key=lambda c: (-c["hits"], c["last"] - c["first"]))
+    for c in candidates:
+        c["rank"] = min(r for (p, line), r in best.items() if p == c["path"] and c["first"] <= line <= c["last"])
+    candidates.sort(key=lambda c: (c["rank"], -c["hits"]))
     return candidates, reply
 
 
@@ -224,22 +212,26 @@ def main():
     parser.add_argument("repo", type=Path)
     parser.add_argument("--count", type=int, default=30)
     parser.add_argument("--seed", type=int, default=1)
+    parser.add_argument("--budget-ms", type=int, default=120000, help="SHGREP_LAYA_BUDGET_MS for the Laya run")
     parser.add_argument("--hard", action="store_true",
                         help="drop the question words that also appear in the answer's code; keep questions with 3+ words left")
-    parser.add_argument("--rerank-port", type=int, help="port of a running llama-server --reranking: adds a reranked arm")
-    parser.add_argument("--context-bytes", type=int,
-                        help="json context bytes around each match (default 80): the code a ranker and reranker see per hunk")
     args = parser.parse_args()
-    if args.context_bytes:
-        EXTRA["context_bytes"] = args.context_bytes
+    require_server()
     repo = args.repo.resolve()
     asked = questions(repo, args.count, args.seed, args.hard)
     print(f"{len(asked)} questions from doc comments in {repo}")
     if not asked:
         return
-    client = Client(args.executable.resolve(), repo, timeout=330)
-    rerank_client = Client(args.executable.resolve(), repo, timeout=330,
-                           environment={**os.environ, "SHGREP_RERANK_PORT": str(args.rerank_port)}) if args.rerank_port else None
+    client = Client(args.executable.resolve(), repo, timeout=330, regression_laya=False,
+                    environment={**os.environ, "SHGREP_LAYA_BUDGET_MS": str(args.budget_ms)})
+    # Same pool and limits with a zero budget: keyword order only, so the rows show what Laya adds.
+    keyword_client = Client(args.executable.resolve(), repo, timeout=330, regression_laya=False,
+                            environment={**os.environ, "SHGREP_LAYA_BUDGET_MS": "0"})
+    # Laya arms differ only in the fusion weight of Laya's rank (percent); the P filter is off in all of them.
+    arms = {w: Client(args.executable.resolve(), repo, timeout=330, regression_laya=False,
+                      environment={**os.environ, "SHGREP_LAYA_BUDGET_MS": str(args.budget_ms),
+                                   "SHGREP_LAYA_FILTER": "0", "SHGREP_LAYA_WEIGHT": str(w)})
+            for w in (100, 50, 25)}
     rows = []
     try:
         for q in asked:
@@ -248,10 +240,8 @@ def main():
             started = time.monotonic()
             candidates, findings = lexical(client, keys, extensions, q["intent"])
             lexical_s = time.monotonic() - started
-            unranked_candidates, _ = lexical(client, keys, extensions)
-            reranked_candidates = reranked_findings = None
-            if rerank_client:
-                reranked_candidates, reranked_findings = lexical(rerank_client, keys, extensions, q["intent"])
+            keyword_candidates, _ = lexical(keyword_client, keys, extensions, q["intent"])
+            weighted = {w: lexical(c, keys, extensions, q["intent"])[0] for w, c in arms.items()}
             # The comparison baseline uses the native CLI, never an MCP bypass.
             command = [str(args.executable.resolve()), "search", "--root", str(repo), "-F", "-i",
                        "--color", "never", "--timeout-ms", "300000"]
@@ -275,28 +265,28 @@ def main():
                    "matched_files": len({item["path"] for item in findings["results"]}),
                    "search_hits": len(findings["results"]),
                    "unmapped_text_candidates": sum(c["kind"] == "text" for c in candidates),
-                   "ranked_rank": rank_of(candidates, q), "unranked_rank": rank_of(unranked_candidates, q),
-                   "reranked_rank": rank_of(reranked_candidates, q) if reranked_candidates is not None else None,
-                   "ranking": findings.get("ranking"),
-                   "rerank_report": reranked_findings.get("ranking") if reranked_findings else None,
+                   "pipeline_rank": rank_of(candidates, q), "keyword_rank": rank_of(keyword_candidates, q),
+                   **{f"w{w}_rank": rank_of(found, q) for w, found in weighted.items()},
+                   "laya": findings.get("laya"),
                    "baseline_tokens": baseline, "mcp_tokens": tokens(json.dumps(findings, ensure_ascii=False)), "top3_tokens": answer_tokens, "lexical_s": round(lexical_s, 1)}
             rows.append(row)
             print(json.dumps(row), flush=True)
     finally:
         client.close()
-        if rerank_client:
-            rerank_client.close()
+        keyword_client.close()
+        for c in arms.values():
+            c.close()
     n = len(rows)
     def share(key, k):
         return sum(1 for r in rows if r[key] and r[key] <= k) / n if n else 0
     print("\nsummary")
-    print(f"  ranked   recall, top-1 / top-3     {share('ranked_rank', 10**9):.0%}, {share('ranked_rank', 1):.0%} / {share('ranked_rank', 3):.0%}")
-    print(f"  unranked recall, top-1 / top-3     {share('unranked_rank', 10**9):.0%}, {share('unranked_rank', 1):.0%} / {share('unranked_rank', 3):.0%}")
-    if rerank_client:
-        print(f"  reranked recall, top-1 / top-3     {share('reranked_rank', 10**9):.0%}, {share('reranked_rank', 1):.0%} / {share('reranked_rank', 3):.0%}")
-        failed = sum(1 for r in rows if r['rerank_report'] and r['rerank_report'].get('rerank_error'))
-        print(f"  searches where the reranker failed {failed} of {n} (those fell back to keyword order)")
-    print(f"  ranked search time per question    {sum(r['lexical_s'] for r in rows) / n:.1f} s")
+    print(f"  answer among returned (recall)     {share('pipeline_rank', 10**9):.0%}  keywords only {share('keyword_rank', 10**9):.0%}")
+    print(f"  Laya top-1 / top-3                 {share('pipeline_rank', 1):.0%} / {share('pipeline_rank', 3):.0%}")
+    for w in arms:
+        key = f"w{w}_rank"
+        print(f"  Laya weight {w:>3}%: recall {share(key, 10**9):.0%}, top-1 / top-3 {share(key, 1):.0%} / {share(key, 3):.0%}")
+    print(f"  keywords top-1 / top-3             {share('keyword_rank', 1):.0%} / {share('keyword_rank', 3):.0%}")
+    print(f"  Laya search time per question      {sum(r['lexical_s'] for r in rows) / n:.1f} s")
     print(f"  tokens: MCP selected evidence    {sum(r['mcp_tokens'] for r in rows) // n} per question")
     print(f"  tokens: baseline grep+read        {sum(r['baseline_tokens'] for r in rows) // n} per question")
     print(f"  tokens: top-3 bodies (metric only) {sum(r['top3_tokens'] for r in rows) // n} per question")

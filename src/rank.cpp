@@ -1,10 +1,7 @@
 #include "rank.hpp"
 #include <windows.h>
-#include <winhttp.h>
 #include <algorithm>
-#include <chrono>
 #include <cmath>
-#include <limits>
 #include <numeric>
 #include <stdexcept>
 #include <unordered_map>
@@ -32,64 +29,6 @@ uint32_t setting_number(const wchar_t* name, uint32_t fallback, uint32_t high) {
         if (result > high) throw bad();
     }
     return static_cast<uint32_t>(result);
-}
-
-struct WinHttpHandle {
-    HINTERNET value;
-    ~WinHttpHandle() { if (value) WinHttpCloseHandle(value); }
-};
-
-// One blocking JSON POST to a loopback llama-server. Throws std::runtime_error on any transport or HTTP failure.
-// SAFETY: loopback only (127.0.0.1), no proxy, no redirects, no credentials or cookies.
-std::string post_json(uint32_t port, const wchar_t* path, const std::string& body, int timeout_ms, int& status_out) {
-    WinHttpHandle session{WinHttpOpen(L"shgrep-rank/1", WINHTTP_ACCESS_TYPE_NO_PROXY, WINHTTP_NO_PROXY_NAME,
-                                      WINHTTP_NO_PROXY_BYPASS, 0)};
-    if (!session.value) throw std::runtime_error("cannot initialize WinHTTP");
-    WinHttpSetTimeouts(session.value, 2000, 2000, timeout_ms, timeout_ms);
-    WinHttpHandle connection{WinHttpConnect(session.value, L"127.0.0.1", static_cast<INTERNET_PORT>(port), 0)};
-    if (!connection.value) throw std::runtime_error("cannot connect to the reranker");
-    WinHttpHandle request{WinHttpOpenRequest(connection.value, L"POST", path, nullptr, WINHTTP_NO_REFERER,
-                                             WINHTTP_DEFAULT_ACCEPT_TYPES, 0)};
-    if (!request.value) throw std::runtime_error("cannot create the reranker request");
-    DWORD redirects = WINHTTP_OPTION_REDIRECT_POLICY_NEVER;
-    DWORD disabled = WINHTTP_DISABLE_COOKIES | WINHTTP_DISABLE_AUTHENTICATION;
-    WinHttpSetOption(request.value, WINHTTP_OPTION_REDIRECT_POLICY, &redirects, sizeof(redirects));
-    WinHttpSetOption(request.value, WINHTTP_OPTION_DISABLE_FEATURE, &disabled, sizeof(disabled));
-    static const wchar_t headers[] = L"Content-Type: application/json\r\nConnection: close\r\n";
-    const auto size = static_cast<DWORD>(body.size());
-    if (!WinHttpSendRequest(request.value, headers, static_cast<DWORD>(-1), const_cast<char*>(body.data()), size, size, 0) ||
-        !WinHttpReceiveResponse(request.value, nullptr))
-        throw std::runtime_error("reranker unreachable or timed out (WinHTTP error " + std::to_string(GetLastError()) + ")");
-    DWORD status = 0, status_size = sizeof(status);
-    if (!WinHttpQueryHeaders(request.value, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
-                             WINHTTP_HEADER_NAME_BY_INDEX, &status, &status_size, WINHTTP_NO_HEADER_INDEX))
-        throw std::runtime_error("cannot read the reranker's HTTP status");
-    status_out = static_cast<int>(status);
-    std::string response;
-    char buffer[16384];
-    for (;;) {
-        DWORD got = 0;
-        if (!WinHttpReadData(request.value, buffer, sizeof(buffer), &got))
-            throw std::runtime_error("reranker response failed (WinHTTP error " + std::to_string(GetLastError()) + ")");
-        if (!got) break;
-        if (response.size() + got > (4u << 20)) throw std::runtime_error("reranker response exceeds 4 MiB");
-        response.append(buffer, got);
-    }
-    return response;
-}
-
-// Document text for the reranker: where the hunk is, then its code cut to max_bytes at a character boundary.
-std::string rerank_document(const RankCandidate& candidate, size_t max_bytes) {
-    std::string text = "file: ";
-    text.append(candidate.path);
-    if (candidate.first_line)
-        text += " (lines " + std::to_string(candidate.first_line) + "-" +
-                std::to_string(std::max(candidate.first_line, candidate.last_line)) + ")";
-    text += '\n';
-    size_t cut = std::min(candidate.code.size(), max_bytes);
-    while (cut > 0 && cut < candidate.code.size() && (static_cast<unsigned char>(candidate.code[cut]) & 0xc0) == 0x80) --cut;
-    text.append(candidate.code.substr(0, cut));
-    return text;
 }
 
 // Lowercase terms; identifiers split at snake_case and camelCase boundaries ("HTTPServer" -> http, server).
@@ -168,60 +107,10 @@ std::vector<double> bm25(const std::string& intent, const std::vector<RankCandid
 }
 }
 
-uint32_t rank_scan_limit() {
-    const uint32_t limit = setting_number(L"SHGREP_RANK_SCAN_LIMIT", 50000, 100000000);
-    return limit ? limit : UINT32_MAX;
-}
-
 Ranker::Ranker(std::string intent) : intent_(std::move(intent)) {
     if (intent_.size() > 4096) throw std::runtime_error("intent is at most 4096 UTF-8 bytes");
     return_limit_ = setting_number(L"SHGREP_RANK_RETURN", 10, 100000);
     per_file_ = setting_number(L"SHGREP_RANK_PER_FILE", 3, 100000);
-    rerank_port_ = setting_number(L"SHGREP_RERANK_PORT", 0, 65535);  // 0 = no reranker
-    rerank_pool_ = setting_number(L"SHGREP_RERANK_POOL", 24, 100000);
-    rerank_budget_ms_ = std::max<uint32_t>(setting_number(L"SHGREP_RERANK_BUDGET_MS", 3000, 300000), 1);
-}
-
-// Scores the ranked candidates in one request and reorders them by the reranker's relevance, best first.
-void Ranker::rerank(const std::vector<RankCandidate>& candidates, std::vector<Ranked>& ranked) {
-    constexpr size_t document_bytes = 2000;
-    Json::Array documents;
-    documents.reserve(ranked.size());
-    for (const auto& item : ranked) documents.emplace_back(rerank_document(candidates[item.index], document_bytes));
-    const std::string body = Json(Json::Object{{"model", "reranker"}, {"query", intent_}, {"documents", std::move(documents)}}).dump();
-    int status = 0;
-    std::string response = post_json(rerank_port_, L"/v1/rerank", body, static_cast<int>(rerank_budget_ms_), status);
-    if (status == 404) response = post_json(rerank_port_, L"/rerank", body, static_cast<int>(rerank_budget_ms_), status);
-    if (status != 200) throw std::runtime_error("reranker answered HTTP " + std::to_string(status));
-    Json parsed;
-    try { parsed = Json::parse(response); }
-    catch (const std::exception&) { throw std::runtime_error("reranker returned invalid JSON"); }
-    const Json* results = std::holds_alternative<Json::Object>(parsed.value) ? parsed.get("results") : nullptr;
-    if (!results || !std::holds_alternative<Json::Array>(results->value))
-        throw std::runtime_error("reranker answer has no results; start llama-server with --reranking --pooling rank");
-    std::vector<double> relevance(ranked.size(), std::numeric_limits<double>::quiet_NaN());
-    for (const Json& entry : results->array()) {
-        const Json* index = std::holds_alternative<Json::Object>(entry.value) ? entry.get("index") : nullptr;
-        const Json* score = std::holds_alternative<Json::Object>(entry.value) ? entry.get("relevance_score") : nullptr;
-        if (!index || !score || !std::holds_alternative<int64_t>(index->value))
-            throw std::runtime_error("reranker result is malformed");
-        double value = 0;
-        if (const auto* real = std::get_if<double>(&score->value)) value = *real;
-        else if (const auto* whole = std::get_if<int64_t>(&score->value)) value = static_cast<double>(*whole);
-        else throw std::runtime_error("reranker result is malformed");
-        const int64_t at = index->integer();
-        if (at < 0 || static_cast<size_t>(at) >= relevance.size() || !std::isfinite(value))
-            throw std::runtime_error("reranker result is out of range");
-        relevance[static_cast<size_t>(at)] = value;
-    }
-    for (double value : relevance)
-        if (std::isnan(value)) throw std::runtime_error("reranker did not score every candidate");
-    for (size_t i = 0; i < ranked.size(); ++i) {
-        ranked[i].reranked = true;
-        ranked[i].rerank_score = relevance[i];
-    }
-    std::stable_sort(ranked.begin(), ranked.end(), [](const Ranked& a, const Ranked& b) { return a.rerank_score > b.rerank_score; });
-    reranked_ = ranked.size();
 }
 
 std::vector<Ranked> Ranker::rank(const std::vector<RankCandidate>& candidates) {
@@ -229,49 +118,22 @@ std::vector<Ranked> Ranker::rank(const std::vector<RankCandidate>& candidates) {
     std::vector<size_t> order(candidates.size());
     std::iota(order.begin(), order.end(), size_t{0});
     std::stable_sort(order.begin(), order.end(), [&](size_t a, size_t b) { return scores[a] > scores[b]; });
-    // With a reranker the keyword stage keeps a wider pool for it to reorder; without one it keeps what is returned.
-    const bool use_reranker = rerank_port_ != 0;
-    const size_t keep = use_reranker ? rerank_pool_ : return_limit_;
     std::vector<Ranked> ranked;
     std::unordered_map<std::string_view, size_t> per_file;
     for (size_t position = 0; position < order.size(); ++position) {
         const size_t index = order[position];
         if (per_file_ && ++per_file[candidates[index].path] > per_file_) continue;
         ranked.push_back({index, position, scores[index]});
-        if (keep && ranked.size() == keep) break;
+        if (return_limit_ && ranked.size() == return_limit_) break;
     }
-    mode_ = "keyword";
-    rerank_error_.clear();
-    reranked_ = rerank_ms_ = 0;
-    if (use_reranker && ranked.size() > 1) {
-        const auto started = std::chrono::steady_clock::now();
-        const std::vector<Ranked> keyword_order = ranked;
-        try {
-            rerank(candidates, ranked);
-            mode_ = "rerank";
-        } catch (const std::exception& error) {
-            ranked = keyword_order;  // never fail a search because the optional reranker failed
-            rerank_error_ = error.what();
-        }
-        rerank_ms_ = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::steady_clock::now() - started).count());
-    }
-    if (return_limit_ && ranked.size() > return_limit_) ranked.resize(return_limit_);
     candidates_ = candidates.size();
     returned_ = ranked.size();
     return ranked;
 }
 
 Json Ranker::report() const {
-    Json::Object report{{"mode", mode_}, {"candidates", candidates_}, {"returned", returned_},
+    return Json::Object{{"mode", "keyword"}, {"candidates", candidates_}, {"returned", returned_},
                         {"return_limit", static_cast<int64_t>(return_limit_)},
                         {"per_file_cap", static_cast<int64_t>(per_file_)}, {"ranking", "bm25(k1=1.2,b=0.75)"}};
-    if (rerank_port_) {
-        report.emplace("rerank_port", static_cast<int64_t>(rerank_port_));
-        report.emplace("rerank_scored", reranked_);
-        report.emplace("rerank_ms", rerank_ms_);
-        if (!rerank_error_.empty()) report.emplace("rerank_error", rerank_error_);
-    }
-    return report;
 }
 }
