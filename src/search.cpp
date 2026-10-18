@@ -3,11 +3,14 @@
 #include "dfa.hpp"
 #include "files.hpp"
 #include "lsp.hpp"
+#include "rank.hpp"
 #include "ignore.hpp"
 #include "teddy.hpp"
 #include "winfs.hpp"
+#include "path_match.hpp"
 
 #include <windows.h>
+#include <bcrypt.h>
 #include <winternl.h>
 #include <intrin.h>
 #include <hs.h>
@@ -16,6 +19,7 @@
 #endif
 
 #include <algorithm>
+#include <atomic>
 #include <array>
 #include <chrono>
 #include <cctype>
@@ -115,6 +119,7 @@ std::vector<std::string> strings(const Json& obj, const char* key, size_t max_co
     return out;
 }
 bool glob_match(const std::string& pattern, const std::string& value) {
+    if (path_has_unicode(pattern) || path_has_unicode(value)) return path_glob_unicode(pattern, value);
     size_t p = 0, v = 0, star = std::string::npos, retry = 0;
     while (v < value.size()) {
         auto fold = [](char c) { return static_cast<unsigned char>(std::tolower(static_cast<unsigned char>(c))); };
@@ -132,6 +137,7 @@ bool any_glob(const std::vector<std::string>& globs, const std::string& rel, con
 }
 char fold_ascii(char c) { return c >= 'A' && c <= 'Z' ? static_cast<char>(c - 'A' + 'a') : c; }
 bool equals_folded(std::string_view a, std::string_view b) {
+    if (path_has_unicode(a) || path_has_unicode(b)) return path_equal_unicode(a, b);
     return a.size() == b.size() &&
            std::equal(a.begin(), a.end(), b.begin(), [](char x, char y) { return fold_ascii(x) == fold_ascii(y); });
 }
@@ -142,23 +148,29 @@ struct Request {
     bool use_index = false;  // search only: consult the snapshot index built by `shgrep index`
     bool block = false;      // lines output: show each match inside its enclosing function or class
     bool color = false;      // CLI terminal only: ANSI-colored paths, line numbers and matches
-    uint32_t max_block_lines = 200;
+    uint32_t max_block_lines = UINT32_MAX;
     // output: "lines" (path:line:text), "files" (paths with a match), "files_without_match", "count" (path:N),
     // or "json".
     std::string mode = "regex", output = "lines", exact_name, substring, name_glob, path_filter;
+    // Every pattern provably matches inside one line, so files over whole_text_bytes may be scanned in chunks.
+    bool line_local = false;
+    // Text search `path`: root-relative file or folder ('/' separators) the walk is limited to; empty means all.
+    std::string scope;
+    bool scope_file = false;
     std::vector<std::string> patterns, includes, excludes, extensions, type_globs;
     std::vector<fs::path> roots;
     uint32_t max_results = UINT32_MAX, max_per_file = UINT32_MAX, timeout_ms = 30000;
     size_t max_output = SIZE_MAX;
     uint32_t context_before = 80, context_after = 80;
     uint32_t before_lines = 0, after_lines = 0;
-    uint32_t max_line_bytes = 400;  // lines output: optional window around the match; 0 shows whole lines
-    uint64_t max_file_bytes = 67108864;
+    uint32_t max_line_bytes = 0;  // lines output: optional window around the match; 0 shows whole lines
+    uint64_t max_file_bytes = 268435456;
     Backend backend = Backend::automatic;
     // Set by run_tool, not parsed: directories, in walk path form, that are never entered (the pattern cache).
     std::vector<std::wstring> excluded_directories;
 };
 bool contains_folded(std::string_view hay, std::string_view needle) {
+    if (path_has_unicode(hay) || path_has_unicode(needle)) return path_contains_unicode(hay, needle);
     if (needle.empty()) return true;
     return std::search(hay.begin(), hay.end(), needle.begin(), needle.end(),
                        [](char x, char y) { return fold_ascii(x) == fold_ascii(y); }) != hay.end();
@@ -260,6 +272,58 @@ void reject_unknown_arguments(const std::string& tool, const Json& args) {
     }
 }
 
+// CONTRACT: true only when a match of pattern can neither contain a line break nor look past its own line or at the
+//   file's start or end, so scanning line-aligned chunks finds exactly what a whole-file scan finds. Conservative:
+//   lookaround, backreferences, \A \z \G, newline-capable escapes and classes, (?s) and \Q all say no.
+bool line_local(std::string_view pattern, bool regex) {
+    if (pattern.find_first_of("\r\n") != std::string_view::npos) return false;
+    if (!regex) return true;
+    static constexpr std::string_view safe_letters = "wdbBtfae";
+    for (size_t i = 0; i < pattern.size(); ++i) {
+        const char c = pattern[i];
+        if (c == '\\') {
+            if (++i >= pattern.size()) return false;
+            const unsigned char e = static_cast<unsigned char>(pattern[i]);
+            if (std::isalnum(e) && safe_letters.find(static_cast<char>(e)) == std::string_view::npos) return false;
+        } else if (c == '[') {
+            size_t j = i + 1;
+            if (j < pattern.size() && pattern[j] == '^') return false;  // a negated class matches line breaks
+            if (j < pattern.size() && pattern[j] == ']') ++j;
+            int previous = -1;
+            for (; j < pattern.size() && pattern[j] != ']'; ++j) {
+                if (pattern[j] == '\\') {
+                    if (++j >= pattern.size()) return false;
+                    const unsigned char e = static_cast<unsigned char>(pattern[j]);
+                    if (std::isalnum(e) && safe_letters.find(static_cast<char>(e)) == std::string_view::npos) return false;
+                    previous = -2;  // an escaped range start (\t, \f, ...) has a value this check does not track
+                    continue;
+                }
+                if (pattern[j] == '[' && j + 1 < pattern.size() && pattern[j + 1] == ':') return false;  // POSIX classes
+                if (pattern[j] == '-' && previous == -2 && j + 1 < pattern.size() && pattern[j + 1] != ']') return false;
+                if (pattern[j] == '-' && previous >= 0 && j + 1 < pattern.size() && pattern[j + 1] != ']') {
+                    const int high = static_cast<unsigned char>(pattern[j + 1]);
+                    if (pattern[j + 1] == '\\' || (previous <= '\r' && high >= '\n')) return false;
+                    previous = -1;
+                    ++j;
+                    continue;
+                }
+                previous = static_cast<unsigned char>(pattern[j]);
+            }
+            if (j >= pattern.size()) return false;
+            i = j;
+        } else if (c == '(' && i + 1 < pattern.size() && pattern[i + 1] == '?') {
+            const std::string_view rest = pattern.substr(i + 2);
+            if (rest.starts_with("=") || rest.starts_with("!") || rest.starts_with("<=") || rest.starts_with("<!")) return false;
+            for (size_t k = 0; k < rest.size() && std::isalpha(static_cast<unsigned char>(rest[k])) ; ++k)
+                if (rest[k] == 's') return false;  // (?s): '.' would cross line breaks
+            if (rest.starts_with("-")) {
+                for (size_t k = 1; k < rest.size() && rest[k] != ')' && rest[k] != ':'; ++k) if (rest[k] == 's') return false;
+            }
+        }
+    }
+    return true;
+}
+
 Request parse_request(const std::string& tool, const Json& args, const SearchContext& context) {
     args.object();
     reject_unknown_arguments(tool, args);
@@ -305,7 +369,7 @@ Request parse_request(const std::string& tool, const Json& args, const SearchCon
     }
     if (r.word && r.binary) throw std::runtime_error("word is supported by search only");
     r.block = !r.binary && !r.file_only && boolean(args, "block", false);
-    r.max_block_lines = bounded(args, "max_block_lines", 200, 1, 100000);
+    r.max_block_lines = bounded(args, "max_block_lines", UINT32_MAX, 1, 100000);
     if (r.block && (r.output != "lines" || r.invert)) throw std::runtime_error("block works with lines output, without invert");
     uint32_t context_lines = bounded(args, "context_lines", 0, 0, 100);
     r.before_lines = bounded(args, "before_lines", context_lines, 0, 100);
@@ -316,7 +380,7 @@ Request parse_request(const std::string& tool, const Json& args, const SearchCon
     r.line = boolean(args, "line_numbers", !r.binary && !r.file_only);
     r.no_ignore = boolean(args, "no_ignore", false);
     r.hidden = boolean(args, "hidden", false);
-    r.max_file_bytes = bounded(args, "max_file_bytes", 67108864, 1, 268435456);
+    r.max_file_bytes = bounded(args, "max_file_bytes", 268435456, 1, 536870912);
     r.max_results = bounded(args, "max_results", UINT32_MAX, 1, 10000);
     r.max_per_file = bounded(args, "max_matches_per_file", UINT32_MAX, 1, 10000);
     r.max_output = args.get("max_output_bytes") ? bounded(args, "max_output_bytes", 65536, 512, 1048576) : SIZE_MAX;
@@ -366,9 +430,30 @@ Request parse_request(const std::string& tool, const Json& args, const SearchCon
             }
         }
     }
+    r.line_local = !r.file_only && !r.binary && !r.multiline && !r.invert && !r.block &&
+                   std::all_of(r.patterns.begin(), r.patterns.end(), [&](const std::string& p) { return line_local(p, r.mode == "regex"); });
     auto requested = strings(args, "roots", 64, 32768);
     if (requested.empty()) r.roots = context.allowed_roots;
     else for (const auto& s : requested) r.roots.push_back(native_path(s));
+    // CONTRACT: path limits a text search to one file or folder below a configured root. Output paths stay
+    //   relative to that root, and the named file or folder is searched even when hidden or .gitignore'd, as with
+    //   rg <path>; what lies inside a named folder follows the usual rules.
+    if (!r.file_only && !r.binary && args.get("path")) {
+        if (!requested.empty()) throw std::runtime_error("give path or roots, not both");
+        bool directory = false;
+        const SourceText target = source_descriptor(context, text(args, "path"), &directory);
+        const std::wstring root = target.root.wstring(), full = target.path.wstring();
+        if (full.size() < root.size() || CompareStringOrdinal(full.data(), static_cast<int>(root.size()), root.data(),
+                                                              static_cast<int>(root.size()), TRUE) != CSTR_EQUAL)
+            throw std::runtime_error("path is outside the configured roots");
+        std::wstring relative = full.substr(root.size());
+        while (!relative.empty() && (relative.front() == L'\\' || relative.front() == L'/')) relative.erase(0, 1);
+        std::replace(relative.begin(), relative.end(), L'\\', L'/');
+        if (!try_utf8(relative, r.scope)) throw std::runtime_error("path is not valid Unicode");
+        r.scope_file = !directory && !r.scope.empty();
+        r.roots = {target.root};
+        r.use_index = false;  // index candidates would bypass the scope; a scoped walk is small anyway
+    }
     if (r.roots.empty()) throw std::runtime_error("no roots configured");
     return r;
 }
@@ -494,7 +579,12 @@ CompileSpec compile_spec(const Request& r) {
     // go through the escaped-regex path instead.
     const bool leading_nul = std::any_of(r.patterns.begin(), r.patterns.end(),
                                          [](const std::string& p) { return !p.empty() && p.front() == '\0'; });
-    spec.literal_api = !spec.regex && !leading_nul && (r.binary || !r.insensitive || ascii);
+    // COMPAT: two ASCII letters fold to non-ASCII ones under Unicode simple case folding (k to U+212A KELVIN SIGN, s
+    // to U+017F LONG S), so caseless literals containing them also take the UTF-8 regex compiler.
+    const bool ascii_folds_suffice = ascii && std::none_of(r.patterns.begin(), r.patterns.end(), [](const std::string& p) {
+        return p.find_first_of("kKsS") != std::string::npos;
+    });
+    spec.literal_api = !spec.regex && !leading_nul && (r.binary || !r.insensitive || ascii_folds_suffice);
     // PERF: start-of-match tracking costs scan speed and stream state (performance.rst). json needs exact starts;
     // whole-word checks and multiline spans need them unless the literal length gives the start.
     spec.som = r.output == "json" || ((r.word || r.multiline) && !spec.literal_api);
@@ -536,7 +626,7 @@ unsigned env_workers() {
 // workspace. Walks never enter the workspace's .shgrep directory. SHGREP_DB_CACHE=0 disables the cache.
 constexpr size_t db_cache_files = 64;
 constexpr auto db_cache_min_compile = std::chrono::milliseconds(5);
-constexpr char db_cache_magic[8] = {'S', 'H', 'G', 'D', 'B', '0', '0', '1'};
+constexpr char db_cache_magic[8] = {'S', 'H', 'G', 'D', 'B', '0', '0', '2'};
 constexpr wchar_t cache_directory_name[] = L".shgrep";
 
 struct DbCache {
@@ -544,15 +634,85 @@ struct DbCache {
     bool writable = false;
 };
 
+// SAFETY: cache files live in the workspace, which anyone able to edit the workspace can write. Each file carries an
+//   HMAC-SHA256 under a per-user secret kept outside it (%LOCALAPPDATA%\\shgrep\\db-cache.key); a file whose MAC does
+//   not verify is ignored, so a planted database can never stand in for a query. Without the secret the cache is off.
+using CacheMac = std::array<unsigned char, 32>;
+const std::optional<CacheMac>& cache_secret() {
+    static const std::optional<CacheMac> secret = []() -> std::optional<CacheMac> {
+        wchar_t base[MAX_PATH];
+        const DWORD n = GetEnvironmentVariableW(L"LOCALAPPDATA", base, MAX_PATH);
+        if (!n || n >= MAX_PATH) return std::nullopt;
+        const std::wstring folder = std::wstring(base, n) + L"\\shgrep";
+        CreateDirectoryW(folder.c_str(), nullptr);
+        const std::wstring path = folder + L"\\db-cache.key";
+        for (int attempt = 0; attempt < 2; ++attempt) {
+            CacheMac key{};
+            Handle existing(CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr));
+            if (existing) {
+                DWORD got = 0;
+                if (ReadFile(existing.h, key.data(), static_cast<DWORD>(key.size()), &got, nullptr) && got == key.size()) return key;
+                return std::nullopt;
+            }
+            if (!BCRYPT_SUCCESS(BCryptGenRandom(nullptr, key.data(), static_cast<ULONG>(key.size()), BCRYPT_USE_SYSTEM_PREFERRED_RNG)))
+                return std::nullopt;
+            Handle created(CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr));
+            if (created) {
+                DWORD put = 0;
+                if (WriteFile(created.h, key.data(), static_cast<DWORD>(key.size()), &put, nullptr) && put == key.size() &&
+                    FlushFileBuffers(created.h)) return key;
+                return std::nullopt;
+            }
+            // Another process created the key meanwhile; the next pass reads it.
+        }
+        return std::nullopt;
+    }();
+    return secret;
+}
+std::optional<CacheMac> cache_mac(std::string_view header, std::string_view body) {
+    const auto& secret = cache_secret();
+    static const BCRYPT_ALG_HANDLE algorithm = [] {
+        BCRYPT_ALG_HANDLE handle = nullptr;
+        return BCRYPT_SUCCESS(BCryptOpenAlgorithmProvider(&handle, BCRYPT_SHA256_ALGORITHM, nullptr, BCRYPT_ALG_HANDLE_HMAC_FLAG))
+            ? handle : nullptr;
+    }();
+    if (!secret || !algorithm) return std::nullopt;
+    BCRYPT_HASH_HANDLE hash = nullptr;
+    if (!BCRYPT_SUCCESS(BCryptCreateHash(algorithm, &hash, nullptr, 0, const_cast<PUCHAR>(secret->data()),
+                                         static_cast<ULONG>(secret->size()), 0))) return std::nullopt;
+    CacheMac mac{};
+    const bool ok =
+        BCRYPT_SUCCESS(BCryptHashData(hash, reinterpret_cast<PUCHAR>(const_cast<char*>(header.data())), static_cast<ULONG>(header.size()), 0)) &&
+        BCRYPT_SUCCESS(BCryptHashData(hash, reinterpret_cast<PUCHAR>(const_cast<char*>(body.data())), static_cast<ULONG>(body.size()), 0)) &&
+        BCRYPT_SUCCESS(BCryptFinishHash(hash, mac.data(), static_cast<ULONG>(mac.size()), 0));
+    BCryptDestroyHash(hash);
+    if (!ok) return std::nullopt;
+    return mac;
+}
+
+// SAFETY: the cache must stay below the workspace. A link or junction at .shgrep or db-cache would send cache writes
+//   and retention deletes elsewhere, so the cache is off then; it is checked again right before writing or deleting.
+bool cache_dir_is_plain(const std::wstring& dir) {
+    const std::wstring parent = dir.substr(0, dir.rfind(L'\\'));
+    for (const std::wstring* path : {&parent, &dir}) {
+        const DWORD attributes = GetFileAttributesW(path->c_str());
+        if (attributes == INVALID_FILE_ATTRIBUTES) continue;  // not created yet; created below as a plain folder
+        if ((attributes & FILE_ATTRIBUTE_REPARSE_POINT) || !(attributes & FILE_ATTRIBUTE_DIRECTORY)) return false;
+    }
+    return true;
+}
+
 // Resolved only when the in-memory database cache misses, so cached queries pay no extra open.
 DbCache db_cache_for(const SearchContext& context) {
-    if (env_off(L"SHGREP_DB_CACHE") || context.allowed_roots.empty()) return {};
-    Handle h(CreateFileW(context.allowed_roots.front().c_str(), FILE_READ_ATTRIBUTES,
+    if (env_off(L"SHGREP_DB_CACHE") || context.allowed_roots.empty() || !cache_secret()) return {};
+    Handle h(CreateFileW(absolute_long_path(context.allowed_roots.front()).c_str(), FILE_READ_ATTRIBUTES,
                          FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
                          FILE_FLAG_BACKUP_SEMANTICS, nullptr));
     if (!h) return {};
     try {
-        return {join_path(join_path(final_path(h.h), cache_directory_name), L"db-cache"), !context.read_only};
+        std::wstring dir = join_path(join_path(final_path(h.h), cache_directory_name), L"db-cache");
+        if (!cache_dir_is_plain(dir)) return {};
+        return {std::move(dir), !context.read_only};
     } catch (const std::runtime_error&) {
         return {};
     }
@@ -609,8 +769,10 @@ hs_database_t* load_cached_database(const std::wstring& dir, const std::string& 
     uint64_t key_length = 0;
     std::memcpy(&key_length, data.data() + 8, sizeof(key_length));
     if (std::memcmp(data.data(), db_cache_magic, sizeof(db_cache_magic)) != 0 || key_length != key.size() ||
-        16 + key_length > data.size() || data.compare(16, key.size(), key) != 0) return nullptr;
-    const size_t offset = 16 + key.size();
+        16 + key_length + sizeof(CacheMac) > data.size() || data.compare(16, key.size(), key) != 0) return nullptr;
+    const size_t mac_at = 16 + key.size(), offset = mac_at + sizeof(CacheMac);
+    const auto expected = cache_mac(std::string_view(data).substr(0, mac_at), std::string_view(data).substr(offset));
+    if (!expected || std::memcmp(expected->data(), data.data() + mac_at, expected->size()) != 0) return nullptr;
     hs_database_t* db = nullptr;
     if (hs_deserialize_database(data.data() + offset, data.size() - offset, &db) != HS_SUCCESS) return nullptr;
     return db;
@@ -630,6 +792,7 @@ void store_cached_database(const std::wstring& dir, const std::string& key, cons
         if (ignore) WriteFile(ignore.h, "*\n", 2, &put, nullptr);
     }
     CreateDirectoryW(dir.c_str(), nullptr);
+    if (!cache_dir_is_plain(dir)) return;
     const std::wstring path = db_cache_path(dir, key);
     const std::wstring temp = path + L"." + std::to_wstring(GetCurrentProcessId()) + L"." +
                               std::to_wstring(GetCurrentThreadId()) + L".tmp";
@@ -651,7 +814,9 @@ void store_cached_database(const std::wstring& dir, const std::string& key, cons
             std::string header(db_cache_magic, sizeof(db_cache_magic));
             header.append(reinterpret_cast<const char*>(&key_length), sizeof(key_length));
             header += key;
-            written = write_all(header.data(), header.size()) && write_all(serialized, length);
+            const auto mac = cache_mac(header, std::string_view(serialized, length));
+            written = mac && write_all(header.data(), header.size()) &&
+                      write_all(reinterpret_cast<const char*>(mac->data()), mac->size()) && write_all(serialized, length);
         }
     }
     if (!written || !MoveFileExW(temp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING)) {
@@ -659,6 +824,7 @@ void store_cached_database(const std::wstring& dir, const std::string& key, cons
         return;
     }
     // Keep the newest db_cache_files databases.
+    if (!cache_dir_is_plain(dir)) return;
     WIN32_FIND_DATAW found{};
     HANDLE search = FindFirstFileW((dir + L"\\*.hsdb").c_str(), &found);
     if (search == INVALID_HANDLE_VALUE) return;
@@ -704,16 +870,26 @@ struct Database {
     std::vector<pcre2_code*> pcre;
     std::vector<bool> pcre_jit;
 #endif
-    ~Database() {
-        if (scratch) hs_free_scratch(scratch);
-        if (db) hs_free_database(db);
-#if defined(SHGREP_PCRE2)
-        for (pcre2_code* code : pcre) pcre2_code_free(code);
-#endif
-    }
+    ~Database() { release(); }
     Database(const Database&) = delete;
     Database& operator=(const Database&) = delete;
+    // SAFETY: a constructor that throws never runs the destructor, so whatever build() allocated before a failure
+    //   (Hyperscan database and scratch, PCRE2 codes) is released here.
     Database(const CompileSpec& spec, const DbCache& cache) : som(spec.som), stream(spec.binary) {
+        try { build(spec, cache); }
+        catch (...) { release(); throw; }
+    }
+    void release() noexcept {
+        if (scratch) hs_free_scratch(scratch);
+        if (db) hs_free_database(db);
+        scratch = nullptr;
+        db = nullptr;
+#if defined(SHGREP_PCRE2)
+        for (pcre2_code* code : pcre) pcre2_code_free(code);
+        pcre.clear();
+#endif
+    }
+    void build(const CompileSpec& spec, const DbCache& cache) {
         // PERF: text files are scanned as one in-memory block ("prefer block-based matching", performance.rst);
         // only search_bytes streams files in chunks.
         const unsigned mode = stream ? (HS_MODE_STREAM | (som ? HS_MODE_SOM_HORIZON_LARGE : 0)) : HS_MODE_BLOCK;
@@ -898,12 +1074,27 @@ struct Collector {
     uint64_t line_end = 0, lines = 0;
     // Count output with several patterns also counts lines (matches, for bytes) per pattern id; empty otherwise.
     std::vector<uint64_t> pattern_lines, pattern_line_end;
+    // CONTRACT: true when no match can cross a line break (Request::line_local), so matches arrive in line order and
+    //   one remembered line end tells whether a line already has a match. Otherwise a match that spans lines can
+    //   arrive after a shorter one that starts later, and lines are remembered by their start offsets instead.
+    bool ordered_lines = true;
+    std::unordered_set<uint64_t> seen_lines;
+    std::vector<std::unordered_set<uint64_t>> pattern_seen;
+    uint64_t line_start(uint64_t at) const {
+        const size_t limit = static_cast<size_t>(std::min<uint64_t>(at, text.size()));
+        if (limit == 0) return 0;
+        const size_t newline = text.rfind('\n', limit - 1);
+        return newline == std::string_view::npos ? 0 : newline + 1;
+    }
     static bool word_byte(char c) {
         unsigned char u = static_cast<unsigned char>(c);
         return std::isalnum(u) || u == '_' || u >= 0x80;
     }
     static int callback(unsigned id, unsigned long long from, unsigned long long to, unsigned, void* raw) {
         auto& c = *static_cast<Collector*>(raw);
+        // SAFETY: an id outside this query's patterns cannot come from its own database; it is ignored rather than
+        //   used to index the per-pattern tables.
+        if ((c.lengths && id >= c.lengths->size()) || (!c.pattern_lines.empty() && id >= c.pattern_lines.size())) return 0;
         if (!c.som) {
             const uint64_t length = c.lengths ? (*c.lengths)[id] : 1;
             from = to >= length ? to - length : 0;
@@ -912,6 +1103,21 @@ struct Collector {
                        (to < c.text.size() && word_byte(c.text[static_cast<size_t>(to)]))))
             return 0;
         ++c.found;
+        if (!c.ordered_lines && !c.text.empty() && (c.count_only || c.per_line)) {
+            const uint64_t start = c.line_start(from);
+            if (c.count_only) {
+                if (!c.pattern_lines.empty()) {
+                    if (c.pattern_seen.size() < c.pattern_lines.size()) c.pattern_seen.resize(c.pattern_lines.size());
+                    if (c.pattern_seen[id].insert(start).second) ++c.pattern_lines[id];
+                }
+                if (c.seen_lines.insert(start).second) ++c.lines;
+                return 0;
+            }
+            if (!c.seen_lines.insert(start).second) return 0;
+            if (c.events.size() < std::min(c.max_per_file, c.remaining)) c.events.push_back({id, from, to});
+            else { c.full = true; return 1; }
+            return 0;
+        }
         if (c.count_only) {
             if (!c.pattern_lines.empty()) {
                 if (c.text.empty()) ++c.pattern_lines[id];
@@ -1019,12 +1225,21 @@ std::optional<bool> probe_binary(HANDLE h, uint64_t size) {
     }
     return false;
 }
-std::string read_window(HANDLE h, uint64_t start, uint64_t end) {
-    if (end < start || end - start > 4096 || !seek(h, start)) return {};
-    std::string out(static_cast<size_t>(end - start), '\0');
-    DWORD read = 0;
-    if (!out.empty() && !ReadFile(h, out.data(), static_cast<DWORD>(out.size()), &read, nullptr)) return {};
-    out.resize(read);
+// nullopt when the window cannot be read; the caller counts a file error instead of showing empty context.
+template<class Interrupted>
+std::optional<std::string> read_window(HANDLE h, uint64_t start, uint64_t end, Interrupted&& interrupted) {
+    if (end < start || end - start > SIZE_MAX || !seek(h, start)) return std::nullopt;
+    const size_t length = static_cast<size_t>(end - start);
+    std::string out;
+    while (out.size() < length) {
+        if (interrupted()) return std::nullopt;
+        const size_t used = out.size();
+        const DWORD want = static_cast<DWORD>(std::min<size_t>(length - used, 1u << 20));
+        out.resize(used + want);
+        DWORD read = 0;
+        if (!ReadFile(h, out.data() + used, want, &read, nullptr) || !read) return std::nullopt;
+        out.resize(used + read);
+    }
     return out;
 }
 std::string hex(const std::string& s) {
@@ -1214,22 +1429,23 @@ DecodedText decode_text(std::string_view raw) {
     out.text.append(body.data() + copied, n - copied);
     return out;
 }
-std::vector<uint64_t> lines_for(HANDLE h, const std::vector<Event>& events, std::vector<char>& buffer,
-                                const std::shared_ptr<std::atomic_bool>& cancelled, Clock::time_point deadline,
-                                std::string& state) {
+// nullopt when the file cannot be read back; cancellation and timeout set state instead.
+std::optional<std::vector<uint64_t>> lines_for(HANDLE h, const std::vector<Event>& events, std::vector<char>& buffer,
+                                               const std::shared_ptr<std::atomic_bool>& cancelled, Clock::time_point deadline,
+                                               std::string& state) {
     std::vector<uint64_t> lines(events.size(), 0);
     std::vector<size_t> order;
     order.reserve(events.size());
     for (size_t i = 0; i < events.size(); ++i) order.push_back(i);
     std::sort(order.begin(), order.end(), [&](size_t a, size_t b) { return events[a].from < events[b].from; });
-    if (!seek(h, 0)) return lines;
+    if (!seek(h, 0)) return std::nullopt;
     uint64_t line = 1, done = 0;
     for (size_t index : order) {
         while (done < events[index].from) {
             if (cancelled->load()) { state = "cancelled"; return lines; }
             if (Clock::now() >= deadline) { state = "timeout"; return lines; }
             DWORD want = static_cast<DWORD>(std::min<uint64_t>(buffer.size(), events[index].from - done)), got = 0;
-            if (!ReadFile(h, buffer.data(), want, &got, nullptr) || got == 0) return lines;
+            if (!ReadFile(h, buffer.data(), want, &got, nullptr) || got == 0) return std::nullopt;
             line += std::count(buffer.begin(), buffer.begin() + got, '\n');
             done += got;
         }
@@ -1250,6 +1466,9 @@ constexpr size_t listing_buffer_bytes = 64 * 1024;
 constexpr uint64_t text_memory_budget = 512ull << 20;
 constexpr uint64_t small_text_bytes = 1ull << 20;
 constexpr uint64_t binary_probe_bytes = 64 * 1024;
+// Text files up to this size are read and scanned whole; larger ones in line-aligned chunks (scan_large_text).
+constexpr uint64_t whole_text_bytes = 64ull << 20;
+constexpr size_t large_chunk_bytes = 8u << 20;
 constexpr size_t retained_text_capacity = 8u << 20;
 
 struct Control {
@@ -1320,6 +1539,89 @@ void add_text_candidate(std::vector<Candidate>& items, const std::string& displa
 
 // CONTRACT: called once per file; applies the request-wide result and output limits in arrival order.
 // find_files JSON candidates carry bytes == 0 and are bounded by the final serialization pass instead.
+std::string painted(const Request& r, const std::string& display);
+
+// Cuts an over-budget block to the whole lines that fit in budget escaped bytes, starting at its first match; the
+// first line itself is cut at a character boundary when no whole line fits. False when nothing can be kept.
+bool trim_block(const Request& r, TextBlock& block, size_t budget) {
+    const std::string prefix = painted(r, block.path);
+    auto matched_at = [&](size_t pos) {
+        return block.text.compare(pos, prefix.size(), prefix) == 0 && pos + prefix.size() < block.text.size() &&
+               block.text[pos + prefix.size()] == ':';
+    };
+    size_t begin = 0;
+    if (r.output == "lines") {
+        for (size_t pos = 0; pos < block.text.size();) {
+            if (matched_at(pos)) { begin = pos; break; }
+            const size_t newline = block.text.find('\n', pos);
+            pos = newline == std::string::npos ? block.text.size() : newline + 1;
+        }
+    }
+    size_t used = 2, end = begin;
+    uint32_t matches = 0;
+    while (end < block.text.size()) {
+        const size_t newline = block.text.find('\n', end);
+        const size_t next = newline == std::string::npos ? block.text.size() : newline + 1;
+        const size_t cost = Json::escaped_size(std::string_view(block.text).substr(end, next - end)) - 2;
+        if (used + cost > budget) break;
+        if (matched_at(end)) ++matches;
+        used += cost;
+        end = next;
+    }
+    std::string kept;
+    if (end == begin) {
+        size_t cut = std::min(block.text.size() - begin, budget > 16 ? (budget - 16) / 6 : 0);  // worst case \u00XX escapes
+        while (cut > 0 && (static_cast<unsigned char>(block.text[begin + cut]) & 0xc0) == 0x80) --cut;
+        if (cut == 0) return false;
+        kept = block.text.substr(begin, cut) + "\n";
+        matches = 1;
+    } else {
+        kept = block.text.substr(begin, end - begin);
+        if (kept.ends_with("--\n")) kept.resize(kept.size() - 3);
+    }
+    block.text = std::move(kept);
+    block.units = r.output == "lines" ? std::max<uint32_t>(matches, 1) : 1;
+    return true;
+}
+
+// Shortens the context of an over-budget json result by at least excess escaped bytes; false when it has none left.
+bool shrink_context(Json& item, size_t excess) {
+    auto& object = std::get<Json::Object>(item.value);
+    for (const char* key : {"context", "context_text", "context_hex"}) {
+        const auto it = object.find(key);
+        if (it == object.end() || !std::holds_alternative<std::string>(it->second.value) || it->second.string().empty()) continue;
+        std::string text = it->second.string();
+        size_t keep = text.size() > excess + 8 ? text.size() - excess - 8 : 0;
+        if (std::string_view(key) == "context_hex") keep -= keep % 2;
+        else while (keep > 0 && (static_cast<unsigned char>(text[keep]) & 0xc0) == 0x80) --keep;
+        text.resize(keep);
+        it->second = std::move(text);
+        object["context_truncated"] = true;
+        return true;
+    }
+    return false;
+}
+
+// Keeps a lines block's first `keep` matched lines (the ':' lines), dropping what follows and a trailing "--".
+std::string keep_matched_lines(const Request& r, const std::string& text, const std::string& display, uint32_t keep) {
+    const std::string prefix = painted(r, display);
+    uint32_t matched = 0;
+    for (size_t pos = 0; pos < text.size();) {
+        const size_t newline = text.find('\n', pos);
+        const size_t next = newline == std::string::npos ? text.size() : newline + 1;
+        if (text.compare(pos, prefix.size(), prefix) == 0 && pos + prefix.size() < text.size() && text[pos + prefix.size()] == ':') {
+            if (matched == keep) {
+                std::string kept = text.substr(0, pos);
+                if (kept.ends_with("--\n")) kept.resize(kept.size() - 3);
+                return kept;
+            }
+            ++matched;
+        }
+        pos = next;
+    }
+    return text;
+}
+
 void publish(const Request& r, Outcome& out, Control& control, std::vector<Candidate>& items, size_t content_budget) {
     if (items.empty()) return;
     std::lock_guard lock(out.mutex);
@@ -1330,7 +1632,27 @@ void publish(const Request& r, Outcome& out, Control& control, std::vector<Candi
             control.stop.store(true);
             break;
         }
+        // CONTRACT: workers size their files from a count that other workers may have raised since, so a block is
+        //   cut to the allowance left here, under the lock, and max_results is never exceeded.
+        const size_t allowance = r.max_results - out.units;
+        if (candidate.units > allowance) {
+            if (candidate.text && r.output == "lines") {
+                candidate.block.text = keep_matched_lines(r, candidate.block.text, candidate.block.path, static_cast<uint32_t>(allowance));
+                candidate.block.units = candidate.units = static_cast<uint32_t>(allowance);
+                candidate.bytes = Json::escaped_size(candidate.block.text);
+            } else {
+                candidate.units = static_cast<uint32_t>(allowance);
+            }
+        }
         if (candidate.bytes > content_budget || out.projected_bytes > content_budget - candidate.bytes) {
+            // CONTRACT: matches never yield an empty answer: the first result is kept even when it alone is over the
+            //   budget, and the final fit shortens it (fit_output) instead of dropping it.
+            if (out.blocks.empty() && out.results.empty()) {
+                out.projected_bytes += candidate.bytes;
+                out.units += candidate.units;
+                if (candidate.text) out.blocks.push_back(std::move(candidate.block));
+                else out.results.push_back(std::move(candidate.item));
+            }
             out.state = "output_limit";
             control.stop.store(true);
             break;
@@ -1751,12 +2073,17 @@ std::optional<std::pair<uint64_t, uint64_t>> enclosing_block(std::string_view te
     return std::make_pair(first, last);
 }
 
-std::string render_lines(const Request& r, const std::string& display, std::string_view text, std::vector<Event> events) {
+// first_line is the line number of text[0]; lines before min_line are never printed (a chunked scan printed them
+// already), and lines up to context_through are printed as context still owed by an earlier chunk's match.
+// first_printed/last_printed, when given, receive the first and last line numbers printed (0 for none).
+std::string render_lines(const Request& r, const std::string& display, std::string_view text, std::vector<Event> events,
+                         uint64_t first_line = 1, uint64_t min_line = 1, uint64_t* first_printed = nullptr,
+                         uint64_t* last_printed = nullptr, uint64_t context_through = 0) {
     std::sort(events.begin(), events.end(), [](const Event& a, const Event& b) { return a.from < b.from; });
     struct Hit { uint64_t line; size_t focus; };
     std::vector<Hit> hits;
     size_t cursor = 0;
-    uint64_t line = 1;
+    uint64_t line = first_line;
     for (const auto& event : events) {
         const size_t from = static_cast<size_t>(std::min<uint64_t>(event.from, text.size()));
         for (;;) {
@@ -1807,8 +2134,11 @@ std::string render_lines(const Request& r, const std::string& display, std::stri
                 continue;
             }
         }
-        wanted.push_back({hit.line > r.before_lines ? hit.line - r.before_lines : 1, hit.line + r.after_lines});
+        wanted.push_back({std::max(hit.line > r.before_lines ? hit.line - r.before_lines : 1, std::max(first_line, min_line)),
+                          hit.line + r.after_lines});
     }
+    if (context_through) wanted.push_back({std::max(first_line, min_line), context_through});
+    std::erase_if(wanted, [](const Range& range) { return range.first > range.last; });
     // Blocks can start before an earlier hit's range, so ranges are ordered before merging.
     std::sort(wanted.begin(), wanted.end(), [](const Range& a, const Range& b) { return a.first < b.first; });
     for (const auto& range : wanted) {
@@ -1824,8 +2154,10 @@ std::string render_lines(const Request& r, const std::string& display, std::stri
     }
     std::string out;
     size_t pos = 0, hit_index = 0;
-    uint64_t number = 1;
+    uint64_t number = first_line;
     bool exhausted = false;
+    if (first_printed) *first_printed = 0;
+    if (last_printed) *last_printed = 0;
     for (size_t group = 0; group < ranges.size() && !exhausted; ++group) {
         while (!exhausted && number < ranges[group].first) {
             size_t newline = text.find('\n', pos);
@@ -1854,6 +2186,8 @@ std::string render_lines(const Request& r, const std::string& display, std::stri
             append_display_line(out, text, pos, shown_end, matched ? hits[hit_index].focus : pos, r.max_line_bytes,
                                 r.color ? &spans : nullptr);
             out.push_back('\n');
+            if (first_printed && !*first_printed) *first_printed = number;
+            if (last_printed) *last_printed = number;
             if (newline == std::string_view::npos) exhausted = true;
             else { pos = newline + 1; ++number; }
         }
@@ -1896,10 +2230,12 @@ struct TextView {
 
 #if defined(SHGREP_PCRE2)
 // Runs the PCRE2 fallback over one file and feeds matches to the collector in end-offset order, as Hyperscan
-// would. Lines and count output need only the first match on a line, so the search jumps to the next line after
-// each match; json output keeps every match up to the per-file limit. The full subject is always passed with a
-// start offset, so lookbehind still sees text before the starting point.
-void pcre_scan(const Database& db, Worker& w, std::string_view text, Collector& c, bool files_only) {
+// would. The full subject is always passed with a start offset, so lookbehind still sees text before the starting
+// point. Whole-word filtering happens before the search moves on, so a rejected match never hides a later valid one.
+// PERF: one pattern feeds the collector as it matches, so memory stays flat. Several patterns are merged in
+//   order; each keeps only as many matches (lines, for lines and count output) as the collector can still take.
+// CONTRACT: cancellation and the deadline are checked between matches; the caller sees them and stops.
+void pcre_scan(const Database& db, Worker& w, std::string_view text, Collector& c, bool files_only, const Control& control) {
     if (!w.pcre_match) {
         w.pcre_match = pcre2_match_data_create(1, nullptr);
         w.pcre_context = pcre2_match_context_create(nullptr);
@@ -1911,11 +2247,21 @@ void pcre_scan(const Database& db, Worker& w, std::string_view text, Collector& 
     const auto subject = reinterpret_cast<PCRE2_SPTR>(text.data());
     const PCRE2_SIZE length = text.size();
     const bool first_per_line = c.per_line || c.count_only;
-    const size_t cap = files_only ? 1 : first_per_line ? SIZE_MAX : static_cast<size_t>(c.max_per_file) + 1;
+    const bool direct = db.pcre.size() == 1;
+    // Count output never stops early; the others need at most one more than the collector accepts, to see "full".
+    const size_t cap = files_only ? 1 : c.count_only ? SIZE_MAX : static_cast<size_t>(std::min(c.max_per_file, c.remaining)) + 1;
+    auto next_char = [&](size_t at) {
+        ++at;
+        while (at < length && (static_cast<unsigned char>(text[at]) & 0xc0) == 0x80) ++at;
+        return at;
+    };
     std::vector<Event> events;
+    size_t steps = 0;
     for (size_t id = 0; id < db.pcre.size(); ++id) {
+        if (control.interrupted() || control.stop.load()) return;
         size_t kept = 0;
         for (PCRE2_SIZE offset = 0; offset <= length && kept < cap;) {
+            if ((++steps & 255) == 0 && (control.interrupted() || control.stop.load())) return;
             // CONTRACT: text reaching here is valid UTF-8 (validated or decoded), so UTF checks are skipped.
             const int rc = db.pcre_jit[id]
                 ? pcre2_jit_match(db.pcre[id], subject, length, offset, 0, w.pcre_match, w.pcre_context)
@@ -1927,8 +2273,14 @@ void pcre_scan(const Database& db, Worker& w, std::string_view text, Collector& 
             }
             const PCRE2_SIZE* ovector = pcre2_get_ovector_pointer(w.pcre_match);
             const PCRE2_SIZE from = std::min(ovector[0], ovector[1]), to = ovector[1];
-            events.push_back({static_cast<unsigned>(id), from, to});
+            if (c.word && ((from > 0 && Collector::word_byte(text[from - 1])) || (to < length && Collector::word_byte(text[to])))) {
+                offset = next_char(from);
+                continue;
+            }
             ++kept;
+            if (direct) {
+                if (Collector::callback(static_cast<unsigned>(id), from, to, 0, &c)) return;
+            } else events.push_back({static_cast<unsigned>(id), from, to});
             if (first_per_line) {
                 const size_t newline = text.find('\n', from);
                 if (newline == std::string_view::npos) break;
@@ -1936,9 +2288,7 @@ void pcre_scan(const Database& db, Worker& w, std::string_view text, Collector& 
             } else if (to > offset) {
                 offset = to;
             } else {
-                // Empty match: step over one UTF-8 character.
-                offset = to + 1;
-                while (offset < length && (static_cast<unsigned char>(text[offset]) & 0xc0) == 0x80) ++offset;
+                offset = next_char(to);  // empty match: step over one UTF-8 character
             }
         }
     }
@@ -2066,8 +2416,35 @@ std::optional<TextBytes> read_text(const ScanShared& s, Worker& w, HANDLE h, uin
     return read_measured_text(s, w, h, file_size, display, file_state, reservation);
 }
 
+// Scans one decoded text into collect with the request's engine; shared by whole-file and chunked scans.
+void run_text_scan(const ScanShared& s, Worker& w, std::string_view text, Collector& collect, bool stop_at_first) {
+#if defined(SHGREP_PCRE2)
+    if (!s.database->pcre.empty()) {
+        pcre_scan(*s.database, w, text, collect, stop_at_first, s.control);
+        if (collect.pcre_limit) ++s.out.errors;
+        return;
+    }
+#else
+    (void)stop_at_first;
+#endif
+    // CONTRACT: an engine that fails reported nothing, so Hyperscan rescans the text into the same collector.
+    const TextEngine* engine = s.database->engine.get();
+    if (!engine || engine->scan(text, w.engine_scratch.get(), Collector::callback, &collect) == ScanStatus::failed) {
+        if (engine) ++s.out.engine_fallbacks;
+        hs_error_t rc = hs_scan(s.database->db, text.data(), static_cast<unsigned>(text.size()), 0,
+                                w.scratch, Collector::callback, &collect);
+        if (rc != HS_SUCCESS && rc != HS_SCAN_TERMINATED) throw std::runtime_error("Hyperscan text scan failed");
+    }
+}
+
+bool scan_large_text(const ScanShared& s, Worker& w, HANDLE h, uint64_t file_size, const std::string& display,
+                     uint32_t remaining, std::string& file_state, std::vector<Candidate>& items);
+
 void scan_text(const ScanShared& s, Worker& w, HANDLE h, uint64_t file_size, const std::string& display,
                uint32_t remaining, std::string& file_state, std::vector<Candidate>& items) {
+    // Requests that are not line_local (multiline, invert, block, patterns that see past a line) read whole files.
+    if (file_size > whole_text_bytes && file_size <= s.r.max_file_bytes && s.r.line_local &&
+        scan_large_text(s, w, h, file_size, display, remaining, file_state, items)) return;
     const Request& r = s.r;
     Outcome& out = s.out;
     TextReservation reservation{s.memory, w};
@@ -2133,22 +2510,8 @@ void scan_text(const ScanShared& s, Worker& w, HANDLE h, uint64_t file_size, con
     // PERF: the decoded file is one contiguous buffer, so block mode applies: no stream state, and end-anchored
     // patterns are resolved in the same call.
     collect.per_line = r.output == "lines" || collect_all;
-#if defined(SHGREP_PCRE2)
-    if (!s.database->pcre.empty()) {
-        pcre_scan(*s.database, w, view.text, collect, files_only && !collect_all);
-        if (collect.pcre_limit) ++out.errors;
-    } else
-#endif
-    {
-        // CONTRACT: an engine that fails reported nothing, so Hyperscan rescans the text into the same collector.
-        const TextEngine* engine = s.database->engine.get();
-        if (!engine || engine->scan(view.text, w.engine_scratch.get(), Collector::callback, &collect) == ScanStatus::failed) {
-            if (engine) ++out.engine_fallbacks;
-            hs_error_t rc = hs_scan(s.database->db, view.text.data(), static_cast<unsigned>(view.text.size()), 0,
-                                    w.scratch, Collector::callback, &collect);
-            if (rc != HS_SUCCESS && rc != HS_SCAN_TERMINATED) throw std::runtime_error("Hyperscan text scan failed");
-        }
-    }
+    collect.ordered_lines = r.line_local;
+    run_text_scan(s, w, view.text, collect, files_only && !collect_all);
     if (collect.full && !files_only) out.per_file_limited.store(true);
     out.found += collect.found;
 
@@ -2210,12 +2573,6 @@ void scan_text(const ScanShared& s, Worker& w, HANDLE h, uint64_t file_size, con
                (static_cast<unsigned char>(view.text[start]) & 0xc0) == 0x80) ++start;
         while (end < view.text.size() &&
                (static_cast<unsigned char>(view.text[end]) & 0xc0) == 0x80) ++end;
-        bool context_truncated = end - start > 2048;
-        if (context_truncated) {
-            end = start + 2048;
-            while (end > event.to && end < view.text.size() &&
-                   (static_cast<unsigned char>(view.text[end]) & 0xc0) == 0x80) --end;
-        }
         uint64_t from = view.raw_offset(event.from, false);
         uint64_t to = view.raw_offset(event.to, true);
         Json::Object item{{"pattern_id", static_cast<int64_t>(event.id)},
@@ -2225,12 +2582,242 @@ void scan_text(const ScanShared& s, Worker& w, HANDLE h, uint64_t file_size, con
             {"context_start", view.raw_offset(start, false)},
             {"context_match_start", event.from - start},
             {"context_match_end", event.to - start},
-            {"context_truncated", context_truncated}};
+            {"context_truncated", false}};
         if (r.line) item.emplace("line", line_numbers[index]);
         Json candidate(std::move(item));
-        const size_t bytes = candidate.dump().size() + 1;
+        const size_t bytes = Json::escaped_size(candidate.dump()) + 1;
         items.push_back({std::move(candidate), bytes});
     }
+}
+
+// PERF: a text file above whole_text_bytes is read in chunks of about large_chunk_bytes that end at a line break,
+//   so memory stays flat however large the file is (a single line longer than a chunk is still held whole).
+// CONTRACT: only line_local requests come here: no match can cross a line break or see past its line, so each chunk
+//   is scanned on its own and nothing is lost. Each chunk but the last is scanned without its final line break, so
+//   $ and ^$ cannot match at a cut. Context lines and bytes come from the neighbouring chunks, line numbers and
+//   byte offsets continue across chunks, and the output equals a whole-file scan's. The file is read up to the size
+//   it had when it was opened, so a log that is still being appended to is searched as of that moment. Returns
+//   false, with the file rewound, for UTF-16, which only the whole-file path decodes.
+bool scan_large_text(const ScanShared& s, Worker& w, HANDLE h, uint64_t file_size, const std::string& display,
+                     uint32_t remaining, std::string& file_state, std::vector<Candidate>& items) {
+    const Request& r = s.r;
+    Outcome& out = s.out;
+    constexpr size_t lookahead = 1u << 20;  // read past each chunk for after-context lines and bytes
+    const uint64_t charge = static_cast<uint64_t>(large_chunk_bytes + 2 * lookahead) * 3;
+    if (!s.memory.acquire(charge, s.control)) {
+        if (const char* why = s.control.interrupted()) file_state = why;
+        return true;
+    }
+    struct Release {
+        MemoryBudget& memory;
+        uint64_t bytes;
+        ~Release() { memory.release(bytes); }
+    } release{s.memory, charge};
+
+    std::string pending;        // raw bytes read but not yet scanned, starting at a line start
+    uint64_t pending_raw = 0;   // file offset of pending[0]
+    std::string prefix;         // raw lines just before pending, kept for before-context
+    uint64_t prefix_line = 1;   // line number of prefix[0], or of pending[0] when prefix is empty
+    uint64_t read_total = 0;
+    bool read_failed = false;
+    auto fill = [&](size_t wanted) {
+        while (pending.size() < wanted && read_total < file_size) {
+            const size_t old = pending.size();
+            const size_t want = static_cast<size_t>(std::min<uint64_t>(lookahead, file_size - read_total));
+            pending.resize(old + want);
+            DWORD got = 0;
+            const bool ok = ReadFile(h, pending.data() + old, static_cast<DWORD>(want), &got, nullptr) != 0;
+            pending.resize(old + got);
+            read_total += got;
+            if (!ok || got == 0) { read_failed = true; return; }  // unreadable, or shorter than when opened
+        }
+    };
+    fill(static_cast<size_t>(binary_probe_bytes));
+    if (read_failed) { ++out.errors; return true; }
+    const auto byte = [&](size_t i) { return static_cast<unsigned char>(pending[i]); };
+    if (pending.size() >= 2 && ((byte(0) == 0xff && byte(1) == 0xfe) || (byte(0) == 0xfe && byte(1) == 0xff))) {
+        LARGE_INTEGER start{};
+        if (!SetFilePointerEx(h, start, nullptr, FILE_BEGIN)) { ++out.errors; return true; }
+        return false;
+    }
+    // PERF: like the whole-file read, a NUL in the first block marks the file binary before the rest is read.
+    if (pending.find('\0') != std::string::npos) { ++out.skipped_binary; return true; }
+    if (pending.size() >= 3 && byte(0) == 0xef && byte(1) == 0xbb && byte(2) == 0xbf) {
+        pending.erase(0, 3);
+        pending_raw = 3;
+    }
+
+    const bool without = r.output == "files_without_match";
+    const bool files_only = r.output == "files" || without, count_only = r.output == "count";
+    const bool json = r.output == "json";
+    uint64_t found = 0;
+    Collector totals{{}, 0, 0, 0};  // count output: summed matching lines
+    if (count_only && r.patterns.size() > 1) totals.pattern_lines.assign(r.patterns.size(), 0);
+    uint32_t per_file_left = files_only ? 1u : r.max_per_file, remaining_left = remaining;
+    std::string rendered;
+    uint64_t printed_through = 0, owed_through = 0;  // lines output: last line printed, last line of owed context
+    uint32_t units = 0;
+    bool limited = false;
+    std::vector<Candidate> results;
+    const size_t keep_lines = r.before_lines;
+    const size_t keep_bytes = json ? r.context_before : 0;
+
+    while (!pending.empty() || read_total < file_size) {
+        if (const char* why = s.control.interrupted()) { file_state = why; return true; }
+        fill(large_chunk_bytes + lookahead);
+        if (read_failed) { ++out.errors; return true; }
+        if (pending.empty()) break;
+        // The core ends at the last line break within the chunk; a longer line is read until it ends.
+        size_t core = pending.size();
+        if (read_total < file_size || core > large_chunk_bytes) {
+            size_t cut = pending.rfind('\n', std::min(pending.size(), large_chunk_bytes) - 1);
+            while (cut == std::string::npos) {
+                const size_t searched = pending.size();
+                cut = pending.find('\n', std::min(pending.size(), large_chunk_bytes));
+                if (cut != std::string::npos || read_total >= file_size) break;
+                fill(searched + lookahead);
+                if (read_failed) { ++out.errors; return true; }
+            }
+            core = cut == std::string::npos ? pending.size() : cut + 1;
+        }
+        fill(core + lookahead);
+        if (read_failed) { ++out.errors; return true; }
+        // After-context: after_lines more lines and, for json, context_after bytes beyond the core.
+        size_t suffix_end = core;
+        for (size_t k = 0; k < r.after_lines && suffix_end < pending.size(); ++k) {
+            const size_t newline = pending.find('\n', suffix_end);
+            suffix_end = newline == std::string::npos ? pending.size() : newline + 1;
+        }
+        if (json) suffix_end = std::max(suffix_end, std::min(pending.size(), core + r.context_after + 4));
+        while (suffix_end > core && suffix_end < pending.size() && (byte(suffix_end) & 0xc0) == 0x80) --suffix_end;
+
+        std::string chunk;
+        chunk.reserve(prefix.size() + suffix_end);
+        chunk.append(prefix);
+        chunk.append(pending, 0, suffix_end);
+        const size_t raw_core_begin = prefix.size(), raw_core_end = prefix.size() + core;
+        const uint64_t chunk_raw = pending_raw - prefix.size();
+        const ByteScan scanned = scan_bytes(std::string_view(chunk).substr(raw_core_begin, core));
+        if (scanned.nul) { ++out.skipped_binary; return true; }
+        // Invalid UTF-8 is repaired per chunk. COMPAT: a leading line break keeps decode_text from reading bytes
+        // FF FE or FE FF at a chunk start as a UTF-16 byte order mark; it is dropped again from every offset.
+        std::optional<DecodedText> decoded;
+        std::string_view text = chunk;
+        size_t core_begin = raw_core_begin, core_end = raw_core_end;
+        if (!valid_utf8(chunk)) {
+            auto repaired = [](std::string_view raw) { return decode_text("\n" + std::string(raw)); };
+            decoded.emplace(repaired(chunk));
+            text = std::string_view(decoded->text).substr(1);
+            core_begin = repaired(std::string_view(chunk).substr(0, raw_core_begin)).text.size() - 1;
+            core_end = core_begin + repaired(std::string_view(chunk).substr(raw_core_begin, core)).text.size() - 1;
+        }
+        auto raw_at = [&](uint64_t at, bool end) -> uint64_t {
+            return chunk_raw + (decoded ? decoded->raw_offset(at + 1, end) - 1 : at);
+        };
+        const bool final_chunk = read_total >= file_size && core == pending.size();
+        std::string_view core_text = text.substr(core_begin, core_end - core_begin);
+        if (!final_chunk && core_text.ends_with('\n')) core_text.remove_suffix(1);
+
+        Collector collect{{}, 0, per_file_left, remaining_left};
+        collect.count_only = count_only;
+        collect.word = r.word;
+        collect.text = core_text;
+        collect.som = s.database->som;
+        collect.lengths = s.database->lengths.empty() ? nullptr : &s.database->lengths;
+        if (count_only && r.patterns.size() > 1) {
+            collect.pattern_lines.assign(r.patterns.size(), 0);
+            collect.pattern_line_end.assign(r.patterns.size(), 0);
+        }
+        if (!count_only) collect.events.reserve(std::min({per_file_left, remaining_left, 64u}));
+        collect.per_line = r.output == "lines";
+        run_text_scan(s, w, core_text, collect, files_only);
+        found += collect.found;
+        if (collect.full && !files_only) limited = true;
+        if (count_only) {
+            totals.lines += collect.lines;
+            for (size_t id = 0; id < totals.pattern_lines.size(); ++id) totals.pattern_lines[id] += collect.pattern_lines[id];
+        } else if (r.output == "lines" && (!collect.events.empty() || owed_through > printed_through)) {
+            // CONTRACT: a chunk prints only its own lines. After-context that runs into the next chunk is owed to it,
+            //   so a line there is printed once, as a match if it is one.
+            for (auto& event : collect.events) { event.from += core_begin; event.to += core_begin; }
+            uint64_t first = 0, last = 0;
+            std::string part = render_lines(r, display, text.substr(0, core_end), collect.events, prefix_line,
+                                            printed_through + 1, &first, &last, owed_through);
+            if (!part.empty()) {
+                // Like rg, separate groups that do not touch, across chunks as within one.
+                if (!rendered.empty() && (r.before_lines || r.after_lines) && first > printed_through + 1) rendered += "--\n";
+                rendered += part;
+                printed_through = last;
+            }
+            if (!collect.events.empty() && r.after_lines) {
+                uint64_t latest = 0;
+                for (const auto& event : collect.events) latest = std::max(latest, event.from);
+                const uint64_t hit_line = prefix_line + static_cast<uint64_t>(
+                    std::count(text.begin(), text.begin() + static_cast<ptrdiff_t>(latest), '\n'));
+                owed_through = std::max(owed_through, hit_line + r.after_lines);
+            }
+        } else if (json) {
+            std::vector<size_t> order(collect.events.size());
+            for (size_t i = 0; i < order.size(); ++i) order[i] = i;
+            std::sort(order.begin(), order.end(), [&](size_t a, size_t b) { return collect.events[a].from < collect.events[b].from; });
+            size_t cursor = 0;
+            uint64_t line_number = prefix_line;
+            for (size_t index : order) {
+                const Event& event = collect.events[index];
+                const uint64_t from_at = event.from + core_begin, to_at = event.to + core_begin;
+                if (from_at > to_at || to_at > text.size()) { ++out.errors; continue; }
+                line_number += std::count(text.begin() + static_cast<ptrdiff_t>(cursor), text.begin() + static_cast<ptrdiff_t>(from_at), '\n');
+                cursor = static_cast<size_t>(from_at);
+                size_t start = static_cast<size_t>(from_at > r.context_before ? from_at - r.context_before : 0);
+                size_t end = static_cast<size_t>(std::min<uint64_t>(text.size(), to_at + r.context_after));
+                while (start < from_at && start < text.size() && (static_cast<unsigned char>(text[start]) & 0xc0) == 0x80) ++start;
+                while (end < text.size() && (static_cast<unsigned char>(text[end]) & 0xc0) == 0x80) ++end;
+                Json::Object item{{"pattern_id", static_cast<int64_t>(event.id)}, {"path", display},
+                    {"byte_start", raw_at(from_at, false)}, {"byte_end", raw_at(to_at, true)}, {"binary", false},
+                    {"context", std::string(text.substr(start, end - start))},
+                    {"context_start", raw_at(start, false)},
+                    {"context_match_start", from_at - start}, {"context_match_end", to_at - start},
+                    {"context_truncated", false}};
+                if (r.line) item.emplace("line", line_number);
+                Json candidate(std::move(item));
+                const size_t bytes = Json::escaped_size(candidate.dump()) + 1;
+                results.push_back({std::move(candidate), bytes});
+            }
+        }
+        if (!count_only && !files_only) {
+            const auto taken = static_cast<uint32_t>(std::min<size_t>(collect.events.size(), per_file_left));
+            units += taken;
+            per_file_left -= taken;
+            remaining_left -= std::min(taken, remaining_left);
+        }
+        const bool done = (files_only && found) || limited || per_file_left == 0 || remaining_left == 0;
+        // The core's last lines (and, for json, bytes) become the next chunk's before-context.
+        size_t start = raw_core_end;
+        for (size_t kept = 0; start > 0 && (kept < keep_lines || raw_core_end - start < keep_bytes); ++kept) {
+            const size_t newline = start >= 2 ? std::string_view(chunk).rfind('\n', start - 2) : std::string_view::npos;
+            start = newline == std::string_view::npos ? 0 : newline + 1;
+        }
+        prefix_line += static_cast<uint64_t>(std::count(chunk.begin(), chunk.begin() + static_cast<ptrdiff_t>(start), '\n'));
+        prefix.assign(chunk, start, raw_core_end - start);
+        pending.erase(0, core);
+        pending_raw += core;
+        if (done) break;
+    }
+    ++out.files;
+    out.bytes += read_total;
+    out.found += found;
+    if (limited) out.per_file_limited.store(true);
+    const std::string path = painted(r, display);
+    if (files_only) {
+        if (without ? found == 0 : found != 0) add_text_candidate(items, display, path + "\n", 1);
+    } else if (count_only) {
+        if (totals.lines) add_text_candidate(items, display, count_line(path, totals), 1);
+    } else if (r.output == "lines") {
+        if (!rendered.empty()) add_text_candidate(items, display, std::move(rendered), units);
+    } else {
+        for (auto& item : results) items.push_back(std::move(item));
+    }
+    return true;
 }
 
 void scan_binary(const ScanShared& s, Worker& w, HANDLE h, uint64_t file_size, const std::string& display,
@@ -2323,7 +2910,11 @@ void scan_binary(const ScanShared& s, Worker& w, HANDLE h, uint64_t file_size, c
         return;
     }
     std::vector<uint64_t> line_numbers;
-    if (r.line) line_numbers = lines_for(h, collect.events, w.buffer, s.control.cancelled, s.control.deadline, file_state);
+    if (r.line) {
+        auto lines = lines_for(h, collect.events, w.buffer, s.control.cancelled, s.control.deadline, file_state);
+        if (!lines) { ++out.errors; return; }
+        line_numbers = std::move(*lines);
+    }
     for (size_t index = 0; index < collect.events.size(); ++index) {
         if (file_state != "complete") break;
         if (const char* why = s.control.interrupted()) { file_state = why; break; }
@@ -2331,13 +2922,18 @@ void scan_binary(const ScanShared& s, Worker& w, HANDLE h, uint64_t file_size, c
         uint64_t from = event.from, to = event.to;
         uint64_t window_start = from > r.context_before ? from - r.context_before : 0;
         uint64_t window_end = std::min<uint64_t>(file_size, to + r.context_after);
-        if (window_end - window_start > 2048) window_end = window_start + 2048;
-        std::string context_bytes = read_window(h, window_start, window_end);
+        const auto window = read_window(h, window_start, window_end, [&] {
+            if (const char* why = s.control.interrupted()) { file_state = why; return true; }
+            return false;
+        });
+        if (!window) { ++out.errors; items.clear(); return; }
+        const std::string& context_bytes = *window;
         bool binary_context = r.binary || context_bytes.find('\0') != std::string::npos || !valid_utf8(context_bytes);
         Json::Object item{{"pattern_id", static_cast<int64_t>(event.id)}, {"path", display},
                           {"byte_start", from}, {"byte_end", to}, {"binary", binary_context},
                           {binary_context ? "context_hex" : "context", binary_context ? hex(context_bytes) : context_bytes},
-                          {"context_start", window_start}};
+                          {"context_start", window_start}, {"context_match_start", from - window_start},
+                          {"context_match_end", to - window_start}, {"context_truncated", false}};
         // The same window with printable ASCII kept and every other byte shown as '.', so strings in binaries
         // are readable without decoding the hex.
         if (binary_context) {
@@ -2350,7 +2946,7 @@ void scan_binary(const ScanShared& s, Worker& w, HANDLE h, uint64_t file_size, c
         }
         if (r.line) item.emplace("line", line_numbers[index]);
         Json candidate(std::move(item));
-        const size_t bytes = candidate.dump().size() + 1;
+        const size_t bytes = Json::escaped_size(candidate.dump()) + 1;
         items.push_back({std::move(candidate), bytes});
     }
 }
@@ -2543,13 +3139,16 @@ std::string render_footer(const Request& r, const Footer& f, const Json::Array& 
 }
 
 HANDLE open_root_directory(const std::wstring& path) {
-    return CreateFileW(long_path(path).c_str(), FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES,
+    return CreateFileW(absolute_long_path(fs::path(path)).c_str(), FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES,
                        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
                        FILE_FLAG_BACKUP_SEMANTICS, nullptr);
 }
 
 struct WalkRoot {
     std::wstring path, final;
+    // SAFETY: the handle that was validated against the configured roots. Walking it, never reopening path, closes
+    //   the window in which a junction swapped in after validation could lead the walk outside the roots.
+    std::shared_ptr<Handle> handle;
 };
 
 struct DirectoryTask {
@@ -2578,6 +3177,19 @@ constexpr size_t file_batch_size = 8;
 // CONTRACT: `directory` is the open parent handle and `name` the listed name; open the file with open_relative.
 using FileVisitor = std::function<void(unsigned worker, HANDLE directory, std::wstring_view name, const std::wstring& path,
                                        uint64_t listed_size)>;
+
+// Where a walked entry stands relative to Request::scope.
+enum class ScopeMatch { outside, ancestor, target, inside };
+ScopeMatch scope_match(const Request& r, std::string_view relative, bool directory) {
+    const std::string_view scope = r.scope;
+    if (relative.size() == scope.size())
+        return directory != r.scope_file && equals_folded(relative, scope) ? ScopeMatch::target : ScopeMatch::outside;
+    if (relative.size() < scope.size())
+        return directory && scope[relative.size()] == '/' && equals_folded(scope.substr(0, relative.size()), relative)
+                   ? ScopeMatch::ancestor : ScopeMatch::outside;
+    return !r.scope_file && relative[scope.size()] == '/' && equals_folded(relative.substr(0, scope.size()), scope)
+               ? ScopeMatch::inside : ScopeMatch::outside;
+}
 
 // Lists one directory: subdirectories to visit go to children, files that pass every filter go to files.
 void visit_directory(const Request& r, const DirectoryTask& task, WalkBuffers& b, std::vector<DirectoryTask>& children,
@@ -2615,6 +3227,17 @@ void visit_directory(const Request& r, const DirectoryTask& task, WalkBuffers& b
         b.relative.assign(task.relative);
         if (!b.relative.empty()) b.relative.push_back('/');
         b.relative.append(b.name);
+        // The folders leading to a scoped path, and the path itself, are entered whatever hidden or ignore say.
+        bool named = false;
+        if (!r.scope.empty()) {
+            const ScopeMatch match = scope_match(r, b.relative, is_directory);
+            if (match == ScopeMatch::outside) {
+                if (is_directory) ++out.directories_pruned;
+                else ++out.files_filtered;
+                continue;
+            }
+            named = match != ScopeMatch::inside;
+        }
         const bool passes = path_passes(r, b.relative, b.name, is_directory);
         if (regular && !passes) { ++out.files_filtered; continue; }
         if (link) {
@@ -2631,12 +3254,12 @@ void visit_directory(const Request& r, const DirectoryTask& task, WalkBuffers& b
             }
         }
         const bool visible = r.hidden || (b.name.front() != '.' && !(entry.attributes & FILE_ATTRIBUTE_HIDDEN));
-        if (!visible) {
+        if (!visible && !named) {
             if (is_directory) ++out.directories_pruned;
             else ++out.files_hidden;
             continue;
         }
-        if (!r.no_ignore && ignored_path(scope.get(), b.relative, is_directory)) {
+        if (!named && !r.no_ignore && ignored_path(scope.get(), b.relative, is_directory)) {
             if (is_directory) ++out.directories_pruned;
             else ++out.files_ignored;
             continue;
@@ -2660,7 +3283,7 @@ void visit_directory(const Request& r, const DirectoryTask& task, WalkBuffers& b
             // listed in binary_extension.
             // CONTRACT: a listed size of 0 is not trusted; NTFS directory entries can lag a file still open for
             // writing, and read_text reads to EOF whatever the listing says.
-            if (!r.sniff_all && binary_extension(b.name)) { ++out.skipped_binary; continue; }
+            if (!r.sniff_all && !named && binary_extension(b.name)) { ++out.skipped_binary; continue; }
         }
         files.push_back(std::move(entry));
     }
@@ -2797,7 +3420,7 @@ void walk(const Request& r, const std::vector<WalkRoot>& roots, unsigned worker_
     size_t queued_files = 0;  // files in batches
     size_t active = 0;        // workers listing a directory, which may add work
     for (const auto& root : roots) {
-        auto handle = std::make_shared<Handle>(open_root_directory(root.path));
+        auto handle = root.handle ? root.handle : std::make_shared<Handle>(open_root_directory(root.path));
         if (!*handle) { ++out.errors; continue; }
         pending.push_back({root.path, {}, nullptr, std::move(handle)});
     }
@@ -3012,7 +3635,7 @@ bool index_relative(const std::wstring& path, const std::wstring& root, std::str
 // (which walks never enter). Empty when that root is unavailable.
 std::wstring index_file_path(const SearchContext& context, const std::wstring& root_final) {
     if (context.allowed_roots.empty()) return {};
-    Handle h(CreateFileW(context.allowed_roots.front().c_str(), FILE_READ_ATTRIBUTES,
+    Handle h(CreateFileW(absolute_long_path(context.allowed_roots.front()).c_str(), FILE_READ_ATTRIBUTES,
                          FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
                          FILE_FLAG_BACKUP_SEMANTICS, nullptr));
     if (!h) return {};
@@ -3477,7 +4100,7 @@ TreeIndex index_tree(const SearchContext& context, const WalkRoot& root, Posting
              Handle h(open_relative(directory, name, false, denied));
              std::optional<DecodedText> decoded;
              std::string_view contents;
-             const IndexRead kind = h ? index_text(h.h, r.max_file_bytes, w.raw, decoded, contents, entry.size,
+             const IndexRead kind = h ? index_text(h.h, std::min<uint64_t>(r.max_file_bytes, whole_text_bytes), w.raw, decoded, contents, entry.size,
                                                    entry.write_time)
                                       : IndexRead::unreadable;
              const uint32_t id = next_id.fetch_add(1);
@@ -3512,7 +4135,7 @@ Json build_index(const SearchContext& context, const std::shared_ptr<std::atomic
     std::string text;
     for (const auto& allowed : context.allowed_roots) {
         const auto started = Clock::now();
-        Handle root(CreateFileW(allowed.c_str(), FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        Handle root(CreateFileW(absolute_long_path(allowed).c_str(), FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                                 nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr));
         if (!root) throw std::runtime_error("configured root unavailable: " + utf8(allowed.wstring()));
         const WalkRoot walk_root{fs::absolute(allowed).lexically_normal().wstring(), final_path(root.h)};
@@ -4576,7 +5199,7 @@ private:
         file.size = listed;
         std::optional<DecodedText> decoded;
         std::string_view contents;
-        const IndexRead kind = index_text(h, Request{}.max_file_bytes, raw_, decoded, contents, file.size, file.write_time);
+        const IndexRead kind = index_text(h, whole_text_bytes, raw_, decoded, contents, file.size, file.write_time);
         if (kind == IndexRead::unreadable) {
             file.flags = unindexed_file;
         } else if (kind == IndexRead::text) {
@@ -4909,7 +5532,7 @@ std::string prepare_index(const Request& r, const SearchContext& context, const 
 
 void start_live_indexes(const SearchContext& context) {
     for (const auto& allowed : context.allowed_roots) {
-        Handle root(CreateFileW(allowed.c_str(), FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        Handle root(CreateFileW(absolute_long_path(allowed).c_str(), FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                                 nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr));
         if (!root) {
             std::fprintf(stderr, "shgrep: live index: root unavailable\n");
@@ -4932,6 +5555,106 @@ void start_live_indexes(const SearchContext& context) {
 }
 
 
+namespace {
+Json run_unlocked(const std::string& name, const Json& arguments, const SearchContext& context,
+                  const std::shared_ptr<std::atomic_bool>& cancelled);
+
+// The identifier at a 1-based line and UTF-16 column, as a navigation request names it.
+std::string identifier_at(const std::string& text, int64_t line, int64_t column) {
+    size_t start = 0;
+    for (int64_t current = 1; current < line; ++current) {
+        start = text.find('\n', start);
+        if (start == std::string::npos) return {};
+        ++start;
+    }
+    const size_t end = text.find_first_of("\r\n", start);
+    const std::string row = text.substr(start, end == std::string::npos ? std::string::npos : end - start);
+    if (row.empty()) return {};
+    const int n = MultiByteToWideChar(CP_UTF8, 0, row.data(), static_cast<int>(row.size()), nullptr, 0);
+    std::wstring wide(static_cast<size_t>(std::max(n, 0)), L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, row.data(), static_cast<int>(row.size()), wide.data(), n);
+    size_t at = static_cast<size_t>(std::max<int64_t>(column - 1, 0));
+    if (at > wide.size()) return {};
+    auto word = [](wchar_t c) { return std::iswalnum(c) || c == L'_'; };
+    size_t begin = at, finish = at;
+    while (begin > 0 && word(wide[begin - 1])) --begin;
+    while (finish < wide.size() && word(wide[finish])) ++finish;
+    std::string name;
+    if (begin == finish || !try_utf8(std::wstring_view(wide).substr(begin, finish - begin), name)) return {};
+    return name;
+}
+
+// Symbol names a navigation request asks about: last name-path components, without overload index or C++ scope.
+std::vector<std::string> requested_names(const Json& arguments) {
+    std::vector<std::string> names;
+    auto add = [&](std::string value) {
+        if (const size_t slash = value.rfind('/'); slash != std::string::npos) value.erase(0, slash + 1);
+        if (const size_t bracket = value.find('['); bracket != std::string::npos) value.resize(bracket);
+        if (const size_t colons = value.rfind("::"); colons != std::string::npos) value.erase(0, colons + 2);
+        if (!value.empty()) names.push_back(std::move(value));
+    };
+    if (const Json* list = arguments.get("patterns")) for (const auto& item : list->array()) add(item.string());
+    else if (arguments.get("name_path") || arguments.get("pattern")) add(text(arguments, "name_path", text(arguments, "pattern")));
+    return names;
+}
+std::string joined(const std::vector<std::string>& names) {
+    std::string out;
+    for (const auto& name : names) out += (out.empty() ? "" : ", ") + name;
+    return out;
+}
+// Runs a whole-word literal text search for names, optionally limited to path or to one extension, under a note.
+Json word_search(const std::vector<std::string>& names, const Json& arguments, const std::string& path,
+                 const std::string& extension, const std::string& output, const std::string& note,
+                 const SearchContext& context, const std::shared_ptr<std::atomic_bool>& cancelled) {
+    Json::Object query{{"operation", "text"}, {"patterns", Json::Array(names.begin(), names.end())}, {"mode", "literal"},
+                       {"word", true}, {"output", output}};
+    query.emplace("intent", text(arguments, "intent", "Locate declarations or uses of: " + joined(names)));
+    if (arguments.get("timeout_ms")) query.emplace("timeout_ms", *arguments.get("timeout_ms"));
+    if (!path.empty()) query.emplace("path", path);
+    if (!extension.empty()) query.emplace("extensions", Json::Array{extension});
+    Json result = run_unlocked("search", query, context, cancelled);
+    auto& object = std::get<Json::Object>(result.value);
+    object["text"] = note + object["text"].string();
+    return result;
+}
+
+// CONTRACT: a navigation request that no language server can answer (none handles the file type, or the server
+//   failed: failure is then its message) answers with whole-word text matches for the symbol's name under a
+//   leading note instead of failing. symbols and hover stay in the file or folder; the other operations search
+//   every file with the same extension. nullopt when no name can be derived or a server should answer.
+std::optional<Json> text_fallback(const std::string& operation, const Json& arguments, const SearchContext& context,
+                                  const std::shared_ptr<std::atomic_bool>& cancelled, const std::string& failure = {}) {
+    const std::string path = text(arguments, "path");
+    bool directory = false;
+    std::optional<SourceText> descriptor;
+    if (!path.empty()) descriptor = source_descriptor(context, path, &directory);
+    if (failure.empty() && (!descriptor || directory || lsp_configured(*descriptor, context))) return std::nullopt;
+    std::vector<std::string> names = requested_names(arguments);
+    if (names.empty() && descriptor && !directory && arguments.get("line") && arguments.get("column")) {
+        std::string name = identifier_at(read_source_text(context, path).text, arguments.get("line")->integer(),
+                                         arguments.get("column")->integer());
+        if (!name.empty()) names.push_back(std::move(name));
+    }
+    if (names.empty()) return std::nullopt;
+    std::string scope, extension, where = "in the workspace";
+    if (descriptor && (directory || operation == "symbols" || operation == "hover")) {
+        scope = path;
+        where = directory ? "in " + path : "in this file";
+    } else if (descriptor) {
+        std::string suffix;
+        if (try_utf8(descriptor->path.extension().wstring(), suffix) && suffix.size() >= 2) {
+            extension = suffix.substr(1);
+            where = "in every " + suffix + " file";
+        }
+    }
+    const std::string matches = "whole-word text matches for " + joined(names) + " " + where;
+    const std::string note = failure.empty()
+        ? "[no language server for this file type; " + operation + " fell back to " + matches + "]\n"
+        : lsp_failure_banner(failure, "Fallback below: " + matches + ", not semantic results");
+    return word_search(names, arguments, scope, extension, "lines", note, context, cancelled);
+}
+} // namespace
+
 Json run_tool(const std::string& name, const Json& arguments,
               const SearchContext& context, const std::shared_ptr<std::atomic_bool>& cancelled) {
     // All ten tools share a read/write gate: an in-process refactor cannot race a navigation snapshot.
@@ -4945,6 +5668,18 @@ Json run_tool(const std::string& name, const Json& arguments,
         if (cancelled && cancelled->load()) throw std::runtime_error("request cancelled while waiting for workspace access");
         if (Clock::now() >= deadline) throw std::runtime_error("request timed out waiting for workspace access");
     }
+    const RequestDeadline request(deadline);
+    try { return run_unlocked(name, arguments, context, cancelled); }
+    catch (const LspFailure& e) {
+        // Requests without a fallback still carry the banner, so the model relays the failure.
+        throw std::runtime_error(lsp_failure_banner(e.what(), "No fallback exists for this operation; nothing was written"));
+    }
+}
+
+namespace {
+// CONTRACT: the caller holds the workspace gate (run_tool), so fallbacks may run nested searches here.
+Json run_unlocked(const std::string& name, const Json& arguments, const SearchContext& context,
+                  const std::shared_ptr<std::atomic_bool>& cancelled) {
     if (is_file_tool(name)) return run_file_tool(name, arguments, context, cancelled);
     if (name == "find_files") {
         reject_unknown_arguments(name, arguments);
@@ -4956,7 +5691,17 @@ Json run_tool(const std::string& name, const Json& arguments,
                 if (!semantic_args.contains(key)) throw std::runtime_error(key + " is a filesystem filter; use operation=filesystem");
             }
             Json::Object query = arguments.object();
-            const Json response = lsp_query(operation == "lsp" ? "files" : "symbols", query, context, cancelled);
+            Json response;
+            try { response = lsp_query(operation == "lsp" ? "files" : "symbols", query, context, cancelled); }
+            catch (const LspFailure& e) {
+                const auto names = requested_names(arguments);
+                if (operation == "lsp" || names.empty())
+                    throw std::runtime_error(lsp_failure_banner(e.what(), "No text fallback exists for this request"));
+                const std::string path = text(arguments, "path");
+                return word_search(names, arguments, path, {}, "files",
+                    lsp_failure_banner(e.what(), "Fallback below: files with whole-word text matches for " + joined(names) +
+                                                 ", not files with those symbols"), context, cancelled);
+            }
             if (operation == "lsp") return Json::Object{{"text", response.dump() + "\n"}};
             Json::Array files;
             std::set<std::string> seen;
@@ -4974,7 +5719,7 @@ Json run_tool(const std::string& name, const Json& arguments,
         reject_unknown_arguments(name, arguments);
         const std::string operation = text(arguments, "operation", "symbols");
         if (operation == "text") {
-            for (const char* key : {"path", "name_path", "include_body", "include_info", "include_kinds", "exclude_kinds", "depth", "substring_matching", "line", "column", "include_declaration"})
+            for (const char* key : {"name_path", "include_body", "include_info", "include_kinds", "exclude_kinds", "depth", "substring_matching", "line", "column", "include_declaration"})
                 if (arguments.get(key)) throw std::runtime_error(std::string(key) + " is only supported by LSP navigation");
         }
         if (operation != "text") {
@@ -4989,46 +5734,72 @@ Json run_tool(const std::string& name, const Json& arguments,
                 if (!navigation_args.contains(key))
                     throw std::runtime_error(key + " is a text-search option; use operation=text or omit it for LSP");
             }
-            return Json::Object{{"text", lsp_query(operation, arguments, context, cancelled).dump() + "\n"}};
+            try {
+                if (auto fallback = text_fallback(operation, arguments, context, cancelled)) return std::move(*fallback);
+                return Json::Object{{"text", lsp_query(operation, arguments, context, cancelled).dump() + "\n"}};
+            } catch (const LspFailure& e) {
+                if (auto fallback = text_fallback(operation, arguments, context, cancelled, e.what())) return std::move(*fallback);
+                throw std::runtime_error(lsp_failure_banner(e.what(), "No text fallback exists without a symbol name"));
+            }
         }
     }
     // CONTRACT: CLI only (`shgrep index`); tool_list never offers it, so MCP clients cannot reach it.
     if (name == "index") return build_index(context, cancelled);
     if (name != "search" && name != "search_bytes" && name != "find_files") throw std::runtime_error("unknown tool");
     Request r = parse_request(name, arguments, context);
+    // CONTRACT: an intent turns on keyword ranking of the findings (hunks, best first, capped per file); without one
+    //   the search returns every finding in scan order, exactly as before.
+    const std::string intent = name == "search" ? text(arguments, "intent") : std::string();
+    const bool ranking = intent.find_first_not_of(" \t\r\n") != std::string::npos;
+    const uint32_t requested_results = r.max_results, requested_per_file = r.max_per_file;
+    const size_t requested_output = r.max_output;
+    if (ranking) {
+        // CONTRACT: ranking sees the findings up to SHGREP_RANK_SCAN_LIMIT matches (the status says when that cut in);
+        //   explicit result/output limits apply afterwards.
+        r.max_results = rank_scan_limit();
+        r.max_per_file = UINT32_MAX;
+        r.max_output = SIZE_MAX;
+        r.use_index = false;
+        r.color = false;
+        r.profile = false;
+    }
     const auto started = Clock::now();
-    Control control{cancelled, started + std::chrono::milliseconds(r.timeout_ms)};
+    Control control{cancelled, request_deadline(started + std::chrono::milliseconds(r.timeout_ms))};
+    std::unique_ptr<Ranker> ranker;
+    if (ranking) ranker = std::make_unique<Ranker>(intent);
     const int64_t began = ticks();
     std::shared_ptr<const Database> database;
     if (!r.file_only) database = compiled_database(r, context);
     const int64_t compiled = ticks();
     std::vector<std::pair<fs::path, std::wstring>> roots;
     for (const auto& allowed : context.allowed_roots) {
-        Handle h(CreateFileW(allowed.c_str(), FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        Handle h(CreateFileW(absolute_long_path(allowed).c_str(), FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                              nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr));
         if (!h) throw std::runtime_error("configured root unavailable: " + utf8(allowed.wstring()));
         roots.emplace_back(allowed, final_path(h.h));
     }
-    std::vector<std::pair<fs::path, std::wstring>> selected;
+    struct Selected { fs::path raw; std::wstring final; std::shared_ptr<Handle> handle; };
+    std::vector<Selected> selected;
     for (const auto& raw : r.roots) {
-        Handle h(CreateFileW(raw.c_str(), FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                             nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr));
-        if (!h) throw std::runtime_error("requested root unavailable: " + utf8(raw.wstring()));
+        // The listing handle itself is validated and then walked (WalkRoot::handle).
+        auto h = std::make_shared<Handle>(open_root_directory(raw.wstring()));
+        if (!*h) throw std::runtime_error("requested root unavailable: " + utf8(raw.wstring()));
         BY_HANDLE_FILE_INFORMATION info{};
-        if (!GetFileInformationByHandle(h.h, &info) || !(info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY))
+        if (!GetFileInformationByHandle(h->h, &info) || !(info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY))
             throw std::runtime_error("requested root is not a directory");
-        std::wstring final = final_path(h.h);
+        std::wstring final = final_path(h->h);
         bool allowed = false;
         for (const auto& root : roots) if (inside(final, root.second)) { allowed = true; break; }
         if (!allowed) throw std::runtime_error("requested root is outside configured roots");
-        selected.emplace_back(raw, final);
+        selected.push_back({raw, std::move(final), std::move(h)});
     }
-    std::sort(selected.begin(), selected.end(), [](const auto& a, const auto& b) { return a.second.size() < b.second.size(); });
+    std::sort(selected.begin(), selected.end(), [](const Selected& a, const Selected& b) { return a.final.size() < b.final.size(); });
     std::vector<WalkRoot> walk_roots;
     for (auto& candidate : selected) {
         bool covered = false;
-        for (const auto& prior : walk_roots) if (inside(candidate.second, prior.final)) { covered = true; break; }
-        if (!covered) walk_roots.push_back({fs::absolute(candidate.first).lexically_normal().wstring(), std::move(candidate.second)});
+        for (const auto& prior : walk_roots) if (inside(candidate.final, prior.final)) { covered = true; break; }
+        if (!covered) walk_roots.push_back({fs::absolute(candidate.raw).lexically_normal().wstring(), std::move(candidate.final),
+                                            std::move(candidate.handle)});
     }
     // CONTRACT: the workspace's .shgrep directory (the pattern cache) is never walked, whatever hidden or
     // no_ignore say. Walks build paths from the walk root's path, so the cache's final path is mapped onto it.
@@ -5049,8 +5820,9 @@ Json run_tool(const std::string& name, const Json& arguments,
     // Reserve a modest starting batch; the default result count is unbounded.
     if (text_output) out.blocks.reserve(std::min<uint32_t>(r.max_results, 100));
     else out.results.reserve(std::min<uint32_t>(r.max_results, 100));
-    const size_t content_budget = text_output ? (r.max_output > 1024 ? r.max_output - 768 : r.max_output / 2)
-                                              : (r.max_output >= 1024 ? (r.max_output - 512) / 2 : r.max_output / 2);
+    // Both outputs are measured as they travel, escaped inside the MCP text field; 768 bytes stay for the footer or
+    // summary and the envelope.
+    const size_t content_budget = r.max_output > 1024 ? r.max_output - 768 : r.max_output / 2;
     // PERF: one worker per logical processor across all processor groups, by the owner's decision.
     // Concurrent MCP requests each get their own full pool.
     const DWORD processors = GetActiveProcessorCount(ALL_PROCESSOR_GROUPS);
@@ -5144,6 +5916,196 @@ Json run_tool(const std::string& name, const Json& arguments,
         for (size_t i : order) sorted.push_back(std::move(results[i]));
         results = std::move(sorted);
     }
+    Json rank_report;
+    std::string rank_note;  // told to the reader whenever ranking returned fewer hunks than it found
+    if (ranker) {
+        // CONTRACT: ranking orders hunks of the text output (groups between "--" separators, or nearby matched lines
+        //   when there are none) or groups of json results with overlapping context. The returned groups keep their
+        //   original output text and come best first; explicit result/output limits apply afterwards.
+        struct Piece {
+            std::string path, text, code;  // text: original output lines; code: the source without grep prefixes
+            uint64_t first = 0, last = 0, end = 0;  // lines (0 = unknown); end: raw context end of a json group
+            uint32_t units = 0;
+            std::vector<size_t> items;  // json results in this group
+        };
+        std::vector<Piece> pieces;
+        if (text_output) {
+            const bool separated = r.before_lines || r.after_lines || r.block;
+            for (auto& block : blocks) {
+                if (r.output != "lines") {
+                    Piece whole;
+                    whole.path = block.path;
+                    whole.text = std::move(block.text);
+                    whole.units = block.units;
+                    pieces.push_back(std::move(whole));
+                    continue;
+                }
+                Piece piece;
+                piece.path = block.path;
+                uint64_t previous_line = 0;
+                const auto close = [&] {
+                    if (!piece.text.empty()) pieces.push_back(std::move(piece));
+                    piece = Piece();
+                    piece.path = block.path;
+                    previous_line = 0;
+                };
+                const std::string_view text = block.text;
+                const std::string_view path = block.path;
+                for (size_t pos = 0; pos < text.size();) {
+                    const size_t newline = text.find('\n', pos);
+                    const size_t next = newline == std::string_view::npos ? text.size() : newline + 1;
+                    const std::string_view line = text.substr(pos, next - pos);
+                    pos = next;
+                    if (line == "--\n" || line == "--") { close(); continue; }
+                    // Lines are path:N:text for matches and path-N-text for context (path:text without numbers).
+                    std::string_view code = line;
+                    uint64_t number = 0;
+                    bool matched = false;
+                    if (line.size() > path.size() && line.starts_with(path) &&
+                        (line[path.size()] == ':' || line[path.size()] == '-')) {
+                        const char separator = line[path.size()];
+                        matched = separator == ':';
+                        code = line.substr(path.size() + 1);
+                        if (r.line) {
+                            size_t digits = 0;
+                            while (digits < code.size() && digits < 19 && code[digits] >= '0' && code[digits] <= '9') ++digits;
+                            if (digits && digits < code.size() && code[digits] == separator) {
+                                for (size_t d = 0; d < digits; ++d) number = number * 10 + static_cast<uint64_t>(code[d] - '0');
+                                code.remove_prefix(digits + 1);
+                            }
+                        }
+                    }
+                    // Without separators, nearby matches stay together and distant ones form their own hunk.
+                    if (!separated && !piece.text.empty() &&
+                        (piece.text.size() >= 1200 || (number && previous_line && number > previous_line + 3)))
+                        close();
+                    if (number) {
+                        if (!piece.first) piece.first = number;
+                        piece.last = number;
+                        previous_line = number;
+                    }
+                    piece.text.append(line);
+                    piece.code.append(code);
+                    piece.units += matched;
+                }
+                close();
+            }
+        } else {
+            for (size_t i = 0; i < results.size(); ++i) {
+                const Json& item = results[i];
+                const std::string& path = item.get("path")->string();
+                const Json* window = item.get("context");
+                const std::string_view text = window && std::holds_alternative<std::string>(window->value)
+                                                  ? std::string_view(window->string()) : std::string_view();
+                const Json* start_field = item.get("context_start");
+                const uint64_t start = start_field ? static_cast<uint64_t>(start_field->integer()) : 0;
+                uint64_t first = 0, last = 0;
+                if (const Json* line = item.get("line")) {
+                    const Json* at = item.get("context_match_start");
+                    const size_t match = at ? std::min<size_t>(static_cast<size_t>(at->integer()), text.size()) : 0;
+                    const auto before = static_cast<uint64_t>(std::count(text.begin(), text.begin() + match, '\n'));
+                    const auto number = static_cast<uint64_t>(line->integer());
+                    first = number > before ? number - before : 1;
+                    const std::string_view body = text.ends_with('\n') ? text.substr(0, text.size() - 1) : text;
+                    last = first + static_cast<uint64_t>(std::count(body.begin(), body.end(), '\n'));
+                }
+                // Results are sorted by path and offset, so overlapping windows of one place are adjacent.
+                if (!pieces.empty() && pieces.back().path == path && start <= pieces.back().end) {
+                    Piece& group = pieces.back();
+                    const uint64_t overlap = group.end - start;
+                    if (overlap < text.size()) group.code.append(text.substr(static_cast<size_t>(overlap)));
+                    group.end = std::max<uint64_t>(group.end, start + text.size());
+                    if (first) {
+                        group.first = group.first ? std::min(group.first, first) : first;
+                        group.last = std::max(group.last, last);
+                    }
+                    ++group.units;
+                    group.items.push_back(i);
+                    continue;
+                }
+                Piece group;
+                group.path = path;
+                group.code = std::string(text);
+                group.first = first;
+                group.last = last;
+                group.end = start + text.size();
+                group.units = 1;
+                group.items.push_back(i);
+                pieces.push_back(std::move(group));
+            }
+        }
+        std::vector<RankCandidate> rank_candidates;
+        rank_candidates.reserve(pieces.size());
+        for (const auto& piece : pieces) rank_candidates.push_back({piece.path, piece.first, piece.last, piece.code});
+        const std::vector<Ranked> ranked = ranker->rank(rank_candidates);
+        if (text_output) {
+            std::vector<TextBlock> kept_blocks;
+            kept_blocks.reserve(ranked.size());
+            for (const auto& pick : ranked) {
+                Piece& piece = pieces[pick.index];
+                kept_blocks.push_back(TextBlock{piece.path, std::move(piece.text), std::max<uint32_t>(piece.units, 1)});
+            }
+            blocks = std::move(kept_blocks);
+        } else {
+            Json::Array kept_results;
+            for (size_t position = 0; position < ranked.size(); ++position) {
+                const Ranked& pick = ranked[position];
+                for (size_t i : pieces[pick.index].items) {
+                    Json item = std::move(results[i]);
+                    Json::Object ranking{{"rank", static_cast<int64_t>(position + 1)},
+                                         {"keyword_rank", static_cast<int64_t>(pick.keyword_rank + 1)}, {"score", pick.score}};
+                    if (pick.reranked) ranking.emplace("rerank_score", pick.rerank_score);
+                    std::get<Json::Object>(item.value).emplace("ranking", std::move(ranking));
+                    kept_results.push_back(std::move(item));
+                }
+            }
+            results = std::move(kept_results);
+        }
+        rank_report = ranker->report();
+        if (ranked.size() < pieces.size())
+            rank_note = "showing " + std::to_string(ranked.size()) + " of " + std::to_string(pieces.size()) +
+                        " matching hunks, best first for the intent; to see every match search again without intent";
+        if (state == "limit")
+            rank_note += std::string(rank_note.empty() ? "" : ". ") +
+                         "the scan stopped at SHGREP_RANK_SCAN_LIMIT matches, so these are the best of the first matches found; "
+                         "narrow path, include or the patterns to rank the rest";
+        if (!rank_note.empty()) std::get<Json::Object>(rank_report.value).emplace("note", rank_note);
+        r.max_results = requested_results;
+        r.max_per_file = requested_per_file;
+        r.max_output = requested_output;
+        uint64_t returned = 0;
+        std::vector<TextBlock> limited_blocks;
+        for (auto& block : blocks) {
+            const uint64_t allowance = returned < r.max_results ? r.max_results - returned : 0;
+            const uint32_t keep = static_cast<uint32_t>(std::min<uint64_t>(
+                allowance, r.output == "lines" ? r.max_per_file : UINT32_MAX));
+            if (block.units > keep) {
+                if (state == "complete") state = allowance < block.units ? "limit" : "per_file_limit";
+                if (!keep) continue;
+                block.text = keep_matched_lines(r, block.text, block.path, keep);
+                block.units = keep;
+            }
+            returned += block.units;
+            limited_blocks.push_back(std::move(block));
+        }
+        blocks = std::move(limited_blocks);
+        Json::Array limited_results;
+        std::map<std::string, uint64_t> per_file;
+        for (auto& item : results) {
+            if (limited_results.size() >= r.max_results) {
+                if (state == "complete") state = "limit";
+                break;
+            }
+            auto& count = per_file[item.get("path")->string()];
+            if (count >= r.max_per_file) {
+                if (state == "complete") state = "per_file_limit";
+                continue;
+            }
+            ++count;
+            limited_results.push_back(std::move(item));
+        }
+        results = std::move(limited_results);
+    }
     const int64_t ordered = ticks();
     auto elapsed = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - started).count());
     uint64_t index_files = 0, index_opened = 0;
@@ -5183,13 +6145,16 @@ Json run_tool(const std::string& name, const Json& arguments,
             std::string display;
             if (try_utf8(root.path, display)) footer.roots.push_back(std::move(display));
         }
-        const bool separate_files = r.output == "lines" && (r.before_lines || r.after_lines);
+        // Ranking returns block-mode hunks one per block, so they need the separator the scan put between them.
+        const bool separate_files = r.output == "lines" && (r.before_lines || r.after_lines || (ranking && r.block));
         for (;;) {
             std::string text;
             uint64_t units = 0;
             size_t length = 0;
             for (const auto& block : blocks) length += block.text.size() + 3;
             text.reserve(length + 1024);
+            if (ranking) text += "[ranking " + rank_report.dump() + "]\n";
+            if (!rank_note.empty()) text += "[" + rank_note + "]\n";
             if (!relative_prefix.empty() && !blocks.empty()) text += "[paths relative to " + relative_root + "]\n";
             for (size_t i = 0; i < blocks.size(); ++i) {
                 if (separate_files && i) text += "--\n";
@@ -5197,19 +6162,28 @@ Json run_tool(const std::string& name, const Json& arguments,
                 units += blocks[i].units;
             }
             footer.state = state;
-            footer.returned = units;
+            // Selection can retain supporting context without a grep hit; do not claim the scan found nothing.
+            footer.returned = ranking && out.found.load() ? std::max<uint64_t>(units, 1) : units;
             text += render_footer(r, footer, skipped_files);
             text += index_note;
             // PERF: blocks were budgeted while publishing, so this loop rarely drops anything.
-            if (blocks.empty() || Json::escaped_size(text) + 256 <= r.max_output) {
+            const size_t size = Json::escaped_size(text) + 256;
+            if (blocks.empty() || r.max_output == SIZE_MAX || size <= r.max_output) {
                 // CONTRACT: the diagnostic profile is a trailing line, added after the budget check.
                 if (!profiles.empty()) text += "[profile " + Json(make_profile()).dump() + "]\n";
                 return Json::Object{{"text", std::move(text)},
                     {"summary", summary(files, out.bytes.load(), out.found.load(), units, errors, skipped_size,
                                         out.skipped_binary.load(), elapsed, state)}};
             }
-            blocks.pop_back();
             state = "output_limit";
+            // A last block that is too large is cut to whole lines rather than dropped, so matches never come back
+            // as "No matches."
+            if (blocks.size() == 1) {
+                const size_t own = Json::escaped_size(blocks.front().text);
+                const size_t excess = size - r.max_output + 8;
+                if (own > excess && trim_block(r, blocks.front(), own - excess)) continue;
+            }
+            blocks.pop_back();
         }
     }
     Json output;
@@ -5217,6 +6191,7 @@ Json run_tool(const std::string& name, const Json& arguments,
         Json::Object payload{{"results", results}, {"skipped_files", skipped_files},
             {"summary", summary(files, out.bytes.load(), out.found.load(), results.size(), errors, skipped_size,
                                 out.skipped_binary.load(), elapsed, state)}};
+        if (ranking) payload.emplace("ranking", rank_report);
         if (show_selection)
             payload.emplace("selection", Json::Object{{"regular_files_seen", out.regular_seen.load()},
                 {"files_filtered", out.files_filtered.load()}, {"files_ignored", out.files_ignored.load()},
@@ -5228,14 +6203,20 @@ Json run_tool(const std::string& name, const Json& arguments,
                                                   {"indexed_files", index_files}, {"deleted", out.index_missing.load()}});
         if (!profiles.empty()) payload.emplace("profile", make_profile());
         output = std::move(payload);
-        if (output.dump().size() <= content_budget) break;
+        if (r.max_output == SIZE_MAX) break;
+        const size_t size = Json::escaped_size(output.dump()) + 256;
+        if (size <= r.max_output) break;
         if (show_selection) { show_selection = false; continue; }
         if (!skipped_files.empty()) { skipped_files.pop_back(); continue; }
         if (results.empty()) throw std::runtime_error("max_output_bytes cannot hold summary");
-        results.pop_back(); state = "output_limit";
+        state = "output_limit";
+        // The last result is shortened rather than dropped, so matches never come back as an empty list.
+        if (results.size() == 1 && shrink_context(results.front(), size - r.max_output)) continue;
+        results.pop_back();
     } while (true);
     return output;
 }
+} // namespace
 
 // CONTRACT: these descriptions are the model's only documentation of the tools; every statement must match the
 // implementation. Update them with any behavior change.
@@ -5279,9 +6260,13 @@ Json tool_definitions() {
     content_props.emplace("context_after_bytes", field("integer", "json: context bytes after."));
 
     auto search_props = content_props;
+    search_props.emplace("intent", field("string",
+        "Optional for operation=text: the task in words, to locate where something is. With it only the best 10 hunks return, ranked by "
+        "keywords (at most 3 per file), and a note says how many were left out. Omit it when you need every occurrence "
+        "(renames, all callers, counts): then every match returns in scan order."));
     search_props.emplace("operation", choice(Json::Array{"symbols", "definition", "declaration", "type_definition", "implementation", "references", "hover", "text"},
         "Default symbols via LSP. text uses live grep; its text filters and budgets apply only there."));
-    search_props.emplace("path", field("string", "File or directory scope for symbols; other navigation needs a file. Omit for all workspaces."));
+    search_props.emplace("path", field("string", "File or folder to limit text search or symbols to; other navigation needs a file. Omit for all workspaces."));
     search_props.emplace("name_path", field("string", "Symbol name or slash-separated parent/name. /prefix anchors at the root; otherwise suffix match."));
     search_props.emplace("include_body", field("boolean", "Include complete symbol bodies; default false."));
     search_props.emplace("substring_matching", field("boolean", "Substring match on the last name-path component only; default false."));
@@ -5303,7 +6288,7 @@ Json tool_definitions() {
     search_props.emplace("max_line_bytes", field("integer", "Optional line window; default 0 shows whole lines."));
     search_props.emplace("block", field("boolean", "Show each match inside its whole enclosing function (else class); "
                                                    "lines output. Brace languages and Python."));
-    search_props.emplace("max_block_lines", field("integer", "Longer blocks keep line context; default 200."));
+    search_props.emplace("max_block_lines", field("integer", "Optional block line limit; default unlimited. Longer blocks keep line context."));
     search_props.emplace("invert", field("boolean", "Lines matching no pattern (not json)."));
     search_props.emplace("multiline", field("boolean", "Matches may span lines."));
     search_props.emplace("word", field("boolean", "Whole words; fast, unlike \\b."));
@@ -5312,7 +6297,7 @@ Json tool_definitions() {
     search_props.emplace("index", field("boolean", "Use the trigram index: opens only candidates. Default true when "
                                                    "the server runs --live-index (kept current); otherwise a "
                                                    "snapshot that can miss newer edits."));
-    search_props.emplace("max_file_bytes", field("integer", "Skip larger text files; default 64 MiB."));
+    search_props.emplace("max_file_bytes", field("integer", "Skip larger text files; default 256 MiB, max 512 MiB. Over 64 MiB, files are scanned in line chunks; multiline, invert and block skip them."));
 
     auto bytes_props = content_props;
     bytes_props.emplace("mode", choice(Json::Array{"literal", "regex"},
@@ -5337,8 +6322,12 @@ Json tool_definitions() {
     return Json::Array{
         Json::Object{{"name", "search"}, {"description",
             "Navigate live code through LSP: symbols, definition/declaration/type_definition, implementation, references, or hover. "
-            "Bodies are opt-in; no LSP output cap. Configure .shgrep/lsp.json. operation=text searches current disk text "
-            "with the grep options below, including XML and files without a language server."},
+            "Bodies are opt-in; no LSP output cap. Lua, XML, C/C++, Rust and Python work out of the box; .shgrep/lsp.json adds or overrides servers. "
+            "A failing server is reported in a leading [LSP FAILURE ...] line, to relay to the user, followed by whole-word text matches. "
+            "operation=text: pass intent (the task in words) to LOCATE something: only the best 10 hunks return, ranked by keywords "
+            "(at most 3 per file, optionally re-ordered by a local reranker), and a note states how many were left out. Omit intent when "
+            "you need EVERY occurrence (renames, all callers, counts): then every match returns in scan order. "
+            "Grep filters apply, including XML and files without a language server."},
             {"inputSchema", schema(search_props)}},
         Json::Object{{"name", "search_bytes"}, {"description",
             "Search raw bytes of any file (no decoding or binary skipping) by hex or byte regex; exact offsets."},

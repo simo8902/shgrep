@@ -1,4 +1,7 @@
 #include "lsp.hpp"
+#include "compile_db.hpp"
+#include "ignore.hpp"
+#include "lsp_watch.hpp"
 #include <windows.h>
 #include <algorithm>
 #include <chrono>
@@ -24,6 +27,8 @@ using Clock = std::chrono::steady_clock;
 namespace fs = std::filesystem;
 using J = Json;
 [[noreturn]] void fail(const std::string& s) { throw std::runtime_error(s); }
+// A malformed answer from the language server, as opposed to a caller mistake.
+[[noreturn]] void server_fail(const std::string& s) { throw LspFailure(s); }
 std::string str(const J& j, const char* key, const std::string& fallback = "") {
     const J* p = j.get(key); return p ? p->string() : fallback;
 }
@@ -71,7 +76,7 @@ std::string uri(const fs::path& path) {
     return out;
 }
 fs::path from_uri(const std::string& value) {
-    if (!value.starts_with("file://")) fail("language server returned a non-file URI");
+    if (!value.starts_with("file://")) server_fail("language server returned a non-file URI");
     std::string body = value.substr(7), decoded;
     auto digit = [](char c) -> int {
         if (c >= '0' && c <= '9') return c - '0';
@@ -107,7 +112,7 @@ struct Control {
     const std::shared_ptr<std::atomic_bool>& cancelled;
     void check() const {
         if (cancelled && cancelled->load()) fail("LSP request cancelled");
-        if (Clock::now() >= deadline) fail("LSP request timed out");
+        if (Clock::now() >= deadline) throw LspFailure("language server did not answer before timeout_ms");
     }
 };
 struct Handle {
@@ -132,6 +137,13 @@ struct Config {
     std::string language, key;
     std::vector<std::string> command, extensions, ignored_paths;
     J initialization = J::Object{}, settings = J::Object{};
+    std::vector<fs::path> state_directories;  // created before the server starts
+    bool bundled = false;
+    // CONTRACT: the server indexes the whole workspace from disk itself. shgrep then opens only the files a request
+    //   touches or that changed since the server read them, and cross-file requests wait for indexing to finish.
+    //   Otherwise every matching file is opened, which servers without their own index need.
+    bool indexes_workspace = false;
+    J details;  // extra status, e.g. where clangd's compile flags came from
 };
 bool glob_match(std::string_view pattern, std::string_view value) {
     std::vector<uint8_t> prior(value.size() + 1, 0), next(value.size() + 1, 0);
@@ -195,25 +207,117 @@ bool path_excluded(const Config& config, const fs::path& path) {
     }
     return ignored;
 }
-std::vector<Config> configs(const fs::path& root, const SearchContext& context) {
+// CONTRACT: tools/fetch_lsp.py installs these servers into <shgrep.exe folder>\lsp; folders and executables match
+//   its PINS. They serve every workspace with no configuration. .shgrep/lsp.json entries take over the extensions
+//   they name, and "bundled": false there turns the shipped servers off. A server that was not installed is
+//   skipped, so its files fall back to text.
+const fs::path& bundled_directory() {
+    static const fs::path directory = [] {
+        std::wstring buffer(MAX_PATH, L'\0');
+        for (;;) {
+            const DWORD n = GetModuleFileNameW(nullptr, buffer.data(), static_cast<DWORD>(buffer.size()));
+            if (n == 0) return fs::path{};
+            if (n < buffer.size()) { buffer.resize(n); break; }
+            if (buffer.size() >= 32768) return fs::path{};
+            buffer.resize(buffer.size() * 2);
+        }
+        return fs::path(buffer).parent_path() / L"lsp";
+    }();
+    return directory;
+}
+void add_bundled(std::vector<Config>& result, const fs::path& root, const std::set<std::string>& owned,
+                 const SearchContext& context, bool cmake_configure) {
+    const fs::path& base = bundled_directory();
+    if (base.empty()) return;
+    const fs::path state = root / L".shgrep" / L"lsp-state";
+    auto add = [&](const char* language, const fs::path& executable, std::vector<std::string> extensions,
+                   std::vector<std::string> arguments, J settings = J::Object{}, J initialization = J::Object{},
+                   std::vector<fs::path> directories = {}, const std::string& variant = {}, J details = nullptr) {
+        std::error_code error;
+        if (!fs::is_regular_file(executable, error)) return;
+        std::erase_if(extensions, [&](const std::string& ext) { return owned.contains(ext); });
+        if (extensions.empty()) return;
+        Config config;
+        config.root = root;
+        config.language = language;
+        config.command.push_back(utf8(executable.wstring()));
+        config.command.insert(config.command.end(), arguments.begin(), arguments.end());
+        config.extensions = std::move(extensions);
+        config.settings = std::move(settings);
+        config.initialization = std::move(initialization);
+        config.state_directories = std::move(directories);
+        config.bundled = true;
+        config.indexes_workspace = true;
+        config.details = std::move(details);
+        // A new variant (clangd's compile database changed) is a new key, so the old server is retired.
+        config.key = lower(utf8(root.wstring())) + ":bundled:" + language + ":" + variant;
+        for (const auto& ext : config.extensions) config.key += ":" + ext;
+        result.push_back(std::move(config));
+    };
+    // COMPAT: LuaLS keeps logs and generated meta files in the folders it is given; Lua 5.1 suits the owner's
+    //   game scripts, and a workspace .luarc.json still overrides it.
+    const fs::path lua = state / L"lua";
+    add("lua", base / L"lua" / L"bin" / L"lua-language-server.exe", {".lua"},
+        {"--logpath=" + utf8((lua / L"logs").wstring()), "--metapath=" + utf8((lua / L"meta").wstring())},
+        J::Object{{"Lua", J::Object{{"runtime", J::Object{{"version", "Lua 5.1"}}},
+                                    {"telemetry", J::Object{{"enable", false}}},
+                                    {"workspace", J::Object{{"checkThirdParty", false}}}}}},
+        J::Object{}, {lua / L"logs", lua / L"meta"});
+    // SAFETY: LemMinX must not fetch schemas or DTDs from the network or resolve external entities.
+    const fs::path xml = state / L"xml";
+    const J xml_settings = J::Object{{"xml", J::Object{
+        {"server", J::Object{{"workDir", utf8(xml.wstring())}}},
+        {"logs", J::Object{{"file", utf8((xml / L"lemminx.log").wstring())}}},
+        {"telemetry", J::Object{{"enabled", false}}},
+        {"downloadExternalResources", J::Object{{"enabled", false}}},
+        {"validation", J::Object{{"resolveExternalEntities", false}}}}}};
+    add("xml", base / L"xml" / L"lemminx.exe", {".xml", ".xsd", ".xsl", ".xslt", ".svg"}, {},
+        xml_settings, J::Object{{"settings", xml_settings}}, {xml});
+    // compile_db.cpp finds or generates clangd's compile flags. SHGREP_CLANGD_LOG=info|verbose raises its stderr log
+    // for diagnosing index problems.
+    const fs::path clangd = base / L"clangd" / L"bin" / L"clangd.exe";
+    std::string clangd_log = "error";
+    wchar_t level[16];
+    if (const DWORD n = GetEnvironmentVariableW(L"SHGREP_CLANGD_LOG", level, 16); n && n < 16) {
+        const std::string requested = lower(utf8(std::wstring(level, n)));
+        if (requested == "info" || requested == "verbose") clangd_log = requested;
+    }
+    std::error_code clangd_error;
+    if (fs::is_regular_file(clangd, clangd_error)) {
+        const CompileSetup setup = cpp_compile_setup(root, context, cmake_configure);
+        add("cpp", clangd, {".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".hxx", ".inl", ".ipp"},
+            // --background-index keeps its shards beside the compile database; limits of 0 return every result.
+            {"--log=" + clangd_log, "--header-insertion=never", "--background-index", "--limit-results=0", "--limit-references=0",
+             "--rename-file-limit=0"},
+            J::Object{}, setup.initialization, {}, setup.fingerprint,
+            J::Object{{"compile_database", setup.status}});
+    }
+    // rust-analyzer loads Cargo projects through the user's cargo; without it only syntax-level features work.
+    // The default workspace/symbol limit of 128 would cut symbol searches short.
+    add("rust", base / L"rust" / L"rust-analyzer.exe", {".rs"}, {}, J::Object{},
+        J::Object{{"workspace", J::Object{{"symbol", J::Object{{"search", J::Object{{"limit", 1000000}}}}}}}});
+    add("python", base / L"python" / L"ty.exe", {".py", ".pyi"}, {"server"});
+}
+std::vector<Config> configs_from_disk(const fs::path& root, const SearchContext& context) {
     const fs::path path = root / L".shgrep" / L"lsp.json";
     std::wstring metadata_path = path.wstring();
     if (!metadata_path.starts_with(L"\\\\?\\")) {
         if (metadata_path.starts_with(L"\\\\")) metadata_path = L"\\\\?\\UNC\\" + metadata_path.substr(2);
         else metadata_path = L"\\\\?\\" + metadata_path;
     }
+    std::vector<Config> result;
+    std::set<std::string> owned_extensions;
     const DWORD attributes = GetFileAttributesW(metadata_path.c_str());
     if (attributes == INVALID_FILE_ATTRIBUTES) {
         const DWORD error = GetLastError();
-        if (error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND) return {};
-        fail("cannot inspect .shgrep/lsp.json");
+        if (error != ERROR_FILE_NOT_FOUND && error != ERROR_PATH_NOT_FOUND) fail("cannot inspect .shgrep/lsp.json");
+        add_bundled(result, root, owned_extensions, context, true);
+        return result;
     }
     const SourceText file = read_source_text(context, utf8(path.wstring()));
     const J json = J::parse(file.text);
     const J* servers = json.get("servers");
     if (!servers) fail(".shgrep/lsp.json needs a servers array");
-    std::vector<Config> result;
-    std::set<std::string> owned_extensions;
     for (const auto& server : servers->array()) {
         Config config;
         config.root = root;
@@ -254,11 +358,18 @@ std::vector<Config> configs(const fs::path& root, const SearchContext& context) 
             }
         }
         if (const J* p = server.get("initialization_options")) config.initialization = *p;
+        config.indexes_workspace = flag(server, "indexes_workspace", false);
         if (const J* p = server.get("settings")) config.settings = *p;
         config.key = lower(utf8(root.wstring())) + ":" + file.sha256 + ":" + std::to_string(result.size());
         result.push_back(std::move(config));
     }
+    if (flag(json, "bundled", true)) add_bundled(result, root, owned_extensions, context, flag(json, "cmake_configure", true));
     return result;
+}
+std::vector<Config> configs(const fs::path& root, const SearchContext& context) {
+    try { return configs_from_disk(root, context); }
+    catch (const LspFailure&) { throw; }
+    catch (const std::exception& e) { throw LspFailure(std::string("language server configuration failed: ") + e.what()); }
 }
 std::optional<Config> configuration(const SourceText& source, const SearchContext& context) {
     const std::string ext = lower(utf8(source.path.extension().wstring()));
@@ -280,9 +391,9 @@ Position position(const J& j) {
 struct Range { Position start, end; };
 Range range(const J& j) {
     const J* s = j.get("start"), *e = j.get("end");
-    if (!s || !e) fail("missing LSP range");
+    if (!s || !e) server_fail("missing LSP range");
     Range r{position(*s), position(*e)};
-    if (r.end < r.start) fail("reversed LSP range");
+    if (r.end < r.start) server_fail("reversed LSP range");
     return r;
 }
 Position text_end(const std::string& text) {
@@ -372,7 +483,52 @@ bool file_glob(std::wstring pattern, std::wstring path, bool insensitive) {
     return match(0, 0);
 }
 
+// The .gitignore/.ignore and dot-name rules source walks apply, for one path the watcher reported.
+bool walk_skips(const fs::path& root, const fs::path& path) {
+    std::wstring prefix = root.lexically_normal().wstring();
+    const std::wstring full = path.lexically_normal().wstring();
+    if (!prefix.ends_with(L"\\")) prefix += L"\\";
+    if (full.size() <= prefix.size() || CompareStringOrdinal(full.data(), static_cast<int>(prefix.size()), prefix.data(),
+                                                              static_cast<int>(prefix.size()), TRUE) != CSTR_EQUAL) return true;
+    const std::wstring relative = full.substr(prefix.size());
+    std::shared_ptr<const IgnoreScope> scope;
+    std::wstring folder = prefix.substr(0, prefix.size() - 1);
+    std::string base;
+    for (size_t start = 0;;) {
+        const bool gitignore = GetFileAttributesW((folder + L"\\.gitignore").c_str()) != INVALID_FILE_ATTRIBUTES;
+        const bool dotignore = GetFileAttributesW((folder + L"\\.ignore").c_str()) != INVALID_FILE_ATTRIBUTES;
+        if (gitignore || dotignore) {
+            auto next = std::make_shared<IgnoreScope>();
+            next->parent = scope;
+            read_ignore_rules(folder, base, gitignore, dotignore, next->rules);
+            if (!next->rules.empty()) scope = std::move(next);
+        }
+        const size_t slash = relative.find(L'\\', start);
+        const std::wstring component = relative.substr(start, slash == std::wstring::npos ? std::wstring::npos : slash - start);
+        if (component.empty() || component.front() == L'.') return true;
+        const std::string child = base.empty() ? utf8(component) : base + "/" + utf8(component);
+        if (ignored_path(scope.get(), child, slash != std::wstring::npos)) return true;
+        if (slash == std::wstring::npos) return false;
+        folder += L"\\" + component;
+        base = child;
+        start = slash + 1;
+    }
+}
+// The identifier the request points at; rename and reference checks compare index ranges against it.
+std::string identifier_at(const std::string& text, Position at) {
+    const std::wstring w = wide(text);
+    const size_t i = offset(w, at);
+    auto word = [](wchar_t c) { return std::iswalnum(c) || c == L'_'; };
+    size_t begin = i, end = i;
+    while (begin > 0 && word(w[begin - 1])) --begin;
+    while (end < w.size() && word(w[end])) ++end;
+    std::string name = utf8(w.substr(begin, end - begin));
+    if (name.empty() || std::isdigit(static_cast<unsigned char>(name.front()))) return {};
+    return name;
+}
 class Session {
+    // Every failure inside a session is the server's, not the caller's.
+    [[noreturn]] static void fail(const std::string& s) { throw LspFailure(s); }
     Handle input_, output_, process_, job_;
     std::thread reader_, writer_;
     std::mutex writer_mutex_;
@@ -381,7 +537,7 @@ class Session {
     std::condition_variable writer_ready_;
     std::string outgoing_;
     bool writer_stopping_ = false, write_done_ = true, write_ok_ = true;
-    std::mutex messages_mutex_;
+    mutable std::mutex messages_mutex_;
     std::condition_variable messages_ready_;
     std::deque<J> messages_;
     std::string reader_error_;
@@ -390,6 +546,21 @@ class Session {
     int64_t next_id_ = 0;
     J capabilities_ = J::Object{};
     int sync_kind_ = 0;
+    // rust-analyzer's experimental/serverStatus: answers before quiescence miss the not-yet-loaded project.
+    bool announces_status_ = false, status_seen_ = false, quiescent_ = true;  // status_seen_/quiescent_: messages_mutex_
+    // Work-done progress the server reports ($/progress), by token; messages_mutex_.
+    struct Progress { std::string title; int64_t percentage = -1; };
+    std::map<std::string, Progress> progress_;
+    Clock::time_point last_activity_{};  // server start, progress or a newly opened document; messages_mutex_
+    // indexes_workspace sessions: documents changed since the server indexed them stay open (pinned_); others
+    // opened for a request are closed again once more than kRecentDocuments are open (recent_, oldest first).
+    static constexpr size_t kRecentDocuments = 32;
+    // PERF: changed files stay open, but past this many the server is restarted to reread the tree instead, so a
+    //   bulk change (checkout, code generation) never leaves the workspace open in the server.
+    static constexpr size_t kPinnedDocuments = 256;
+    std::unique_ptr<DirectoryWatch> watch_;
+    std::set<std::wstring, PathLess> pinned_;
+    std::deque<std::wstring> recent_;
     struct Document { std::string hash, uri; int64_t version; Position end; };
     std::map<std::wstring, Document, PathLess> documents_;
 
@@ -436,6 +607,32 @@ class Session {
                 if (!read_exact(payload.data(), payload.size())) fail("language server closed a partial response");
                 J message = J::parse(payload);
                 if (!message.get("id")) {
+                    if (str(message, "method") == "$/progress") {
+                        const J* params = message.get("params");
+                        const J* value = params ? params->get("value") : nullptr;
+                        const J* token = params ? params->get("token") : nullptr;
+                        if (value && token && std::holds_alternative<J::Object>(value->value)) {
+                            const J* percentage = value->get("percentage");
+                            const int64_t percent = percentage && std::holds_alternative<int64_t>(percentage->value) ? percentage->integer() : -1;
+                            const std::string kind = str(*value, "kind"), key = token->dump();
+                            std::lock_guard lock(messages_mutex_);
+                            if (kind == "begin") progress_[key] = Progress{str(*value, "title"), percent};
+                            else if (kind == "report") { if (auto it = progress_.find(key); it != progress_.end() && percent >= 0) it->second.percentage = percent; }
+                            else if (kind == "end") progress_.erase(key);
+                            last_activity_ = Clock::now();
+                            messages_ready_.notify_all();
+                        }
+                        continue;
+                    }
+                    if (str(message, "method") == "experimental/serverStatus") {
+                        if (const J* params = message.get("params")) {
+                            std::lock_guard lock(messages_mutex_);
+                            status_seen_ = true;
+                            quiescent_ = flag(*params, "quiescent", true);
+                            messages_ready_.notify_all();
+                        }
+                        continue;
+                    }
                     if (str(message, "method") == "textDocument/publishDiagnostics") {
                         if (const J* params = message.get("params")) {
                             std::lock_guard lock(messages_mutex_);
@@ -568,6 +765,8 @@ public:
         documents_.clear();
         std::lock_guard lock(messages_mutex_);
         messages_.clear(); reader_error_.clear(); published_diagnostics_.clear();
+        status_seen_ = false; quiescent_ = true; announces_status_ = false; progress_.clear();
+        watch_.reset(); pinned_.clear(); recent_.clear();
         { std::lock_guard registrations_lock(registrations_mutex_); registrations_.clear(); }
         capabilities_ = J::Object{};
     }
@@ -595,7 +794,11 @@ public:
                         control.check();
                         break;
                     }
-                    fail("language server " + method + ": " + error->dump());
+                    // CONTRACT: an error reply means the server works and declines this request (clangd will not rename
+                    //   a macro, a method is unsupported): a plain error the caller can act on. Only an internal error
+                    //   (-32603) says the server itself broke, which is an LspFailure with the relay banner.
+                    if (number(*error, "code", -32603) == -32603) fail("language server " + method + ": " + error->dump());
+                    throw std::runtime_error("language server declined " + method + ": " + str(*error, "message", error->dump()));
                 }
                 const J* result = message.get("result");
                 if (!result) fail("invalid LSP response to " + method);
@@ -608,6 +811,13 @@ public:
     }
     void start(const Control& control) {
         if (process_.h) return;
+        // The watch starts before the server reads the tree, so no change made meanwhile is missed.
+        if (config.indexes_workspace) watch_ = std::make_unique<DirectoryWatch>(config.root);
+        for (const auto& directory : config.state_directories) {
+            std::error_code error;
+            fs::create_directories(directory, error);
+            if (error) fail("cannot create language server state folder " + utf8(directory.wstring()) + ": " + error.message());
+        }
         SECURITY_ATTRIBUTES security{sizeof(SECURITY_ATTRIBUTES), nullptr, TRUE};
         Handle child_input, child_output, child_error;
         HANDLE a = nullptr, b = nullptr;
@@ -692,18 +902,23 @@ public:
                     {"publishDiagnostics", J::Object{{"versionSupport", true}, {"relatedInformation", true}}},
                     {"diagnostic", J::Object{{"dynamicRegistration", false}, {"relatedDocumentSupport", false}}},
                     {"synchronization", J::Object{{"dynamicRegistration", false}, {"didSave", true}}}
-                }}
+                }},
+                {"experimental", J::Object{{"serverStatusNotification", true}}},
+                {"window", J::Object{{"workDoneProgress", true}}}
             }}
         }, control);
         const J* capabilities = initialize.get("capabilities");
         if (!capabilities) fail("language server initialize response has no capabilities");
         capabilities_ = *capabilities;
+        if (const J* info = initialize.get("serverInfo"); info && std::holds_alternative<J::Object>(info->value))
+            announces_status_ = str(*info, "name").find("rust-analyzer") != std::string::npos;
         if (str(capabilities_, "positionEncoding", "utf-16") != "utf-16") fail("language server did not negotiate UTF-16 positions");
         const J* sync = capabilities_.get("textDocumentSync");
         sync_kind_ = sync ? static_cast<int>(std::holds_alternative<int64_t>(sync->value) ? sync->integer() : number(*sync, "change", 0)) : 0;
         if (sync_kind_ != 1 && sync_kind_ != 2) fail("language server does not support live document synchronization");
         notify("initialized", J::Object{}, control);
         notify("workspace/didChangeConfiguration", J::Object{{"settings", config.settings}}, control);
+        { std::lock_guard lock(messages_mutex_); last_activity_ = Clock::now(); }
     }
     void require(const char* capability) const {
         if (!supports(capability)) fail(std::string("language server lacks ") + capability);
@@ -725,7 +940,7 @@ public:
         for (const auto& [id, entry] : registrations_) { (void)id; if (entry.first == method) return true; }
         return false;
     }
-    void service_pending(const Control& control) {
+    void drain(const Control& control) {
         for (;;) {
             J message;
             {
@@ -734,6 +949,24 @@ public:
                 message = std::move(messages_.front()); messages_.pop_front();
             }
             if (message.get("method")) answer(message, control);
+        }
+    }
+    // CONTRACT: waits for a status-announcing server to finish loading, but stops 5 s short of the deadline and
+    //   proceeds, so a server that never settles still answers instead of timing out.
+    void service_pending(const Control& control) {
+        drain(control);
+        if (!announces_status_) return;
+        const auto give_up = control.deadline - std::chrono::seconds(5);
+        for (;;) {
+            {
+                std::unique_lock lock(messages_mutex_);
+                if (status_seen_ && quiescent_) return;
+                if (!reader_error_.empty()) fail(reader_error_);
+                if (Clock::now() >= give_up) return;
+                messages_ready_.wait_for(lock, std::chrono::milliseconds(50));
+            }
+            control.check();
+            drain(control);
         }
     }
     bool file_operation(const std::string& name, const fs::path& path, bool directory = false) const {
@@ -770,9 +1003,17 @@ public:
         std::lock_guard lock(registrations_mutex_);
         J::Array dynamic;
         for (const auto& [id, entry] : registrations_) { (void)id; dynamic.push_back(entry.first); }
-        return J::Object{{"language_id", config.language}, {"root", utf8(config.root.wstring())},
+        J::Object result{{"language_id", config.language}, {"root", utf8(config.root.wstring())},
                          {"capabilities", capabilities_}, {"dynamic_methods", std::move(dynamic)},
                          {"open_documents", static_cast<int64_t>(documents_.size())}};
+        if (std::holds_alternative<J::Object>(config.details.value))
+            for (const auto& [key, value] : config.details.object()) result.emplace(key, value);
+        if (config.indexes_workspace) {
+            std::lock_guard progress_lock(messages_mutex_);
+            const std::string busy = indexing_locked();
+            result.emplace("indexing", busy.empty() ? std::string("complete") : busy);
+        }
+        return result;
     }
     int64_t document_version(const SourceText& source) const {
         const auto it = documents_.find(source.path.wstring());
@@ -824,6 +1065,8 @@ public:
             {
                 std::lock_guard lock(messages_mutex_);
                 published_diagnostics_.erase(source.path.lexically_normal().make_preferred().wstring());
+                // Opening can start new server work (clangd loads the compile database on first open).
+                if (config.indexes_workspace) last_activity_ = Clock::now();
             }
             notify("textDocument/didOpen", J::Object{{"textDocument", J::Object{
                 {"uri", id}, {"languageId", config.language}, {"version", 1}, {"text", source.text}}}}, control);
@@ -845,6 +1088,7 @@ public:
         return 2;
     }
     void synchronize(const SourceText* primary, const SearchContext& context, const Control& control, bool save = false) {
+        if (config.indexes_workspace && watch_ && !watch_->failed()) { synchronize_changed(primary, context, control, save); return; }
         std::vector<std::string> paths = source_paths(context, utf8(config.root.wstring()), config.extensions, control.deadline, control.cancelled);
         paths.erase(std::remove_if(paths.begin(), paths.end(), [&](const auto& path) {
             return path_excluded(config, fs::path(wide(path)));
@@ -903,6 +1147,157 @@ public:
         }
         if (!changes.empty()) notify("workspace/didChangeWatchedFiles", J::Object{{"changes", std::move(changes)}}, control);
     }
+    bool is_open(const SourceText& source) const { return documents_.contains(source.path.wstring()); }
+    // indexes_workspace: keeps the server's answers current without opening the workspace. Files Windows reported as
+    // changed are opened and stay open; open documents are rechecked; the server reads everything else from disk.
+    void synchronize_changed(const SourceText* primary, const SearchContext& context, const Control& control, bool save) {
+        std::vector<fs::path> changed;
+        bool reload = false;
+        watch_->take(changed, reload);
+        if (!reload) {
+            const size_t relevant = static_cast<size_t>(std::count_if(changed.begin(), changed.end(), [&](const fs::path& path) {
+                const std::string extension = lower(utf8(path.extension().wstring()));
+                return std::find(config.extensions.begin(), config.extensions.end(), extension) != config.extensions.end();
+            }));
+            reload = pinned_.size() + relevant > kPinnedDocuments;
+        }
+        if (reload) {
+            // SAFETY: some changes are unknown, so the server's index may be stale; a restart makes it reread the tree.
+            stop();
+            start(control);
+            changed.clear();
+            if (!watch_ || watch_->failed()) { synchronize(primary, context, control, save); return; }
+        }
+        J::Array events;
+        auto publish = [&](const SourceText& source, int type) {
+            if (!type) return;
+            if (save) saved(source, control);
+            if (save && type == 1 && file_operation("didCreate", source.path))
+                notify("workspace/didCreateFiles", J::Object{{"files", J::Array{J::Object{{"uri", uri(source.path)}}}}}, control);
+        };
+        auto read = [&](const std::wstring& path, bool& removed) -> std::optional<SourceText> {
+            removed = false;
+            try { return read_source_text(context, utf8(path)); }
+            catch (const std::exception& e) { removed = std::string(e.what()).find(": not found") != std::string::npos; }
+            return std::nullopt;
+        };
+        std::set<std::wstring, PathLess> seen;
+        for (const auto& path : changed) {
+            control.check();
+            const std::string extension = lower(utf8(path.extension().wstring()));
+            if (std::find(config.extensions.begin(), config.extensions.end(), extension) == config.extensions.end()) continue;
+            const std::wstring key = path.lexically_normal().wstring();
+            if (!seen.insert(key).second) continue;
+            if (!documents_.contains(key) && (path_excluded(config, path) || walk_skips(config.root, path))) continue;
+            bool removed = false;
+            const auto source = read(key, removed);
+            if (!source) {
+                // Deleted, a folder now, or legacy-encoded: the server must not keep answering from old bytes.
+                close_document(key, control);
+                pinned_.erase(key);
+                if (removed) events.push_back(J::Object{{"uri", uri(path)}, {"type", 3}});
+                continue;
+            }
+            pinned_.insert(source->path.wstring());
+            publish(*source, sync_one(*source, control));
+            events.push_back(J::Object{{"uri", uri(source->path)}, {"type", 2}});
+        }
+        // Open documents can change before their report arrives, e.g. a write that is still in flight.
+        for (auto it = documents_.begin(); it != documents_.end();) {
+            control.check();
+            const std::wstring key = it->first;
+            ++it;  // sync_one never inserts or erases an existing document; close_document erases only key
+            if (seen.contains(key)) continue;
+            bool removed = false;
+            const auto current = read(key, removed);
+            if (!current) {
+                close_document(key, control);
+                pinned_.erase(key);
+                if (removed) events.push_back(J::Object{{"uri", uri(fs::path(key))}, {"type", 3}});
+                continue;
+            }
+            const int type = sync_one(*current, control);
+            if (type) { pinned_.insert(current->path.wstring()); publish(*current, type); }
+        }
+        if (primary) {
+            if (save) pinned_.insert(primary->path.wstring());
+            publish(*primary, sync_one(*primary, control));
+            touch(primary->path.wstring());
+        }
+        evict(control);
+        if (!events.empty()) notify("workspace/didChangeWatchedFiles", J::Object{{"changes", std::move(events)}}, control);
+    }
+    void close_document(const std::wstring& key, const Control& control) {
+        const auto it = documents_.find(key);
+        if (it == documents_.end()) return;
+        notify("textDocument/didClose", J::Object{{"textDocument", J::Object{{"uri", it->second.uri}}}}, control);
+        { std::lock_guard lock(messages_mutex_); published_diagnostics_.erase(it->first); }
+        documents_.erase(it);
+    }
+    // Opens (or updates) a file a request reads; in indexes_workspace sessions it is closed again by evict().
+    void use(const SourceText& source, const Control& control) {
+        sync_one(source, control);
+        if (config.indexes_workspace) { touch(source.path.wstring()); evict(control); }
+    }
+    // A file shgrep just wrote: the server must see these bytes now, not when the watcher reports them.
+    void pin(const SourceText& source, const Control& control) {
+        if (pinned_.size() >= kPinnedDocuments && !pinned_.contains(source.path.wstring())) {
+            // The next synchronize restarts the server, which then reads these bytes from disk.
+            use(source, control);
+            return;
+        }
+        pinned_.insert(source.path.wstring());
+        std::erase_if(recent_, [&](const std::wstring& item) { return !PathLess{}(item, source.path.wstring()) && !PathLess{}(source.path.wstring(), item); });
+        sync_one(source, control);
+    }
+    void touch(const std::wstring& key) {
+        if (pinned_.contains(key)) return;
+        std::erase_if(recent_, [&](const std::wstring& item) { return !PathLess{}(item, key) && !PathLess{}(key, item); });
+        recent_.push_back(key);
+    }
+    void evict(const Control& control) {
+        while (recent_.size() > kRecentDocuments) {
+            const std::wstring key = recent_.front();
+            recent_.pop_front();
+            if (!pinned_.contains(key)) close_document(key, control);
+        }
+    }
+    // CONTRACT: messages_mutex_ held. Empty once the server's index covers the workspace, else what it is doing.
+    std::string indexing_locked() const {
+        if (announces_status_) return status_seen_ && quiescent_ ? "" : "loading the project";
+        for (const auto& [token, progress] : progress_) {
+            (void)token;
+            // Diagnostics and checks (cargo check, workspace diagnosis) do not change what the index knows.
+            const std::string title = lower(progress.title);
+            if (title.find("diagnos") != std::string::npos || title.find("check") != std::string::npos ||
+                title.find("lint") != std::string::npos) continue;
+            return (progress.title.empty() ? std::string("working") : progress.title) +
+                   (progress.percentage >= 0 ? " " + std::to_string(progress.percentage) + "%" : "");
+        }
+        // Servers announce indexing a moment after starting or opening a file; quiet means settled.
+        if (Clock::now() - last_activity_ < std::chrono::seconds(1)) return "starting";
+        return {};
+    }
+    // CONTRACT: cross-file answers come from the server's index, so they wait until it covers the whole workspace.
+    //   Near the deadline the request fails with a retry hint rather than returning partial results.
+    void wait_indexed(const Control& control) {
+        if (!config.indexes_workspace) return;
+        const auto give_up = control.deadline - std::chrono::seconds(2);
+        for (;;) {
+            {
+                std::unique_lock lock(messages_mutex_);
+                if (!reader_error_.empty()) fail(reader_error_);
+                const std::string busy = indexing_locked();
+                if (busy.empty()) return;
+                if (Clock::now() >= give_up)
+                    fail("language server is still indexing the workspace (" + busy +
+                         "); results would be incomplete, so retry shortly or pass a larger timeout_ms");
+                messages_ready_.wait_for(lock, std::chrono::milliseconds(50));
+            }
+            control.check();
+            drain(control);
+        }
+    }
     std::string document_uri(const SourceText& source) const {
         const auto it = documents_.find(source.path.wstring());
         if (it == documents_.end()) fail("file has not been synchronized with the language server");
@@ -930,6 +1325,13 @@ std::shared_ptr<Session> session_for(const Config& config) {
     }
     auto session = std::make_shared<Session>(config);
     registry.emplace(config.key, session); return session;
+}
+// PERF: workspace-wide status, restart and directory moves start a bundled server only when it already runs or
+//   the root holds a file it serves, so a Lua workspace never launches clangd.
+bool worth_starting(const Config& config, const SearchContext& context, const Control& control) {
+    if (!config.bundled) return true;
+    { std::lock_guard lock(registry_mutex); if (registry.contains(config.key)) return true; }
+    return !source_paths(context, utf8(config.root.wstring()), config.extensions, control.deadline, control.cancelled).empty();
 }
 
 struct Symbol {
@@ -971,7 +1373,7 @@ void flatten(const J& items, const std::string& parent, int depth, std::vector<S
                       number(item, "kind", 0), range(*extent),
                       range(selection ? *selection : *extent), depth, hierarchical};
         if (symbol.selection.start < symbol.extent.start || symbol.extent.end < symbol.selection.end)
-            fail("language server returned a selection outside its symbol range");
+            server_fail("language server returned a selection outside its symbol range");
         result.push_back(symbol);
         if (const J* children = item.get("children")) flatten(*children, symbol.name_path, depth + 1, result, language);
     }
@@ -1026,7 +1428,7 @@ J symbol_json(const Symbol& symbol, const SourceText& source, bool include_body)
                    {"line", symbol.selection.start.line + 1}, {"column", symbol.selection.start.column + 1},
                    {"range", coordinates(symbol.extent)}, {"selection_range", coordinates(symbol.selection)}, {"body_available", symbol.has_body}};
     if (include_body) {
-        if (!symbol.has_body) fail("language server returned flat SymbolInformation without a reliable symbol-body range");
+        if (!symbol.has_body) server_fail("language server returned flat SymbolInformation without a reliable symbol-body range");
         out.emplace("body", body(source, symbol.extent));
     }
     return out;
@@ -1054,13 +1456,13 @@ J query_file(const std::string& operation, const J& args, const SourceText& orig
     try {
         session->start(control);
         if (synchronized.insert(config.key).second) session->synchronize(&original, context, control);
-        else session->sync_one(original, control);
+        else session->use(original, control);
         session->service_pending(control);
         const SourceText source = read_source_text(context, utf8(original.path.wstring()));
         session->assert_current(source);
         const std::string pattern = str(args, "name_path", str(args, "pattern"));
         J::Array results;
-        int64_t outside = 0, stale = 0, ignored = 0;
+        int64_t outside = 0, stale = 0, ignored = 0, owners_omitted = 0;
         if (operation == "status" || operation == "restart") {
             if (operation == "restart") { session->stop(); session->start(control); session->synchronize(&source, context, control); }
             return session->status();
@@ -1102,7 +1504,7 @@ J query_file(const std::string& operation, const J& args, const SourceText& orig
         }
         if (operation == "symbols" || operation == "overview") {
             const auto found = symbols(*session, source, control);
-            const int64_t depth = number(args, "depth", 0);
+            const int64_t depth = number(args, "depth", operation == "overview" ? -1 : 0);
             if (depth < -1) fail("depth must be -1 or greater");
             if (flag(args, "require_unique")) {
                 results.push_back(symbol_json(unique(found, pattern), source, flag(args, "include_body")));
@@ -1173,6 +1575,9 @@ J query_file(const std::string& operation, const J& args, const SourceText& orig
             const auto method = operations.find(operation);
             if (method == operations.end()) fail("unknown LSP navigation operation");
             session->require(method->second.first);
+            if (operation != "hover") session->wait_indexed(control);
+            // Index answers for unopened files are checked against current bytes: each reference must still spell it.
+            const std::string expected = references ? identifier_at(source.text, at) : std::string{};
             J::Object params{{"textDocument", J::Object{{"uri", session->document_uri(source)}}}, {"position", at.json()}};
             if (references) params.emplace("context", J::Object{{"includeDeclaration", flag(args, "include_declaration")}});
             J raw = session->request(method->second.second, std::move(params), control);
@@ -1185,12 +1590,14 @@ J query_file(const std::string& operation, const J& args, const SourceText& orig
             else if (!std::holds_alternative<std::nullptr_t>(raw.value)) locations.push_back(raw);
             std::map<std::wstring, std::set<std::string>, PathLess> dedup;
             std::map<std::wstring, std::vector<Symbol>, PathLess> owners;
+            constexpr size_t kOwnerFiles = 16;  // unopened files opened per request to name enclosing symbols
+            size_t opened_for_owners = 0;
             for (const auto& location : locations) {
                 control.check();
                 const bool link = location.get("targetUri") != nullptr;
                 const std::string id = str(location, link ? "targetUri" : "uri");
                 const J* raw_range = location.get(link ? "targetSelectionRange" : "range");
-                if (!raw_range) fail("language server returned a location without a range");
+                if (!raw_range) server_fail("language server returned a location without a range");
                 const Range found = range(*raw_range);
                 SourceText target;
                 try {
@@ -1210,17 +1617,27 @@ J query_file(const std::string& operation, const J& args, const SourceText& orig
                 // Other configured languages are readable, but their bodies are never taken from an old server buffer.
                 const auto target_config = configuration(target, context);
                 if (target_config && path_excluded(*target_config, target.path)) { ++ignored; continue; }
-                if (target_config && target_config->key == config.key && !session->has_document(target)) {
-                    ++ignored;
-                    continue;
+                const bool same_server = target_config && target_config->key == config.key;
+                bool from_index = false;
+                if (same_server && !session->has_document(target)) {
+                    // A server without its own index only knows open documents; anything else is a leftover.
+                    if (!config.indexes_workspace || session->is_open(target)) { ++ignored; continue; }
+                    from_index = true;
                 }
-                if (target_config && target_config->key == config.key) session->assert_current(target);
+                if (same_server && !from_index) session->assert_current(target);
                 offset(wide(target.text), found.start);
                 offset(wide(target.text), found.end);
+                if (from_index && !expected.empty() && body(target, Range{found.start, found.end}) != expected) { ++stale; continue; }
                 J::Object result{{"path", shown_path(target)}, {"line", found.start.line + 1},
                                   {"column", found.start.column + 1}, {"range", coordinates(found)}};
                 if (references) result.emplace("reference_name", body(target, Range{found.start, found.end}));
-                if (session->supports("documentSymbolProvider") && target_config && target_config->key == config.key) {
+                const bool owner_known = owners.contains(target.path.wstring());
+                if (from_index && !owner_known && session->supports("documentSymbolProvider")) {
+                    // Enclosing symbols need the document open; a bounded number per request keeps parsing cheap.
+                    if (opened_for_owners < kOwnerFiles) { session->use(target, control); ++opened_for_owners; }
+                    else ++owners_omitted;
+                }
+                if (session->supports("documentSymbolProvider") && same_server && (owner_known || session->is_open(target))) {
                     auto owner = owners.find(target.path.wstring());
                     if (owner == owners.end()) owner = owners.emplace(target.path.wstring(), symbols(*session, target, control)).first;
                     const Symbol* enclosing = nullptr;
@@ -1250,14 +1667,40 @@ J query_file(const std::string& operation, const J& args, const SourceText& orig
         }
         if (read_source_text(context, utf8(source.path.wstring())).sha256 != source.sha256)
             fail("source changed during LSP navigation; retry");
-        return J::Object{{"path", shown_path(source)}, {"sha256", source.sha256}, {"mtime", source.mtime}, {"results", std::move(results)},
-                          {"outside_roots", outside}, {"stale_locations", stale}, {"ignored_locations", ignored}, {"backend", "lsp"}};
+        J::Object response{{"path", shown_path(source)}, {"sha256", source.sha256}, {"mtime", source.mtime}, {"results", std::move(results)},
+                           {"outside_roots", outside}, {"stale_locations", stale}, {"ignored_locations", ignored}, {"backend", "lsp"}};
+        if (owners_omitted) response.emplace("symbols_omitted", owners_omitted);  // enclosing symbol left out for these
+        return response;
     } catch (...) {
         session->stop();
         throw;
     }
 }
+// Last name-path components a symbol search looks for, without overload index; empty when any symbol may match.
+std::vector<std::string> symbol_names(const J& args) {
+    std::vector<std::string> names;
+    if (const J* list = args.get("patterns")) for (const auto& item : list->array()) names.push_back(item.string());
+    else names.push_back(str(args, "name_path", str(args, "pattern")));
+    for (auto& name : names) {
+        if (const size_t slash = name.rfind('/'); slash != std::string::npos) name = name.substr(slash + 1);
+        if (const size_t bracket = name.find('['); bracket != std::string::npos) name.resize(bracket);
+        // C++ qualifies out-of-line definitions (Foo::bar); the declaration in the class says only bar.
+        if (const size_t colons = name.rfind("::"); colons != std::string::npos) name = name.substr(colons + 2);
+        if (name.empty()) return {};
+    }
+    return names;
+}
+bool contains_folded(std::string_view text, std::string_view needle) {
+    if (needle.empty()) return true;
+    const auto fold = [](char c) { return static_cast<char>(std::tolower(static_cast<unsigned char>(c))); };
+    return std::search(text.begin(), text.end(), needle.begin(), needle.end(),
+                       [&](char a, char b) { return fold(a) == fold(b); }) != text.end();
+}
 } // namespace
+
+std::string lsp_failure_banner(const std::string& detail, const std::string& fallback) {
+    return "[LSP FAILURE - tell the user about this in your next message, before continuing: " + detail + ". " + fallback + "]\n";
+}
 
 std::shared_timed_mutex& workspace_operation_mutex() {
     static std::shared_timed_mutex mutex;
@@ -1272,7 +1715,7 @@ Json lsp_query(const std::string& operation, const Json& arguments, const Search
                const std::shared_ptr<std::atomic_bool>& cancelled) {
     const int64_t timeout = number(arguments, "timeout_ms", 30000);
     if (timeout < 1 || timeout > 300000) fail("timeout_ms must be 1-300000");
-    const Control control{Clock::now() + std::chrono::milliseconds(timeout), cancelled};
+    const Control control{request_deadline(Clock::now() + std::chrono::milliseconds(timeout)), cancelled};
     std::set<std::string> synchronized;
     const bool symbol_query = operation == "symbols" || operation == "overview";
     if (operation == "files")
@@ -1304,7 +1747,7 @@ Json lsp_query(const std::string& operation, const Json& arguments, const Search
         if (!directory) {
             const SourceText source = read_source_text(context, path);
             const auto config = configuration(source, context);
-            if (!config) fail("no LSP server configured for this file in .shgrep/lsp.json; use operation: text");
+            if (!config) fail("no language server for this file type (install the bundled ones with tools/fetch_lsp.py or add one to .shgrep/lsp.json); use operation: text");
             return query_file(operation, arguments, source, *config, context, control, synchronized);
         }
     }
@@ -1326,6 +1769,7 @@ Json lsp_query(const std::string& operation, const Json& arguments, const Search
         const auto configured = configs(absolute, context);
         if (operation == "status" || operation == "restart") {
             for (const auto& config : configured) {
+                if (!worth_starting(config, context, control)) continue;
                 auto session = session_for(config);
                 std::unique_lock<std::timed_mutex> lock(session->mutex, std::defer_lock);
                 while (!lock.try_lock_for(std::chrono::milliseconds(10))) control.check();
@@ -1345,9 +1789,19 @@ Json lsp_query(const std::string& operation, const Json& arguments, const Search
             extensions.insert(extensions.end(), config.extensions.begin(), config.extensions.end());
         if (extensions.empty()) continue;
         const auto paths = source_paths(context, utf8(absolute.wstring()), extensions, control.deadline, cancelled);
+        // PERF: a workspace-wide symbol search opens a file in an indexing server only when one of the names occurs in
+        //   its text (ASCII case folded); a symbol's name always appears where it is declared or defined, so this
+        //   drops nothing, unlike workspace/symbol, which names one location per symbol and may cap its results.
+        const std::vector<std::string> names = operation == "symbols" ? symbol_names(arguments) : std::vector<std::string>{};
         for (const auto& file : paths) {
             control.check();
-            SourceText source = operation == "files" ? source_descriptor(context, file) : read_source_text(context, file);
+            SourceText source;
+            try { source = operation == "files" ? source_descriptor(context, file) : read_source_text(context, file); }
+            catch (const std::exception& e) {
+                // Same rule as Session::synchronize: legacy-encoded files stay out of LSP results.
+                if (std::string(e.what()).ends_with(" is not valid Unicode source text")) continue;
+                throw;
+            }
             if (scope && !below(source.path, scope->path) &&
                 (PathLess{}(source.path.wstring(), scope->path.wstring()) || PathLess{}(scope->path.wstring(), source.path.wstring()))) continue;
             if (!scanned.insert(source.path.wstring()).second) continue;
@@ -1355,6 +1809,11 @@ Json lsp_query(const std::string& operation, const Json& arguments, const Search
             if (!config || path_excluded(*config, source.path)) continue;
             if (operation == "files") {
                 results.push_back(J::Object{{"path", shown_path(source)}, {"root", utf8(source.root.wstring())}, {"language_id", config->language}});
+                continue;
+            }
+            if (config->indexes_workspace && !names.empty() &&
+                std::none_of(names.begin(), names.end(), [&](const std::string& name) { return contains_folded(source.text, name); })) {
+                synchronized.insert(config->key);  // a search with no hits is an empty result, not "no source files"
                 continue;
             }
             J::Object per_file = arguments.object();
@@ -1367,7 +1826,7 @@ Json lsp_query(const std::string& operation, const Json& arguments, const Search
             }
         }
     }
-    if (operation != "files" && synchronized.empty() && !scope) fail("no LSP source files found; configure .shgrep/lsp.json or use operation: text");
+    if (operation != "files" && synchronized.empty() && !scope) fail("no LSP source files found; install the bundled servers with tools/fetch_lsp.py, add one to .shgrep/lsp.json, or use operation: text");
     return J::Object{{"results", std::move(results)}, {"backend", "lsp"}};
 }
 
@@ -1388,16 +1847,104 @@ std::string newlines(const std::string& text, const std::string& reference) {
     }
     return out;
 }
+// CONTRACT: a language server renames only what it understands: one language, never strings, comments, FFI
+//   declarations or build files. The old name is looked up as a whole word in the workspace's other text files,
+//   and the ones the rename leaves alone are listed so a cross-language use (a Rust extern for a C function) is not
+//   missed. Best effort: it stops at the request's deadline and says so.
+std::string rename_leftovers(const std::string& old_name, const std::vector<SourceChange>& changes, const fs::path& root,
+                             const SearchContext& context, const Control& control) {
+    if (old_name.empty()) return {};
+    static const std::vector<std::string> kinds{
+        ".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".hxx", ".inl", ".ipp", ".rs", ".py", ".pyi", ".lua", ".xml",
+        ".json", ".toml", ".yaml", ".yml", ".js", ".ts", ".cs", ".go", ".java", ".kt", ".swift", ".m", ".mm", ".def",
+        ".idl", ".cmake", ".txt", ".md", ".bat", ".ps1", ".sh"};
+    std::set<std::wstring, PathLess> changed;
+    for (const auto& change : changes) changed.insert(change.before.path.wstring());
+    const auto word = [](unsigned char c) { return std::isalnum(c) || c == '_' || c >= 0x80; };
+    // Vendored code and comments mention common words ("helper") all the time; neither is a use the rename missed.
+    static const std::set<std::string> vendored{"libs", "third_party", "thirdparty", "3rdparty", "vendor",
+                                                "external", "extern", "deps", "node_modules", "target"};
+    const auto vendored_path = [&](const SourceText& text) {
+        const std::string shown = lower(shown_path(text));
+        size_t start = 0;
+        for (size_t slash = shown.find_first_of("/\\"); slash != std::string::npos; slash = shown.find_first_of("/\\", start)) {
+            if (vendored.contains(shown.substr(start, slash - start))) return true;
+            start = slash + 1;
+        }
+        return false;
+    };
+    const auto in_comment = [](std::string_view before, const std::string& extension) {
+        const size_t first = before.find_first_not_of(" \t");
+        const std::string_view lead = first == std::string_view::npos ? std::string_view{} : before.substr(first);
+        const bool hash_comments = extension == ".py" || extension == ".pyi" || extension == ".toml" || extension == ".yaml" ||
+                                   extension == ".yml" || extension == ".sh" || extension == ".ps1" || extension == ".cmake";
+        return before.find("//") != std::string_view::npos || before.find("/*") != std::string_view::npos ||
+               lead.starts_with("* ") || lead == "*" || lead.starts_with("--") || lead.starts_with("<!--") ||
+               (hash_comments && before.find('#') != std::string_view::npos);
+    };
+    std::vector<std::string> hits;
+    size_t files = 0, total = 0;
+    bool partial = false;
+    try {
+        for (const auto& path : source_paths(context, utf8(root.wstring()), kinds, control.deadline, control.cancelled)) {
+            if (Clock::now() >= control.deadline) { partial = true; break; }
+            SourceText text;
+            try { text = read_source_text(context, path); }
+            catch (const std::exception&) { continue; }  // legacy-encoded or too large: not searched
+            if (changed.contains(text.path.wstring()) || vendored_path(text)) continue;
+            const std::string extension = lower(utf8(text.path.extension().wstring()));
+            bool counted = false;
+            uint64_t line = 1;
+            size_t line_start = 0, scanned = 0;
+            for (size_t at = text.text.find(old_name); at != std::string::npos; at = text.text.find(old_name, at + 1)) {
+                const size_t end = at + old_name.size();
+                if ((at > 0 && word(static_cast<unsigned char>(text.text[at - 1]))) ||
+                    (end < text.text.size() && word(static_cast<unsigned char>(text.text[end])))) continue;
+                for (; scanned < at; ++scanned) if (text.text[scanned] == '\n') { ++line; line_start = scanned + 1; }
+                if (in_comment(std::string_view(text.text).substr(line_start, at - line_start), extension)) continue;
+                if (!counted) { ++files; counted = true; }
+                ++total;
+                if (hits.size() < 10) {
+                    const size_t line_end = text.text.find_first_of("\r\n", at);
+                    std::string shown = text.text.substr(line_start, (line_end == std::string::npos ? text.text.size() : line_end) - line_start);
+                    const size_t first = shown.find_first_not_of(" \t");
+                    shown = first == std::string::npos ? std::string{} : shown.substr(first, 160);
+                    hits.push_back("  " + shown_path(text) + ":" + std::to_string(line) + ": " + shown);
+                }
+            }
+        }
+    } catch (const std::exception&) { partial = true; }
+    if (!total && !partial) return {};
+    std::string out = "[warning: " + std::to_string(total) + " whole-word mention" + (total == 1 ? "" : "s") + " of " + old_name +
+                      " in " + std::to_string(files) + " file" + (files == 1 ? "" : "s") + " the rename does not change (other "
+                      "languages, FFI, strings, build files; comments and vendored folders skipped); check them by hand" +
+                      (partial ? "; the search stopped at the deadline, so there may be more" : "") + "]\n";
+    for (const auto& hit : hits) out += hit + "\n";
+    if (total > hits.size()) out += "  ... " + std::to_string(total - hits.size()) + " more\n";
+    return out;
+}
+
+// After a multi-file write, before the watcher reports it, so the next request already sees the new bytes.
+void resync_written(Session& session, const std::vector<SourceChange>& changes, const SearchContext& context, const Control& control) {
+    for (const auto& change : changes) {
+        try { session.pin(read_source_text(context, utf8(change.before.path.wstring())), control); }
+        catch (const std::exception&) {}  // e.g. legacy-encoded now; the watcher's report closes it
+    }
+}
+// CONTRACT: in indexes_workspace sessions, edits may target files the server only knows from its index. Those are
+//   accepted when every replaced range still spells old_name (rename) or, without old_name, on the watcher's word
+//   that the file is unchanged since the server read it.
 std::vector<SourceChange> workspace_changes(Session& session, const J& edit, const Config& config,
-                                           const SearchContext& context, const Control& control) {
-    if (std::holds_alternative<std::nullptr_t>(edit.value)) fail("language server returned no workspace edit");
-    if (edit.get("changes") && edit.get("documentChanges")) fail("ambiguous workspace edit: changes and documentChanges");
+                                           const SearchContext& context, const Control& control,
+                                           const std::string& old_name = {}) {
+    if (std::holds_alternative<std::nullptr_t>(edit.value)) server_fail("language server returned no workspace edit");
+    if (edit.get("changes") && edit.get("documentChanges")) server_fail("ambiguous workspace edit: changes and documentChanges");
     if (const J* annotations = edit.get("changeAnnotations"))
         for (const auto& [id, annotation] : annotations->object()) {
             (void)id;
             if (flag(annotation, "needsConfirmation")) fail("workspace edit requires an unsupported change confirmation; nothing written");
         }
-    struct Entry { SourceText source; std::vector<J> edits; };
+    struct Entry { SourceText source; std::vector<J> edits; bool from_index = false; };
     std::map<std::wstring, Entry, PathLess> entries;
     auto add = [&](const std::string& id, const J& edits, const J* version) {
         control.check();
@@ -1405,10 +1952,15 @@ std::vector<SourceChange> workspace_changes(Session& session, const J& edit, con
         if (path_excluded(config, path))
             fail("language server workspace edit targets ignored_paths; nothing written");
         SourceText source = read_source_text(context, utf8(path.wstring()));
-        session.assert_current(source);
-        if (version && !std::holds_alternative<std::nullptr_t>(version->value) &&
-            version->integer() != session.document_version(source)) fail("stale workspace edit document version");
-        auto [it, inserted] = entries.try_emplace(source.path.wstring(), Entry{source, {}});
+        const bool from_index = session.config.indexes_workspace && !session.is_open(source);
+        const bool versioned = version && !std::holds_alternative<std::nullptr_t>(version->value);
+        if (from_index) {
+            if (versioned) fail("stale workspace edit document version");
+        } else {
+            session.assert_current(source);
+            if (versioned && version->integer() != session.document_version(source)) fail("stale workspace edit document version");
+        }
+        auto [it, inserted] = entries.try_emplace(source.path.wstring(), Entry{source, {}, from_index});
         if (!inserted && it->second.source.sha256 != source.sha256) fail("workspace edit source changed during planning");
         for (const auto& item : edits.array()) it->second.edits.push_back(item);
     };
@@ -1429,8 +1981,12 @@ std::vector<SourceChange> workspace_changes(Session& session, const J& edit, con
         std::wstring text = wide(entry.source.text);
         for (const auto& item : entry.edits) {
             const J* extent = item.get("range"), *replacement = item.get("newText");
-            if (!extent || !replacement) fail("invalid LSP TextEdit");
+            if (!extent || !replacement) server_fail("invalid LSP TextEdit");
             const Range r = range(*extent);
+            if (entry.from_index && !old_name.empty() &&
+                text.substr(offset(text, r.start), offset(text, r.end) - offset(text, r.start)) != wide(old_name))
+                fail("the language server's index is out of date for " + utf8(entry.source.path.wstring()) +
+                     "; nothing written, retry once it has caught up");
             replacements.push_back({offset(text, r.start), offset(text, r.end), replacements.size(),
                                     wide(newlines(replacement->string(), entry.source.text))});
         }
@@ -1442,7 +1998,7 @@ std::vector<SourceChange> workspace_changes(Session& session, const J& edit, con
         size_t boundary = text.size() + 1;
         for (const auto& replacement : replacements) {
             if (replacement.end > boundary || (replacement.start == boundary && replacement.end > replacement.start))
-                fail("overlapping LSP TextEdits; nothing written");
+                server_fail("overlapping LSP TextEdits; nothing written");
             text.replace(replacement.start, replacement.end - replacement.start, replacement.text);
             boundary = replacement.start;
         }
@@ -1457,7 +2013,7 @@ Json lsp_edit(const Json& arguments, const SearchContext& context,
     if (context.read_only) fail("edit_file is disabled: --read-only");
     const int64_t timeout = number(arguments, "timeout_ms", 30000);
     if (timeout < 1 || timeout > 300000) fail("timeout_ms must be 1-300000");
-    const Control control{Clock::now() + std::chrono::milliseconds(timeout), cancelled};
+    const Control control{request_deadline(Clock::now() + std::chrono::milliseconds(timeout)), cancelled};
     const SourceText source = read_source_text(context, str(arguments, "path"));
     if (const J* expected = arguments.get("expected_sha256"))
         if (source.sha256 != lower(expected->string())) fail("expected_sha256 does not match current file");
@@ -1486,21 +2042,26 @@ Json lsp_edit(const Json& arguments, const SearchContext& context,
             at = {line - 1, column - 1}; offset(wide(source.text), at);
         }
         std::vector<SourceChange> changes;
+        std::string leftovers;
         if (operation == "rename") {
             const std::string new_name = str(arguments, "new_name");
             if (new_name.empty() || new_name.find('\0') != std::string::npos) fail("rename requires a nonempty new_name");
             session->require("renameProvider");
+            session->wait_indexed(control);
             J::Object params{{"textDocument", J::Object{{"uri", session->document_uri(source)}}}, {"position", at.json()}};
             if (session->prepare_rename()) {
                 const J prepared = session->request("textDocument/prepareRename", params, control);
                 if (std::holds_alternative<std::nullptr_t>(prepared.value)) fail("language server refuses rename at this position");
             }
             params.emplace("newName", new_name);
-            changes = workspace_changes(*session, session->request("textDocument/rename", std::move(params), control), *config, context, control);
+            changes = workspace_changes(*session, session->request("textDocument/rename", std::move(params), control), *config,
+                                        context, control, identifier_at(source.text, at));
+            leftovers = rename_leftovers(identifier_at(source.text, at), changes, source.root, context, control);
         } else {
             if (!selected || !selected->has_body) fail("symbol has no reliable editable definition range");
             if (operation == "safe_delete") {
                 session->require("referencesProvider");
+                session->wait_indexed(control);
                 const J references = session->request("textDocument/references", J::Object{
                     {"textDocument", J::Object{{"uri", session->document_uri(source)}}}, {"position", at.json()},
                     {"context", J::Object{{"includeDeclaration", false}}}}, control);
@@ -1521,6 +2082,29 @@ Json lsp_edit(const Json& arguments, const SearchContext& context,
             std::wstring text = wide(source.text);
             size_t begin = offset(text, selected->extent.start), end = offset(text, selected->extent.end);
             std::string replacement = operation == "safe_delete" ? "" : str(arguments, "new_text");
+            if (operation == "safe_delete") {
+                // Like Serena: a symbol alone on its lines goes with those lines and the blank lines after it, so the
+                // gap before it is what separates its neighbours.
+                const auto blank = [&](size_t from, size_t to) { return text.substr(from, to - from).find_first_not_of(L" \t") == std::wstring::npos; };
+                const size_t line_start = offset(text, Position{selected->extent.start.line, 0});
+                const size_t line_end = std::min(text.find_first_of(L"\r\n", end), text.size());
+                if (blank(line_start, begin) && blank(end, line_end)) {
+                    begin = line_start;
+                    end = line_end;
+                    auto step_newline = [&](size_t at) {
+                        if (at < text.size() && text[at] == L'\r') ++at;
+                        if (at < text.size() && text[at] == L'\n') ++at;
+                        return at;
+                    };
+                    end = step_newline(end);
+                    for (;;) {
+                        size_t at = end;
+                        while (at < text.size() && (text[at] == L' ' || text[at] == L'\t')) ++at;
+                        if (at >= text.size() || (text[at] != L'\r' && text[at] != L'\n')) break;
+                        end = step_newline(at);
+                    }
+                }
+            }
             if (operation != "safe_delete" && !arguments.get("new_text")) fail("this symbol edit requires new_text");
             replacement = newlines(replacement, source.text);
             if (operation == "insert_before") {
@@ -1528,7 +2112,10 @@ Json lsp_edit(const Json& arguments, const SearchContext& context,
                 if (text.substr(line_start, begin - line_start).find_first_not_of(L" \t") != std::wstring::npos)
                     fail("insert_before cannot split an inline definition; replace the containing symbol instead");
                 begin = end = line_start;
-                if (!replacement.ends_with("\n")) replacement += source.text.find("\r\n") != std::string::npos ? "\r\n" : "\n";
+                const std::string eol = source.text.find("\r\n") != std::string::npos ? "\r\n" : "\n";
+                if (!replacement.ends_with("\n")) replacement += eol;
+                // Like Serena: one blank line keeps the new symbol apart from the one it precedes.
+                if (!replacement.ends_with(eol + eol)) replacement += eol;
             } else if (operation == "insert_after") {
                 if (selected->extent.end.column == 0) begin = end;
                 else {
@@ -1539,7 +2126,10 @@ Json lsp_edit(const Json& arguments, const SearchContext& context,
                     else { if (text[next] == L'\r' && next + 1 < text.size() && text[next + 1] == L'\n') ++next; begin = next + 1; }
                 }
                 end = begin;
-                if (!replacement.ends_with("\n")) replacement += source.text.find("\r\n") != std::string::npos ? "\r\n" : "\n";
+                const std::string eol = source.text.find("\r\n") != std::string::npos ? "\r\n" : "\n";
+                if (!replacement.ends_with("\n")) replacement += eol;
+                // Like Serena: one blank line keeps the new symbol apart from the one it follows.
+                if (!replacement.starts_with(eol)) replacement = eol + replacement;
             }
             text.replace(begin, end - begin, wide(replacement));
             changes.push_back({source, utf8(text)});
@@ -1549,6 +2139,11 @@ Json lsp_edit(const Json& arguments, const SearchContext& context,
         if (current.sha256 != source.sha256 || (arguments.get("expected_mtime") && current.mtime != source.mtime))
             fail("source changed during refactoring; retry");
         J result = apply_source_changes(changes, arguments, context, cancelled);
+        if (config->indexes_workspace) resync_written(*session, changes, context, control);
+        if (!leftovers.empty()) {
+            auto& text = std::get<J::Object>(result.value)["text"];
+            text = text.string() + leftovers;
+        }
         return result;
     } catch (...) { session->stop(); throw; }
 }
@@ -1560,7 +2155,7 @@ Json lsp_move(const Json& arguments, const SearchContext& context,
     if (operation != "filesystem" && flag(arguments, "overwrite")) fail("LSP file moves do not overwrite; use operation=filesystem explicitly");
     const int64_t timeout = number(arguments, "timeout_ms", 30000);
     if (timeout < 1 || timeout > 300000) fail("timeout_ms must be 1-300000");
-    const Control control{Clock::now() + std::chrono::milliseconds(timeout), cancelled};
+    const Control control{request_deadline(Clock::now() + std::chrono::milliseconds(timeout)), cancelled};
     bool directory = false;
     const SourceText source = source_descriptor(context, str(arguments, "source"), &directory);
     bool destination_exists = false;
@@ -1579,14 +2174,41 @@ Json lsp_move(const Json& arguments, const SearchContext& context,
         for (const auto& config : configs(source.root, context)) {
             const std::string extension = lower(utf8(source.path.extension().wstring()));
             if (!directory && std::find(config.extensions.begin(), config.extensions.end(), extension) == config.extensions.end()) continue;
+            if (directory && !worth_starting(config, context, control)) continue;
             auto session = session_for(config);
             auto lock = acquire(*session, control);
             try {
                 session->start(control); session->synchronize(nullptr, context, control); session->service_pending(control);
                 if (!(session->file_operation("willRename", source.path, directory) || session->file_operation("willRename", destination.path, directory))) continue;
                 supported = true;
-                const J edit = session->request("workspace/willRenameFiles", J::Object{
-                    {"files", J::Array{J::Object{{"oldUri", uri(source.path)}, {"newUri", uri(destination.path)}}}}}, control);
+                session->wait_indexed(control);
+                // SAFETY: import edits carry no old text to check, so in an indexing session every file they touch is
+                //   opened with its current bytes and the server is asked again; the edits then rest on exactly what
+                //   shgrep will change, and workspace_changes verifies them against the open documents.
+                J edit;
+                for (int attempt = 0;; ++attempt) {
+                    edit = session->request("workspace/willRenameFiles", J::Object{
+                        {"files", J::Array{J::Object{{"oldUri", uri(source.path)}, {"newUri", uri(destination.path)}}}}}, control);
+                    if (std::holds_alternative<std::nullptr_t>(edit.value) || !session->config.indexes_workspace) break;
+                    std::vector<std::string> targets;
+                    if (const J* changes_by_file = edit.get("changes"))
+                        for (const auto& [id, edits] : changes_by_file->object()) { (void)edits; targets.push_back(id); }
+                    if (const J* documents = edit.get("documentChanges"))
+                        for (const auto& change : documents->array())
+                            if (const J* document = change.get("textDocument")) targets.push_back(str(*document, "uri"));
+                    bool opened = false;
+                    for (const auto& id : targets) {
+                        std::optional<SourceText> current;
+                        try { current = read_source_text(context, utf8(from_uri(id).wstring())); }
+                        catch (const std::exception&) { continue; }  // workspace_changes reports it below
+                        if (session->has_document(*current)) continue;
+                        session->pin(*current, control);
+                        opened = true;
+                    }
+                    if (!opened) break;
+                    if (attempt == 2) server_fail("language server kept planning import edits for files that changed; nothing written");
+                    session->service_pending(control);
+                }
                 if (!std::holds_alternative<std::nullptr_t>(edit.value)) {
                     auto planned = workspace_changes(*session, edit, config, context, control);
                     for (auto& change : planned) changes.push_back(std::move(change));
@@ -1601,7 +2223,9 @@ void lsp_after_mutation(Json& result, const std::string& tool, const Json& argum
                         const SearchContext& context, const std::shared_ptr<std::atomic_bool>& cancelled) {
     std::vector<std::shared_ptr<Session>> active;
     { std::lock_guard lock(registry_mutex); for (const auto& [key, session] : registry) { (void)key; active.push_back(session); } }
-    const Control control{Clock::now() + std::chrono::seconds(30), cancelled};
+    // After the request's deadline the sync is left to the next request, which catches up the same way.
+    const Control control{request_deadline(Clock::now() + std::chrono::seconds(30)), cancelled};
+    if (Clock::now() >= control.deadline) return;
     auto belongs = [](const fs::path& child, const fs::path& root) {
         const std::wstring candidate = child.wstring(), parent = root.wstring();
         return candidate.size() >= parent.size() &&
@@ -1644,7 +2268,8 @@ void lsp_after_mutation(Json& result, const std::string& tool, const Json& argum
             } catch (...) { session->stop(); throw; }
         } catch (const std::exception& e) {
             auto& object = std::get<J::Object>(result.value);
-            const std::string warning = "[warning: filesystem changes applied; LSP synchronization failed: " + std::string(e.what()) + "]\n";
+            const std::string warning = lsp_failure_banner("language server synchronization failed after the write: " + std::string(e.what()),
+                "The write itself succeeded; symbol results may be stale until the server recovers.");
             if (auto it = object.find("text"); it != object.end()) it->second = it->second.string() + warning;
             else object.emplace("warning", warning);
         }

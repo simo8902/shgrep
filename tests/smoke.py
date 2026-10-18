@@ -10,7 +10,8 @@ import tempfile
 
 def main():
     executable = pathlib.Path(sys.argv[1]).resolve()
-    with tempfile.TemporaryDirectory(prefix="shgrep-") as root:
+    # Bundled language servers run inside the root and release it a moment after shgrep exits.
+    with tempfile.TemporaryDirectory(prefix="shgrep-", ignore_cleanup_errors=True) as root:
         root = pathlib.Path(root)
         source = root / "unicøde source.cpp"
         source.write_bytes(b"first needle\nother line\n")
@@ -219,7 +220,7 @@ def main():
             big = ft / "big.txt"
             big.write_bytes(b"".join(b"line %d " % i + b"x" * 100 + b"\n" for i in range(5000)))
             default_window = tool_text("read_file", {"path": "ft/big.txt"}, 133)
-            assert "showed lines 1-200 of 5000" in default_window, default_window[-300:]
+            assert "[status" not in default_window and default_window.endswith("  5000→line 4999 " + "x" * 100 + "\n"), default_window[-300:]
             whole = tool_text("read_file", {"path": "ft/big.txt", "limit": 5000}, 134)
             assert "[status" not in whole and whole.endswith("  5000→line 4999 " + "x" * 100 + "\n"), whole[-300:]
             window = tool_text("read_file", {"path": str(crlf), "offset": 2, "limit": 1}, 103).splitlines()[1:]
@@ -264,7 +265,8 @@ def main():
             assert replaced.startswith(f"Replaced {crlf} (2 lines"), replaced
             # Binary files are refused; direct paths ignore hidden; paths cannot leave the root or name a stream.
             assert "search_bytes" in tool_error("read_file", {"path": "blob.bin"}, 114)
-            assert tool_text("read_file", {"path": ".secret.cpp"}, 115).endswith("     1→needle\n")
+            # .cpp now has a bundled language server, whose default is the symbol overview; this checks hidden files.
+            assert tool_text("read_file", {"path": ".secret.cpp", "operation": "text"}, 115).endswith("     1→needle\n")
             assert "leave the root" in tool_error("read_file", {"path": "../outside.txt"}, 116)
             assert "outside the configured roots" in tool_error("read_file", {"path": str(root.parent / "x.txt")}, 117)
             assert "alternate data streams" in tool_error("write_file", {"path": "ft/a.txt:s", "content": "x"}, 118)
@@ -286,6 +288,111 @@ def main():
             assert "type: file\n" in info and "line_endings: crlf\n" in info and "lines: 2\n" in info, info
             assert "type: directory" in tool_text("file_info", {"path": "ft/sub"}, 124)
             # create_directory is mkdir -p; move_file renames and refuses to replace without overwrite.
+            # path limits a text search to one file or folder; output stays relative to the workspace root.
+            (root / "scope" / "inner").mkdir(parents=True)
+            (root / "scope" / "one.txt").write_text("scoped hit\n", encoding="utf-8")
+            (root / "scope" / "inner" / "two.txt").write_text("scoped hit\n", encoding="utf-8")
+            (root / "scope" / "inner" / "skip.log").write_text("scoped hit\n", encoding="utf-8")
+            (root / "scope" / ".gitignore").write_text("*.log\n", encoding="utf-8")
+            (root / "elsewhere.txt").write_text("scoped hit\n", encoding="utf-8")
+            scoped = call("tools/call", {"name": "search", "arguments": {"pattern": "scoped hit", "path": "scope"}}, 140)
+            scoped_text = scoped["content"][0]["text"].replace("\\", "/")
+            assert "scope/one.txt:1:scoped hit" in scoped_text and "scope/inner/two.txt:1:scoped hit" in scoped_text, scoped_text
+            assert "elsewhere.txt" not in scoped_text and "skip.log" not in scoped_text, scoped_text
+            single = call("tools/call", {"name": "search", "arguments": {"pattern": "scoped hit", "path": "scope/inner/two.txt"}}, 141)
+            single_text = single["content"][0]["text"].replace("\\", "/")
+            assert "scope/inner/two.txt:1:" in single_text and "one.txt" not in single_text, single_text
+            # A file named explicitly is searched even though .gitignore covers it, as with rg <path>.
+            named = call("tools/call", {"name": "search", "arguments": {"pattern": "scoped hit", "path": "scope/inner/skip.log"}}, 142)
+            assert "scope/inner/skip.log:1:" in named["content"][0]["text"].replace("\\", "/"), named
+            assert "not both" in tool_error("search", {"operation": "text", "pattern": "x", "path": "scope", "roots": [str(root)]}, 143)
+            # Navigation on a file type without a language server falls back to whole-word text matches.
+            (root / "scope" / "notes.txt").write_text("alpha beta\nalphabet\nbeta alpha\n", encoding="utf-8")
+            fallback = call("tools/call", {"name": "search", "arguments": {"operation": "references", "path": "scope/notes.txt",
+                                                                           "line": 1, "column": 2}}, 144)
+            fallback_text = fallback["content"][0]["text"].replace("\\", "/")
+            assert not fallback.get("isError") and fallback_text.startswith("[no language server for this file type;"), fallback
+            assert "notes.txt:1:alpha beta" in fallback_text and "notes.txt:3:beta alpha" in fallback_text, fallback_text
+            assert "alphabet" not in fallback_text, fallback_text
+            # PCRE2 whole-word: a rejected first candidate must not hide a valid later one (lookahead forces PCRE2).
+            (root / "scope" / "words.txt").write_text("foobar foo!\n", encoding="utf-8")
+            words = tool("search", {"operation": "text", "pattern": "foo(?=.)", "word": True, "path": "scope/words.txt"}, 148)
+            assert [item["byte_start"] for item in words["results"]] == [7], words
+            # max_results holds across files that workers publish concurrently.
+            (root / "many").mkdir(exist_ok=True)
+            for index in range(20):
+                (root / "many" / f"m{index:02}.txt").write_text("limit hit\nlimit hit\n", encoding="utf-8")
+            capped = call("tools/call", {"name": "search", "arguments": {"pattern": "limit hit", "path": "many", "max_results": 3}}, 149)
+            capped_lines = [line for line in capped["content"][0]["text"].splitlines() if ":limit hit" in line]
+            assert len(capped_lines) == 3, capped
+            # JSON context preserves the complete multibyte match, including matches over 2,048 bytes.
+            (root / "scope" / "euro.txt").write_text(newline=chr(10), data="\u20ac" * 1000 + "\n", encoding="utf-8")
+            euro = tool("search", {"operation": "text", "pattern": "^.+$", "path": "scope/euro.txt"}, 151)
+            assert euro["results"] and euro["results"][0]["context"].startswith("\u20ac"), euro
+            euro_hit = euro["results"][0]
+            assert euro_hit["context"].rstrip("\n") == "\u20ac" * 1000 and not euro_hit["context_truncated"], euro
+            # Multiline: a spanning match that arrives after a shorter, later one still marks its lines.
+            (root / "scope" / "spans.txt").write_text("one\ntwo\nthree\n", encoding="utf-8")
+            spans = call("tools/call", {"name": "search", "arguments": {"patterns": ["two", "one[\\s\\S]*three"],
+                                                                        "multiline": True, "path": "scope/spans.txt"}}, 152)
+            spans_text = spans["content"][0]["text"].replace("\\", "/")
+            assert all(f"scope/spans.txt:{n}:" in spans_text for n in (1, 2, 3)), spans_text
+            # A leading slash anchors a .gitignore rule to its folder.
+            (root / "anchor" / "nested").mkdir(parents=True)
+            (root / "anchor" / ".gitignore").write_text("/config.json\n", encoding="utf-8")
+            (root / "anchor" / "config.json").write_text("anchored hit\n", encoding="utf-8")
+            (root / "anchor" / "nested" / "config.json").write_text("anchored hit\n", encoding="utf-8")
+            anchored = call("tools/call", {"name": "search", "arguments": {"pattern": "anchored hit", "path": "anchor"}}, 153)
+            anchored_text = anchored["content"][0]["text"].replace("\\", "/")
+            assert "anchor/nested/config.json:1:" in anchored_text and "anchor/config.json:1:" not in anchored_text, anchored_text
+            # Case-insensitive literals fold k to U+212A KELVIN SIGN, as Unicode simple case folding does.
+            (root / "scope" / "kelvin.txt").write_text("\u212aelvin\n", encoding="utf-8")
+            kelvin = call("tools/call", {"name": "search", "arguments": {"pattern": "kelvin", "mode": "literal",
+                                                                         "case_insensitive": True, "path": "scope/kelvin.txt"}}, 154)
+            assert "kelvin.txt:1:" in kelvin["content"][0]["text"], kelvin
+            # A tight max_output_bytes returns the results that fit, never none: the roadmap's 215-match case.
+            (root / "scope" / "dense.txt").write_text("".join(f"dense match {i:04d} " + "y" * 60 + "\n" for i in range(215)),
+                                                      encoding="utf-8")
+            capped_json = tool("search", {"operation": "text", "pattern": "dense match", "path": "scope/dense.txt",
+                                          "max_output_bytes": 1000}, 155)
+            assert capped_json["results"] and capped_json["summary"]["status"] == "output_limit", capped_json
+            capped_text = call("tools/call", {"name": "search", "arguments": {"pattern": "dense match", "path": "scope/dense.txt",
+                                                                              "max_output_bytes": 600}}, 156)["content"][0]["text"]
+            assert "dense.txt:1:dense match 0000" in capped_text.replace("\\", "/") and "[status output_limit" in capped_text, capped_text
+            assert len(capped_text.encode("utf-8")) <= 600, len(capped_text.encode("utf-8"))
+            # Overlapping context windows print each line once; a search with results prints no Selection line.
+            (root / "scope" / "overlap.txt").write_text("a\nhit one\nhit two\nb\n", encoding="utf-8")
+            overlap = call("tools/call", {"name": "search", "arguments": {"pattern": "hit", "path": "scope/overlap.txt",
+                                                                          "context_lines": 2}}, 157)["content"][0]["text"]
+            shown = [line for line in overlap.splitlines() if "overlap.txt" in line and not line.startswith("[")]
+            assert len(shown) == len(set(shown)) == 4 and "Selection:" not in overlap, overlap
+            # An edit keeps the file's own permissions instead of taking the folder's inherited ones.
+            guarded = root / "scope" / "guarded.txt"
+            guarded.write_text("before\n", encoding="utf-8")
+            user = subprocess.run(["whoami"], capture_output=True, text=True, check=True).stdout.strip()
+            subprocess.run(["icacls", str(guarded), "/inheritance:r", "/grant:r", f"{user}:F"], capture_output=True, check=True)
+            acl = lambda: subprocess.run(["icacls", str(guarded)], capture_output=True, text=True, check=True).stdout.replace(str(guarded), "")
+            protected = acl()
+            assert "(I)" not in protected, protected
+            tool_text("edit_file", {"path": "scope/guarded.txt", "edits": [{"old_text": "before", "new_text": "after"}]}, 150)
+            assert guarded.read_text(encoding="utf-8") == "after\n" and acl() == protected, (protected, acl())
+            # A server that cannot start is reported with the relay banner, and the request still answers from text.
+            (root / ".shgrep").mkdir(exist_ok=True)
+            (root / ".shgrep" / "lsp.json").write_text(json.dumps({"servers": [{
+                "language_id": "bogus", "extensions": [".bogus"], "command": [str(root / "missing-server.exe")]}]}), encoding="utf-8")
+            (root / "scope" / "code.bogus").write_text("alpha()\nalpha_two\n", encoding="utf-8")
+            failed = call("tools/call", {"name": "search", "arguments": {"operation": "symbols", "path": "scope/code.bogus",
+                                                                         "pattern": "alpha"}}, 145)
+            failed_text = failed["content"][0]["text"].replace("\\", "/")
+            assert not failed.get("isError") and failed_text.startswith("[LSP FAILURE - tell the user"), failed
+            assert "scope/code.bogus:1:alpha()" in failed_text and "alpha_two" not in failed_text, failed_text
+            outline = tool_text("read_file", {"path": "scope/code.bogus"}, 146)
+            assert outline.startswith("[LSP FAILURE - tell the user") and "1→alpha()" in outline, outline
+            refused_edit = tool_error("edit_file", {"path": "scope/code.bogus", "operation": "rename", "line": 1, "column": 1,
+                                                    "new_name": "beta"}, 147)
+            assert "[LSP FAILURE - tell the user" in refused_edit and "nothing was written" in refused_edit, refused_edit
+            assert (root / "scope" / "code.bogus").read_text(encoding="utf-8").startswith("alpha()"), "edit must not apply"
+            (root / ".shgrep" / "lsp.json").unlink()
             made = tool_text("create_directory", {"path": "ft/a/b"}, 125)
             assert (ft / "a" / "b").is_dir() and "Created folders: ft/a/ ft/a/b/" in made, made
             assert tool_text("create_directory", {"path": "ft/a/b"}, 126).startswith("Already exists")

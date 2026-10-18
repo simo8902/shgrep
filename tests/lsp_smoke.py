@@ -13,6 +13,7 @@ import sys
 import tempfile
 import threading
 import time
+import urllib.parse
 
 
 def units(text):
@@ -26,6 +27,10 @@ def pos(line, column):
 def mock():
     documents = {}
     events = []
+    # --index: answer like a server with its own index. Unopened files come from a deliberately stale view (one
+    # line shifted), so edits planned from it are wrong until the client opens the file and asks again.
+    indexed = "--index" in sys.argv
+    root_dir = None
 
     def selected_name(params):
         document = documents[params["textDocument"]["uri"]]
@@ -111,6 +116,8 @@ def mock():
             continue
         if method == "initialize":
             initialize_id = request_id
+            root_uri = params.get("rootUri") or ""
+            root_dir = urllib.parse.unquote(root_uri[8:]) if root_uri.startswith("file:///") else None
             send({"jsonrpc": "2.0", "id": "config", "method": "workspace/configuration",
                   "params": {"items": [{"section": "mock"}]}})
             continue
@@ -144,8 +151,9 @@ def mock():
                 send({"jsonrpc": "2.0", "id": request_id,
                       "error": {"code": -32801, "message": "Content modified."}})
                 continue
-            if "--HANG" in documents[uri]["text"]:
-                time.sleep(10)
+            hang = re.search(r"--HANG(\d*)", documents[uri]["text"])
+            if hang:
+                time.sleep(int(hang[1] or 10))
             result = tree(uri)
         elif method in {"textDocument/definition", "textDocument/declaration", "textDocument/typeDefinition", "textDocument/implementation"}:
             uri = params["textDocument"]["uri"]
@@ -176,6 +184,8 @@ def mock():
         elif method == "textDocument/prepareRename":
             result = {"defaultBehavior": True}
         elif method == "textDocument/rename":
+            if "--SLOWRENAME" in documents[params["textDocument"]["uri"]]["text"]:
+                time.sleep(2)
             name = selected_name(params)
             result = {"documentChanges": []}
             for uri, document in documents.items():
@@ -203,7 +213,14 @@ def mock():
             before = params["files"][0]["oldUri"].rsplit("/", 1)[-1].removesuffix(".lua")
             after = params["files"][0]["newUri"].rsplit("/", 1)[-1].removesuffix(".lua")
             result = {"changes": {}}
-            for uri, document in documents.items():
+            views = dict(documents)
+            if indexed and root_dir:
+                opened = {urllib.parse.unquote(uri[8:]).lower() for uri in documents}
+                for path in Path(root_dir).rglob("*.lua"):
+                    if ".shgrep" in path.parts or path.as_posix().lower() in opened:
+                        continue
+                    views["file:///" + urllib.parse.quote(path.as_posix())] = {"text": "\n" + path.read_text(encoding="utf-8-sig")}
+            for uri, document in views.items():
                 edits = []
                 for index, line in enumerate(document["text"].splitlines()):
                     for match in re.finditer(re.escape('require("' + before + '")'), line):
@@ -220,9 +237,10 @@ def mock():
 
 
 class Client:
-    def __init__(self, executable, root):
-        self.process = subprocess.Popen([str(executable), "--root", str(root)],
-                                        stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+    def __init__(self, executable, root, stderr=None, arguments=(), cwd=None, timeout=20, environment=None):
+        self.process = subprocess.Popen([str(executable), "--root", str(root), *arguments], cwd=cwd,
+                                        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=stderr, env=environment)
+        self.timeout = timeout  # seconds to wait for one reply; real servers on cold repos need minutes
         self.messages = queue.Queue()
         self.next_id = 0
         self.reader = threading.Thread(target=self._read, daemon=True)
@@ -241,12 +259,22 @@ class Client:
         request = {"jsonrpc": "2.0", "id": self.next_id, "method": method, "params": params}
         self.process.stdin.write(json.dumps(request).encode() + b"\n")
         self.process.stdin.flush()
-        response = self.messages.get(timeout=20)
-        assert isinstance(response, dict), response
-        assert response["id"] == self.next_id and "error" not in response, response
-        return response["result"]
+        while True:
+            response = self.messages.get(timeout=self.timeout)
+            assert isinstance(response, dict), response
+            # A reply to a request that already timed out here is stale; skip it instead of misreading it.
+            if isinstance(response.get("id"), int) and response["id"] < self.next_id:
+                continue
+            assert response["id"] == self.next_id and "error" not in response, response
+            return response["result"]
 
     def tool(self, name, arguments, error=False, raw=False):
+        # Overviews default to compact text; parsed checks ask for the json form.
+        overview = name in ("read_file", "list_dir") and not any(k in arguments for k in ("name_path", "offset", "limit")) and \
+            arguments.get("operation", "overview" if name == "list_dir" else "auto") in ("auto", "overview")
+        if overview and not raw and not error and "format" not in arguments and \
+                (name == "read_file" or arguments.get("operation") == "overview"):
+            arguments = {**arguments, "format": "json"}
         result = self.call("tools/call", {"name": name, "arguments": arguments})
         assert bool(result.get("isError")) == error, result
         text = result["content"][0]["text"]
@@ -276,6 +304,10 @@ def exercise_extended(client, root):
     assert not client.tool("search", {"path": "code.lua", "pattern": "roo/alpha", "substring_matching": True})["results"]
     children = client.tool("search", {"path": "code.lua", "pattern": "/root", "depth": 1})
     assert {item["name_path"] for item in children["results"]} >= {"root", "root/alpha", "root/caller"}
+    complete_outline = client.tool("read_file", {"path": "code.lua", "operation": "overview"})
+    assert {item["name_path"] for item in complete_outline["results"]} >= {"root", "root/alpha", "root/caller"}
+    shallow_outline = client.tool("read_file", {"path": "code.lua", "operation": "overview", "depth": 0})
+    assert [item["name_path"] for item in shallow_outline["results"]] == ["root"]
     assert not client.tool("search", {"path": "code.lua", "pattern": "alpha", "exclude_kinds": [12]})["results"]
 
     client.tool("create_directory", {"path": "subdir"}, raw=True)
@@ -318,6 +350,22 @@ def exercise_extended(client, root):
     assert target.read_text().index("before()") < target.read_text().index("renamed()") < target.read_text().index("after()")
     client.tool("edit_file", {"path": "subdir/refactor.lua", "name_path": "before", "operation": "safe_delete"}, raw=True)
     assert b"function before()" not in target.read_bytes()
+
+    # Layout matches Serena: inserted symbols keep a blank line from their neighbour; a deleted one takes its lines
+    # and the blank lines after it, so the gap before it remains.
+    layout = root / "subdir" / "layout.lua"
+    one, two = "function one()\n    return 1\nend\n", "function two()\n    return 2\nend\n"
+    layout.write_text(one + "\n" + two, encoding="utf-8")
+    client.tool("edit_file", {"path": "subdir/layout.lua", "name_path": "two", "operation": "insert_before",
+                             "new_text": "function mid()\n    return 0\nend\n"}, raw=True)
+    mid = "function mid()\n    return 0\nend\n"
+    assert layout.read_text(encoding="utf-8") == one + "\n" + mid + "\n" + two, layout.read_text(encoding="utf-8")
+    client.tool("edit_file", {"path": "subdir/layout.lua", "name_path": "two", "operation": "insert_after",
+                             "new_text": "function last()\n    return 3\nend\n"}, raw=True)
+    last = "function last()\n    return 3\nend\n"
+    assert layout.read_text(encoding="utf-8") == one + "\n" + mid + "\n" + two + "\n" + last, layout.read_text(encoding="utf-8")
+    client.tool("edit_file", {"path": "subdir/layout.lua", "name_path": "mid", "operation": "safe_delete"}, raw=True)
+    assert layout.read_text(encoding="utf-8") == one + "\n" + two + "\n" + last, layout.read_text(encoding="utf-8")
 
     # Duplicate sibling symbols are individually readable and editable.
     client.tool("write_file", {"path": "overload.lua", "content": "function repeated()\n    return 1\nend\nfunction repeated()\n    return 2\nend\n"}, raw=True)
@@ -393,7 +441,8 @@ def main():
     with tempfile.TemporaryDirectory(prefix="shgrep-lsp-") as directory:
         root = Path(directory)
         (root / ".shgrep").mkdir()
-        (root / ".shgrep" / "lsp.json").write_text(json.dumps({"servers": [{
+        # Servers shipped beside the executable would claim plain.xml; this run checks only the mock.
+        (root / ".shgrep" / "lsp.json").write_text(json.dumps({"bundled": False, "servers": [{
             "language_id": "lua", "extensions": [".lua"],
             "ignored_paths": ["ignored/**"],
             "command": [sys.executable, str(Path(__file__).resolve()), "--mock"],
@@ -413,7 +462,10 @@ def main():
             status = client.tool("file_info", {"path": "code.lua", "operation": "lsp"})
             assert status["open_documents"] == 1
             overview = client.tool("read_file", {"path": "code.lua"})
-            assert [x["name_path"] for x in overview["results"]] == ["root"]
+            assert [x["name_path"] for x in overview["results"]] == ["root", "root/alpha", "root/caller"]
+            # The default overview is one line per symbol: line, kind, name_path.
+            compact = client.tool("read_file", {"path": "code.lua"}, raw=True)
+            assert compact.startswith("[outline code.lua | 3 symbols | mtime ") and "\n     1 namespace root\n" in compact, compact
             assert "body" not in overview["results"][0]
             functions = client.tool("search", {"path": "code.lua", "patterns": ["alpha", "caller"]})
             assert {x["name_path"] for x in functions["results"]} == {"root/alpha", "root/caller"}
@@ -466,16 +518,19 @@ def main():
 
             # Text fallback returns a default window; explicit larger reads have no byte cap.
             plain = client.tool("read_file", {"path": "plain.xml"}, raw=True)
-            assert "showed lines 1-200 of 300" in plain
+            assert "<n>299</n>" in plain and "[status limit" not in plain
             assert "<n>299</n>" in client.tool("read_file", {"path": "plain.xml", "limit": 300}, raw=True)
             client.tool("read_file", {"path": "../escape.lua"}, error=True)
 
             exercise_extended(client, root)
 
-            # A timed-out server is terminated and restarted for the following request.
+            # A timed-out server is reported with the relay banner, the read falls back to the file's text, and the
+            # server is terminated and restarted for the following request.
             source.write_bytes(source.read_bytes() + b"--HANG\r\n")
             start = time.monotonic()
-            assert "timed out" in client.tool("read_file", {"path": "code.lua", "timeout_ms": 1000}, error=True)
+            timed_out = client.tool("read_file", {"path": "code.lua", "timeout_ms": 1000}, raw=True)
+            assert timed_out.startswith("[LSP FAILURE - tell the user") and "timeout_ms" in timed_out, timed_out
+            assert "     7\u2192--HANG" in timed_out, timed_out
             assert time.monotonic() - start < 5
             source.write_bytes(b"\xef\xbb\xbf" + expected.encode())
             assert client.tool("read_file", {"path": "code.lua"})["backend"] == "lsp"
