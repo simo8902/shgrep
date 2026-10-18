@@ -1,11 +1,11 @@
 """Tests a standard reranker (llama-server --reranking) on the same questions and candidates as retrieval_eval.py.
-Usage: python tests/rerank_eval.py dist/shgrep.exe <repo> [--count 30] [--seed 1] [--rerank-port 8081]
-  Needs two llama-servers: Laya on SHGREP_LAYA_PORT (default 8080, shgrep requires it to start) and the reranker:
+Usage: python tests/rerank_eval.py dist/shgrep.exe <repo> [--count 30] [--seed 1] [--hard] [--rerank-port 8081]
+  Needs one llama-server running a reranker:
     llama-server -m <reranker.gguf> --reranking --pooling rank --embedding -ngl 99 --port 8081
-  Candidates are shgrep's keyword pool (budget 0, whole pool returned). Per question the reranker scores every
-  candidate (path + code) against the intent through POST /v1/rerank; arms compare keyword order, reranker order,
-  and RRF fusion of both at weights 100/50/25 (percent of the reranker's rank), the same fusion shgrep uses for Laya.
-  Nothing in the repo is written.
+  Candidates are shgrep's ranked hunks with the return limit lifted (SHGREP_RANK_RETURN=0: every hunk, still at most
+  3 per file). Per question the reranker scores every candidate (path + code) against the intent through
+  POST /v1/rerank; arms compare keyword order, reranker order, and RRF fusion of both at weights 100/50/25
+  (percent of the reranker's rank). Nothing in the repo is written.
 """
 import argparse
 import json
@@ -16,7 +16,6 @@ import urllib.error
 import urllib.request
 
 import retrieval_eval as ev
-from laya_fixture import require_server
 from lsp_smoke import Client
 
 RRF_K = 60.0
@@ -63,7 +62,6 @@ def main():
     parser.add_argument("--query-prefix", default="", help="text before the intent, e.g. a reranker instruction")
     parser.add_argument("--hard", action="store_true", help="same hardened questions as retrieval_eval.py --hard")
     args = parser.parse_args()
-    require_server()
     try:
         urllib.request.urlopen(f"http://127.0.0.1:{args.rerank_port}/health", timeout=10).close()
     except OSError as error:
@@ -71,9 +69,8 @@ def main():
     repo = args.repo.resolve()
     asked = ev.questions(repo, args.count, args.seed, args.hard)
     print(f"{len(asked)} questions from doc comments in {repo}")
-    # Budget 0 and no limits: the whole BM25 pool comes back in keyword order for the reranker to reorder.
-    client = Client(args.executable.resolve(), repo, timeout=330, regression_laya=False,
-                    environment={**os.environ, "SHGREP_LAYA_BUDGET_MS": "0", "SHGREP_LAYA_RETURN": "0"})
+    # No return limit: every ranked hunk comes back in keyword order for the reranker to reorder.
+    client = Client(args.executable.resolve(), repo, timeout=330, environment={**os.environ, "SHGREP_RANK_RETURN": "0"})
     rows = []
     try:
         for q in asked:
