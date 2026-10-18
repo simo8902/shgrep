@@ -5754,8 +5754,9 @@ Json run_unlocked(const std::string& name, const Json& arguments, const SearchCo
     const uint32_t requested_results = r.max_results, requested_per_file = r.max_per_file;
     const size_t requested_output = r.max_output;
     if (ranking) {
-        // CONTRACT: ranking sees every finding. Explicit result/output limits apply afterwards.
-        r.max_results = UINT32_MAX;
+        // CONTRACT: ranking sees the findings up to SHGREP_RANK_SCAN_LIMIT matches (the status says when that cut in);
+        //   explicit result/output limits apply afterwards.
+        r.max_results = rank_scan_limit();
         r.max_per_file = UINT32_MAX;
         r.max_output = SIZE_MAX;
         r.use_index = false;
@@ -5916,6 +5917,7 @@ Json run_unlocked(const std::string& name, const Json& arguments, const SearchCo
         results = std::move(sorted);
     }
     Json rank_report;
+    std::string rank_note;  // told to the reader whenever ranking returned fewer hunks than it found
     if (ranker) {
         // CONTRACT: ranking orders hunks of the text output (groups between "--" separators, or nearby matched lines
         //   when there are none) or groups of json results with overlapping context. The returned groups keep their
@@ -6060,6 +6062,14 @@ Json run_unlocked(const std::string& name, const Json& arguments, const SearchCo
             results = std::move(kept_results);
         }
         rank_report = ranker->report();
+        if (ranked.size() < pieces.size())
+            rank_note = "showing " + std::to_string(ranked.size()) + " of " + std::to_string(pieces.size()) +
+                        " matching hunks, best first for the intent; to see every match search again without intent";
+        if (state == "limit")
+            rank_note += std::string(rank_note.empty() ? "" : ". ") +
+                         "the scan stopped at SHGREP_RANK_SCAN_LIMIT matches, so these are the best of the first matches found; "
+                         "narrow path, include or the patterns to rank the rest";
+        if (!rank_note.empty()) std::get<Json::Object>(rank_report.value).emplace("note", rank_note);
         r.max_results = requested_results;
         r.max_per_file = requested_per_file;
         r.max_output = requested_output;
@@ -6144,6 +6154,7 @@ Json run_unlocked(const std::string& name, const Json& arguments, const SearchCo
             for (const auto& block : blocks) length += block.text.size() + 3;
             text.reserve(length + 1024);
             if (ranking) text += "[ranking " + rank_report.dump() + "]\n";
+            if (!rank_note.empty()) text += "[" + rank_note + "]\n";
             if (!relative_prefix.empty() && !blocks.empty()) text += "[paths relative to " + relative_root + "]\n";
             for (size_t i = 0; i < blocks.size(); ++i) {
                 if (separate_files && i) text += "--\n";
@@ -6250,7 +6261,9 @@ Json tool_definitions() {
 
     auto search_props = content_props;
     search_props.emplace("intent", field("string",
-        "Optional for operation=text: the user's task. With it the findings are ranked against it by keywords (BM25) and the best hunks return first."));
+        "Optional for operation=text: the task in words, to locate where something is. With it only the best 10 hunks return, ranked by "
+        "keywords (at most 3 per file), and a note says how many were left out. Omit it when you need every occurrence "
+        "(renames, all callers, counts): then every match returns in scan order."));
     search_props.emplace("operation", choice(Json::Array{"symbols", "definition", "declaration", "type_definition", "implementation", "references", "hover", "text"},
         "Default symbols via LSP. text uses live grep; its text filters and budgets apply only there."));
     search_props.emplace("path", field("string", "File or folder to limit text search or symbols to; other navigation needs a file. Omit for all workspaces."));
@@ -6311,9 +6324,9 @@ Json tool_definitions() {
             "Navigate live code through LSP: symbols, definition/declaration/type_definition, implementation, references, or hover. "
             "Bodies are opt-in; no LSP output cap. Lua, XML, C/C++, Rust and Python work out of the box; .shgrep/lsp.json adds or overrides servers. "
             "A failing server is reported in a leading [LSP FAILURE ...] line, to relay to the user, followed by whole-word text matches. "
-            "operation=text takes an optional intent: with it, hunks are ranked by BM25 against the task (and re-ordered by a local "
-            "reranker when SHGREP_RERANK_PORT is set) and the best 10 return first (at most 3 per file) with their original text; "
-            "without it every finding returns in scan order. "
+            "operation=text: pass intent (the task in words) to LOCATE something: only the best 10 hunks return, ranked by keywords "
+            "(at most 3 per file, optionally re-ordered by a local reranker), and a note states how many were left out. Omit intent when "
+            "you need EVERY occurrence (renames, all callers, counts): then every match returns in scan order. "
             "Grep filters apply, including XML and files without a language server."},
             {"inputSchema", schema(search_props)}},
         Json::Object{{"name", "search_bytes"}, {"description",

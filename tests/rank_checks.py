@@ -66,6 +66,10 @@ def check_ranking(client):
     assert len(blank) == 2 and "ranking" not in reply, reply
 
 
+def reply_note(reply):
+    return reply["ranking"].get("note", "")
+
+
 def check_limits(client):
     results, reply = results_of(client, pattern="def handler_", path="many", intent="handle the request")
     assert reply["ranking"]["candidates"] == 30, reply["ranking"]
@@ -80,6 +84,15 @@ def check_limits(client):
     limited, reply = results_of(client, pattern="def handler_", path="many", intent="handle the request", max_results=2)
     assert len(limited) == 2 and reply["summary"]["truncated"], reply["summary"]
     assert [r["ranking"]["rank"] for r in limited] == [1, 2], limited
+
+    # What the ranking left out is stated, in the report and as a plain line of the text output.
+    assert "showing 10 of 30 matching hunks" in reply_note(results_of(client, pattern="def handler_", path="many",
+                                                                        intent="handle the request")[1]), "note missing"
+    text = client.tool("search", {"operation": "text", "pattern": "def handler_", "path": "many",
+                                  "intent": "handle the request"}, raw=True)
+    assert "[showing 10 of 30 matching hunks" in text and "without intent" in text, text[:400]
+    _, whole = results_of(client, pattern="def ", path="pair", include=["*.py"], intent=INTENT)
+    assert "note" not in whole["ranking"], whole["ranking"]
 
     # Without an intent no limit applies: all 30.
     everything, _ = results_of(client, pattern="def handler_", path="many")
@@ -99,6 +112,14 @@ def check_settings(executable, root):
     try:
         results, _ = results_of(client, pattern="def repeated_", path="deep", intent="repeated")
         assert len(results) == 8, len(results)
+    finally:
+        client.close()
+    # A tiny scan limit stops the scan early, says so, and ranks what was found.
+    client = Client(executable, root, environment={**os.environ, "SHGREP_RANK_SCAN_LIMIT": "5"})
+    try:
+        results, reply = results_of(client, pattern="def handler_", path="many", intent="handle the request")
+        assert reply["summary"]["status"] == "limit" and len(results) <= 5, reply["summary"]
+        assert "SHGREP_RANK_SCAN_LIMIT" in reply["ranking"]["note"], reply["ranking"]
     finally:
         client.close()
     client = Client(executable, root, environment={**os.environ, "SHGREP_RANK_RETURN": "many"})

@@ -168,6 +168,11 @@ std::vector<double> bm25(const std::string& intent, const std::vector<RankCandid
 }
 }
 
+uint32_t rank_scan_limit() {
+    const uint32_t limit = setting_number(L"SHGREP_RANK_SCAN_LIMIT", 50000, 100000000);
+    return limit ? limit : UINT32_MAX;
+}
+
 Ranker::Ranker(std::string intent) : intent_(std::move(intent)) {
     if (intent_.size() > 4096) throw std::runtime_error("intent is at most 4096 UTF-8 bytes");
     return_limit_ = setting_number(L"SHGREP_RANK_RETURN", 10, 100000);

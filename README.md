@@ -4,6 +4,8 @@
 
 MCP search with operation="text" takes an optional `intent`, the user's task in words. With it, the findings are ranked against it and only the best come back; without it every finding returns in scan order, exactly as before. Ranking is local, needs no model or server by default, and keeps no state between requests. An optional reranker (below) can re-order the best candidates.
 
+**For agents: locate with `intent`, enumerate without it.** Pass `intent` to find where something is: you get the best 10 hunks (3 per file) and a plain note says how many matching hunks were left out. Omit `intent` when you need every occurrence (renames, all callers, counts): every match then returns in scan order. If a ranked scan stops at SHGREP_RANK_SCAN_LIMIT matches, the status is `limit` and the note says the ranking covers only the first matches found; narrow `path`, `include` or the patterns to rank the rest.
+
 How a ranked search works:
 
 1. The live scan's findings become candidates: text hunks (groups between `--` separators, or nearby matched lines), or json results grouped where their context overlaps.
@@ -15,6 +17,7 @@ How a ranked search works:
 |---|---|---|
 | SHGREP_RANK_RETURN | 10 | most candidates returned (0 = all) |
 | SHGREP_RANK_PER_FILE | 3 | most candidates per file (0 = no cap) |
+| SHGREP_RANK_SCAN_LIMIT | 50000 | most matches collected before ranking (0 = no limit); keeps one loose pattern in a huge tree from making ranking hold millions of hits |
 | SHGREP_RERANK_PORT | unset | port of a llama-server on 127.0.0.1 started with `--reranking`; unset = no reranker |
 | SHGREP_RERANK_POOL | 24 | keyword candidates sent to the reranker (0 = all) |
 | SHGREP_RERANK_BUDGET_MS | 3000 | how long a search waits for the reranker |
