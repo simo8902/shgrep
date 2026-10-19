@@ -98,6 +98,20 @@ def check_python(client, root):
     assert "def beta()" in (root / "mod_a.py").read_text() and "return beta()" in (root / "mod_b.py").read_text()
 
 
+def check_csharp(client, root):
+    # OmniSharp loads app.csproj (C# 9: records, with-expressions, relational patterns) before it answers initialize.
+    assert client.tool("file_info", {"path": "Person.cs", "operation": "lsp", **SLOW})["language_id"] == "csharp"
+    symbols = client.tool("search", {"path": "Person.cs", "pattern": "Person", **SLOW})["results"]
+    assert symbols, symbols
+    use = (root / "Use.cs").read_text(encoding="utf-8").splitlines()
+    line = next(number for number, text in enumerate(use, 1) if "new Person(" in text)
+    column = use[line - 1].index("Person(") + 1
+    definition = client.tool("search", {"operation": "definition", "path": "Use.cs", "line": line, "column": column, **SLOW})
+    assert "Person.cs" in names(definition["results"]), definition
+    references = client.tool("search", {"operation": "references", "path": "Person.cs", "name_path": symbols[0]["name_path"], **SLOW})
+    assert "Use.cs" in names(references["results"]), references
+
+
 def check_rust(client, root):
     assert client.tool("file_info", {"path": "src/main.rs", "operation": "lsp", **SLOW})["language_id"] == "rust"
     symbols = client.tool("search", {"path": "src/util.rs", "pattern": "alpha", **SLOW})["results"]
@@ -166,8 +180,10 @@ def main():
     manifest = executable.parent / "lsp" / "manifest.json"
     assert manifest.is_file(), f"No bundled servers beside {executable}; run: python tools/fetch_lsp.py {executable.parent}"
     installed = set(json.loads(manifest.read_text(encoding="utf-8")))
-    assert installed == {"lua", "xml", "clangd", "rust", "python"}, f"Incomplete bundle: {sorted(installed)}"
+    assert installed == {"lua", "xml", "clangd", "rust", "python", "csharp"}, f"Incomplete bundle: {sorted(installed)}"
     rust = shutil.which("cargo") is not None
+    # OmniSharp needs a .NET 10+ SDK; without one shgrep reports it missing instead of starting the server.
+    csharp = shutil.which("dotnet") is not None or (Path(os.environ.get("ProgramFiles", "")) / "dotnet" / "dotnet.exe").is_file()
     with tempfile.TemporaryDirectory(prefix="shgrep-live-") as directory:
         root = Path(directory)
         write(root, {
@@ -181,6 +197,17 @@ def main():
             "mod_b.py": "from mod_a import alpha\n\ndef usage():\n    return alpha()\n",
         })
         (root / "legacy-invalid.lua").write_bytes(b"-- legacy comment: \xff\r\n")
+        if csharp:
+            write(root, {
+                "app.csproj": '<Project Sdk="Microsoft.NET.Sdk">\n  <PropertyGroup>\n    <TargetFramework>net10.0</TargetFramework>\n'
+                              '    <LangVersion>9.0</LangVersion>\n  </PropertyGroup>\n</Project>\n',
+                "Person.cs": "namespace Demo\n{\n    public record Person(string Name, int Age);\n    public static class Classifier\n    {\n"
+                             "        public static string Classify(Person p) => p switch\n        {\n"
+                             "            { Age: < 18 } => \"minor\",\n            _ => \"adult\",\n        };\n    }\n}\n",
+                "Use.cs": "namespace Demo\n{\n    public static class Use\n    {\n        public static string Run()\n        {\n"
+                          "            var p = new Person(\"Ann\", 30);\n            return Classifier.Classify(p with { Age = 70 });\n"
+                          "        }\n    }\n}\n",
+            })
         if rust:
             write(root, {
                 "Cargo.toml": '[package]\nname = "fixture"\nversion = "0.1.0"\nedition = "2021"\n',
@@ -195,12 +222,15 @@ def main():
             check_python(client, root)
             if rust:
                 check_rust(client, root)
+            if csharp:
+                check_csharp(client, root)
             listed = {item["language_id"] for item in client.tool("find_files", {"operation": "lsp"})["results"]}
-            expected = {"lua", "xml", "cpp", "python"} | ({"rust"} if rust else set())
+            expected = {"lua", "xml", "cpp", "python"} | ({"rust"} if rust else set()) | ({"csharp"} if csharp else set())
             assert listed == expected, listed
             status = client.tool("file_info", {"operation": "lsp", **SLOW})
             print(json.dumps([item.get("language_id") for item in status.get("results", [])]))
             print("Bundled Lua, XML, C++, Python" + (", Rust" if rust else " (Rust skipped: no cargo)") +
+                  (", C#" if csharp else " (C# skipped: no .NET SDK)") +
                   " navigation, refactoring and diagnostics checks passed with no lsp.json.")
         finally:
             client.close()

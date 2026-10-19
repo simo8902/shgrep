@@ -1,4 +1,5 @@
 #include "json.hpp"
+#include "banner.hpp"
 #include "cli.hpp"
 #include "search.hpp"
 #include "files.hpp"
@@ -36,13 +37,20 @@ Json error(const Json& id, int code, const std::string& message) {
 Json success(const Json& id, Json result) {
     return Json::Object{{"jsonrpc", "2.0"}, {"id", id}, {"result", std::move(result)}};
 }
+// CONTRACT: the session health notice travels as a second text block after the result, so clients and tests that read
+//   the first block see the result unchanged, while the model and the notify hook see both.
+Json content(std::string text, const std::string& notice) {
+    Json::Array blocks{Json::Object{{"type", "text"}, {"text", std::move(text)}}};
+    if (!notice.empty()) blocks.push_back(Json::Object{{"type", "text"}, {"text", notice}});
+    return blocks;
+}
 // Returns the serialized response, so the size check and the send share one dump.
-std::string tool_response(const Json& id, Json& result, uint32_t max_bytes, bool uncapped) {
+std::string tool_response(const Json& id, Json& result, uint32_t max_bytes, bool uncapped, const std::string& notice) {
     // CONTRACT: text output (lines/files/count) is sent as-is so agents read grep-style lines, not JSON.
     if (const Json* text = result.get("text")) {
         std::string core = text->string(), marker;
         for (;;) {
-            std::string response = success(id, Json::Object{{"content", Json::Array{Json::Object{{"type", "text"}, {"text", core + marker}}}}}).dump();
+            std::string response = success(id, Json::Object{{"content", content(core + marker, notice)}}).dump();
             if (uncapped || response.size() <= max_bytes) return response;
             if (core.empty()) throw std::runtime_error("max_output_bytes cannot hold MCP response");
             size_t cut = core.size() >= 2 ? core.rfind('\n', core.size() - 2) : std::string::npos;
@@ -51,7 +59,7 @@ std::string tool_response(const Json& id, Json& result, uint32_t max_bytes, bool
         }
     }
     for (;;) {
-        std::string response = success(id, Json::Object{{"content", Json::Array{Json::Object{{"type", "text"}, {"text", result.dump()}}}}}).dump();
+        std::string response = success(id, Json::Object{{"content", content(result.dump(), notice)}}).dump();
         if (uncapped || response.size() <= max_bytes) return response;
         auto& object = std::get<Json::Object>(result.value);
         auto& items = std::get<Json::Array>(object.at("results").value);
@@ -63,13 +71,12 @@ std::string tool_response(const Json& id, Json& result, uint32_t max_bytes, bool
         if (summary.at("status").string() == "complete") summary["status"] = "output_limit";
     }
 }
-Json tool_error_response(const Json& id, std::string message, uint32_t max_bytes, bool uncapped) {
+Json tool_error_response(const Json& id, std::string message, uint32_t max_bytes, bool uncapped, const std::string& notice) {
     if (!uncapped && message.size() > 1024) message.resize(1024);
     for (;;) {
         while (!message.empty() && !MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS,
                message.data(), static_cast<int>(message.size()), nullptr, 0)) message.pop_back();
-        Json response = success(id, Json::Object{{"isError", true},
-            {"content", Json::Array{Json::Object{{"type", "text"}, {"text", message}}}}});
+        Json response = success(id, Json::Object{{"isError", true}, {"content", content(message, notice)}});
         if (uncapped || response.dump().size() <= max_bytes || message.empty()) return response;
         message.resize(message.size() / 2);
     }
@@ -114,8 +121,21 @@ int wmain(int argc, wchar_t** argv) {
         }
     }
     if (context.allowed_roots.empty()) context.allowed_roots.push_back(std::filesystem::current_path());
+    // SHGREP_REQUIRE_INTENT=0 lifts the intent requirement for test suites; an MCP client cannot change it.
+    wchar_t require_intent[4];
+    const DWORD require_length = GetEnvironmentVariableW(L"SHGREP_REQUIRE_INTENT", require_intent, 4);
+    context.require_intent = !(require_length == 1 && require_intent[0] == L'0');
     // The build and the watchers run in the background; searches walk until each root's index is ready.
     if (context.live_index) shgrep::start_live_indexes(context);
+    // The health check runs while the client finishes its handshake; the first tool result of the session carries it.
+    const std::shared_future<std::string> health = std::async(std::launch::async, [&context] {
+        try { return shgrep::health_notice(context); }
+        catch (const std::exception& e) {
+            return shgrep::failure_banner("SHGREP HEALTH", std::string("the health check itself failed: ") + e.what(),
+                                          "Requests still run and report their own failures");
+        }
+    }).share();
+    std::atomic_bool health_sent{false};
     std::mutex active_mutex;
     std::map<std::string, std::shared_ptr<std::atomic_bool>> active;
     std::vector<std::future<void>> tasks;
@@ -190,6 +210,7 @@ int wmain(int argc, wchar_t** argv) {
                 }
                 try { tasks.push_back(std::async(std::launch::async, [&, id, tool_name, arguments, flag, key] {
                     const bool uncapped = !arguments.get("max_output_bytes");
+                    const std::string notice = health_sent.exchange(true) ? std::string() : health.get();
                     const uint32_t ceiling = 1048576;
                     uint32_t max_bytes = 65536;
                     try {
@@ -198,9 +219,9 @@ int wmain(int argc, wchar_t** argv) {
                             if (requested >= 512 && requested <= ceiling) max_bytes = static_cast<uint32_t>(requested);
                         }
                         Json result = shgrep::run_tool(tool_name, arguments, context, flag);
-                        send_line(tool_response(id, result, max_bytes, uncapped));
+                        send_line(tool_response(id, result, max_bytes, uncapped, notice));
                     } catch (const std::exception& e) {
-                        send(tool_error_response(id, e.what(), max_bytes, uncapped));
+                        send(tool_error_response(id, e.what(), max_bytes, uncapped, notice));
                     }
                     std::lock_guard lock(active_mutex);
                     active.erase(key);

@@ -61,7 +61,10 @@ def main():
     parser.add_argument("--max-chars", type=int, default=2000, help="code characters sent per candidate")
     parser.add_argument("--query-prefix", default="", help="text before the intent, e.g. a reranker instruction")
     parser.add_argument("--hard", action="store_true", help="same hardened questions as retrieval_eval.py --hard")
+    parser.add_argument("--outline", action="store_true",
+                        help="map hits to functions through the language server (slow on a cold big repo); default: text hunks")
     args = parser.parse_args()
+    ev.OUTLINE["on"] = args.outline
     try:
         urllib.request.urlopen(f"http://127.0.0.1:{args.rerank_port}/health", timeout=10).close()
     except OSError as error:

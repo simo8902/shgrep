@@ -1,50 +1,5 @@
 # shgrep
 
-## Ranked text search
-
-MCP search with operation="text" takes an optional `intent`, the user's task in words. With it, the findings are ranked against it and only the best come back; without it every finding returns in scan order, exactly as before. Ranking is local, needs no model or server by default, and keeps no state between requests. An optional reranker (below) can re-order the best candidates.
-
-**For agents: locate with `intent`, enumerate without it.** Pass `intent` to find where something is: you get the best 10 hunks (3 per file) and a plain note says how many matching hunks were left out. Omit `intent` when you need every occurrence (renames, all callers, counts): every match then returns in scan order. If a ranked scan stops at SHGREP_RANK_SCAN_LIMIT matches, the status is `limit` and the note says the ranking covers only the first matches found; narrow `path`, `include` or the patterns to rank the rest.
-
-How a ranked search works:
-
-1. The live scan's findings become candidates: text hunks (groups between `--` separators, or nearby matched lines), or json results grouped where their context overlaps.
-2. BM25 (k1 1.2, b 0.75) of the intent over each candidate's path and code orders them. Identifiers are split at `_` and camelCase, and instruction words (find, show, where, the, ...) are ignored. Ties keep scan order.
-3. At most 3 candidates per file and the best 10 overall come back, best first, with their original output text. json results carry `ranking: {rank, keyword_rank, score}`.
-4. Explicit limits (`max_results`, `max_matches_per_file`, `max_output_bytes`) apply after ranking. Responses include a ranking report (a leading `[ranking ...]` line for text): candidates, returned and the active limits. summary.matches_found describes the raw scan; matches_returned the returned matches.
-
-| Setting | Default | Effect |
-|---|---|---|
-| SHGREP_RANK_RETURN | 10 | most candidates returned (0 = all) |
-| SHGREP_RANK_PER_FILE | 3 | most candidates per file (0 = no cap) |
-| SHGREP_RANK_SCAN_LIMIT | 50000 | most matches collected before ranking (0 = no limit); keeps one loose pattern in a huge tree from making ranking hold millions of hits |
-| SHGREP_RERANK_PORT | unset | port of a llama-server on 127.0.0.1 started with `--reranking`; unset = no reranker |
-| SHGREP_RERANK_POOL | 24 | keyword candidates sent to the reranker (0 = all) |
-| SHGREP_RERANK_BUDGET_MS | 3000 | how long a search waits for the reranker |
-
-### Optional reranker
-
-Any reranker model that llama-server serves works (Qwen3-Reranker-0.6B was tested). Start it, then give shgrep its port:
-
-    llama-server -m <reranker>.gguf --reranking --pooling rank --embedding -ngl 99 --host 127.0.0.1 --port 8081
-    set SHGREP_RERANK_PORT=8081
-
-The best SHGREP_RERANK_POOL keyword candidates (`file: <path> (lines a-b)` plus up to 2,000 bytes of code each) are scored in one `POST /v1/rerank`, and the top 10 come back in the reranker's order; json results carry `ranking.rerank_score`. The reranker never makes a search fail: if it is unreachable, slow or answers badly, the keyword order is returned and the ranking report carries `rerank_error`. A search cannot be cancelled while it waits for the reranker (at most the budget). The reranker's quality depends on its model; measure it with `tests\retrieval_eval.py ... --rerank-port 8081`.
-
-Measured on 30 doc-comment questions in a Rust and Python repository (`tests/retrieval_eval.py`): the right function was ranked first for 87% of questions (77% with `--hard`) and returned about 6,000 tokens instead of about 123,000 for grep plus reading the file. Second-stage models were compared: Laya System One decision models never beat keywords and were removed (the integration and its evals are in commit 1b89e50, "SYSTEM ONE"); a standard reranker did (Qwen3-Reranker-0.6B, 100 hard questions: first 90% vs 78%, top 3 100% vs 93%) and is the optional stage above.
-
-Example text search:
-
-    {"operation":"text","patterns":["combat","transaction"],"intent":"Locate where a combat tick emits its transaction"}
-
-User-run ranking checks (no model, no server; add `--rerank-port 8081` to check the real reranker stage too):
-
-    python tests\rank_checks.py build-rel\shgrep.exe
-
-Retrieval quality, ranked against unranked results (add --hard to drop question words that also appear in the answer's code):
-
-    python tests\retrieval_eval.py build-rel\shgrep.exe "C:\Users\Simeon\Documents\rust-experimental" --count 30
-
 ## mcp__shgrep__create_directory
 
 Create a folder and its parents (mkdir -p). Links are never followed.
@@ -104,7 +59,7 @@ declare const tools: { mcp__shgrep__edit_file(args: {
 
 ## mcp__shgrep__file_info
 
-Disk metadata, or operation=lsp for server capabilities, diagnostics for current file/symbol problems, restart for LSP recovery. Links are never followed.
+Disk metadata, or operation=lsp for server capabilities and whether the reranker works, diagnostics for current file/symbol problems, restart for LSP recovery. Links are never followed.
 
 exec tool declaration:
 ```ts
@@ -230,7 +185,7 @@ declare const tools: { mcp__shgrep__move_file(args: {
 
 ## mcp__shgrep__read_file
 
-Read live code through LSP: complete symbol overview by default (one "LINE kind name_path" line each; format=json for ranges), or name_path for a symbol body. Explicit offset/limit or operation=text reads lines (all remaining lines unless limit is set). Unconfigured formats use text. No output byte cap. Text header includes encoding, mtime and sha256; binary and >256 MiB refused (UTF-16 >64 MiB). Links are never followed.
+Read live code through LSP: complete symbol overview by default (one "LINE kind name_path" line each; format=json for ranges), or name_path for a symbol body. Explicit offset/limit or operation=text reads lines (all remaining lines unless limit is set). Unconfigured formats use text; a code file whose bundled server is missing reads as text under an [LSP FAILURE ...] line to relay to the user. No output byte cap. Text header includes encoding, mtime and sha256; binary and >256 MiB refused (UTF-16 >64 MiB). Links are never followed.
 
 exec tool declaration:
 ```ts
@@ -262,7 +217,7 @@ declare const tools: { mcp__shgrep__read_file(args: {
 
 ## mcp__shgrep__search
 
-Navigate live code through LSP: symbols, definition/declaration/type_definition, implementation, references, or hover. Bodies are opt-in; no LSP output cap. Lua, XML, C/C++, Rust and Python work out of the box; .shgrep/lsp.json adds or overrides servers. A failing server is reported in a leading [LSP FAILURE ...] line, to relay to the user, followed by whole-word text matches. operation=text requires intent and a local llama-server with Laya: findings are ranked by keywords, the best re-ranked by Laya, and the top hunks return best first with their original text; the laya report gives the counts. An unreachable Laya is an error. Grep filters apply, including XML and files without a language server.
+Navigate live code through LSP: symbols, definition/declaration/type_definition, implementation, references, or hover. Bodies are opt-in; no LSP output cap. Lua, XML, C/C++, Rust, Python and C# (with the .NET 10+ SDK) work out of the box; .shgrep/lsp.json adds or overrides servers. A missing or failing server is reported in a leading [LSP FAILURE ...] line, to relay to the user, followed by whole-word text matches. operation=text requires intent (the task in words): only the best 10 hunks return, ranked by BM25 keywords (at most 3 per file) and then a local reranker, and a note states how many were left out. A reranker that is down fails the search with a leading [RERANK FAILURE ...] line, to relay to the user; for every reference to a symbol use operation=references. Grep filters apply, including XML and files without a language server.
 
 exec tool declaration:
 ```ts

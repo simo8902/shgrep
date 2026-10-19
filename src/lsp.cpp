@@ -1,4 +1,5 @@
 #include "lsp.hpp"
+#include "banner.hpp"
 #include "compile_db.hpp"
 #include "ignore.hpp"
 #include "lsp_watch.hpp"
@@ -27,7 +28,8 @@ using Clock = std::chrono::steady_clock;
 namespace fs = std::filesystem;
 using J = Json;
 [[noreturn]] void fail(const std::string& s) { throw std::runtime_error(s); }
-// A malformed answer from the language server, as opposed to a caller mistake.
+// A malformed answer from the language server, or no server for the request, as opposed to a caller mistake;
+//   callers turn it into the failure banner.
 [[noreturn]] void server_fail(const std::string& s) { throw LspFailure(s); }
 std::string str(const J& j, const char* key, const std::string& fallback = "") {
     const J* p = j.get(key); return p ? p->string() : fallback;
@@ -144,6 +146,8 @@ struct Config {
     //   Otherwise every matching file is opened, which servers without their own index need.
     bool indexes_workspace = false;
     J details;  // extra status, e.g. where clangd's compile flags came from
+    // Variables set for the server on top of shgrep's own environment (OmniSharp's DOTNET_ROOT).
+    std::vector<std::pair<std::wstring, std::wstring>> environment;
 };
 bool glob_match(std::string_view pattern, std::string_view value) {
     std::vector<uint8_t> prior(value.size() + 1, 0), next(value.size() + 1, 0);
@@ -210,7 +214,70 @@ bool path_excluded(const Config& config, const fs::path& path) {
 // CONTRACT: tools/fetch_lsp.py installs these servers into <shgrep.exe folder>\lsp; folders and executables match
 //   its PINS. They serve every workspace with no configuration. .shgrep/lsp.json entries take over the extensions
 //   they name, and "bundled": false there turns the shipped servers off. A server that was not installed is
-//   skipped, so its files fall back to text.
+//   skipped; missing_bundled names it so the text fallback for its files carries the failure banner.
+struct BundledServer { const char* language; const char* name; const wchar_t* executable; std::vector<std::string> extensions; };
+const std::vector<BundledServer>& bundled_servers() {
+    static const std::vector<BundledServer> servers{
+        {"lua", "LuaLS", L"lua\\bin\\lua-language-server.exe", {".lua"}},
+        {"xml", "LemMinX", L"xml\\lemminx.exe", {".xml", ".xsd", ".xsl", ".xslt", ".svg"}},
+        {"cpp", "clangd", L"clangd\\bin\\clangd.exe", {".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".hxx", ".inl", ".ipp"}},
+        {"rust", "rust-analyzer", L"rust\\rust-analyzer.exe", {".rs"}},
+        {"python", "ty", L"python\\ty.exe", {".py", ".pyi"}},
+        {"csharp", "OmniSharp", L"csharp\\OmniSharp.exe", {".cs"}},
+    };
+    return servers;
+}
+const BundledServer& bundled_server(std::string_view language) {
+    for (const auto& server : bundled_servers()) if (server.language == language) return server;
+    throw std::logic_error("unknown bundled language server");
+}
+// COMPAT: OmniSharp 2 runs on .NET 10 (runtimeconfig: 10.0, LatestMajor) and loads projects through the SDK's
+//   MSBuild, so it needs a dotnet with a 10+ runtime and an SDK. It looks in DOTNET_ROOT, then PATH; without one it
+//   starts but loads no project and answers every request empty. shgrep therefore finds a usable dotnet itself
+//   (DOTNET_ROOT, PATH, then %ProgramFiles%\dotnet), hands it over as DOTNET_ROOT, and reports a missing one
+//   instead of starting the server. Rechecked every 30 seconds, so a fresh .NET install is picked up.
+struct DotNet { fs::path root; std::string problem; };
+DotNet find_dotnet() {
+    static std::mutex mutex;
+    static DotNet cached;
+    static std::chrono::steady_clock::time_point checked{};
+    std::lock_guard lock(mutex);
+    const auto now = std::chrono::steady_clock::now();
+    if (checked != std::chrono::steady_clock::time_point{} && now - checked < std::chrono::seconds(30)) return cached;
+    std::vector<fs::path> candidates;
+    std::wstring buffer(32768, L'\0');
+    if (const DWORD n = GetEnvironmentVariableW(L"DOTNET_ROOT", buffer.data(), static_cast<DWORD>(buffer.size())); n && n < buffer.size())
+        candidates.emplace_back(std::wstring(buffer.data(), n));
+    if (const DWORD n = SearchPathW(nullptr, L"dotnet.exe", nullptr, static_cast<DWORD>(buffer.size()), buffer.data(), nullptr); n && n < buffer.size())
+        candidates.push_back(fs::path(std::wstring(buffer.data(), n)).parent_path());
+    if (const DWORD n = GetEnvironmentVariableW(L"ProgramFiles", buffer.data(), static_cast<DWORD>(buffer.size())); n && n < buffer.size())
+        candidates.push_back(fs::path(std::wstring(buffer.data(), n)) / L"dotnet");
+    std::string seen;
+    DotNet result;
+    for (const auto& root : candidates) {
+        std::error_code error;
+        if (!fs::is_regular_file(root / L"dotnet.exe", error)) continue;
+        int runtime = 0;
+        for (const auto& entry : fs::directory_iterator(root / L"shared" / L"Microsoft.NETCore.App", error))
+            runtime = std::max(runtime, static_cast<int>(std::wcstol(entry.path().filename().c_str(), nullptr, 10)));
+        bool sdk = false;
+        for (const auto& entry : fs::directory_iterator(root / L"sdk", error)) if (entry.is_directory(error)) { sdk = true; break; }
+        if (runtime >= 10 && sdk) { result.root = root; break; }
+        if (seen.empty())
+            seen = " (" + utf8(root.wstring()) + " has " + (runtime ? ".NET " + std::to_string(runtime) : std::string("no runtime")) +
+                   (sdk ? "" : " and no SDK") + ")";
+    }
+    if (result.root.empty())
+        result.problem = "needs the .NET 10 or newer SDK, and no dotnet with one was found in DOTNET_ROOT, PATH or "
+                         "%ProgramFiles%\\dotnet" + seen + "; install it from https://dot.net";
+    cached = result;
+    checked = now;
+    return result;
+}
+// Why the bundled server for language cannot run although it is installed; empty when nothing is missing.
+std::string bundled_prerequisite(std::string_view language) {
+    return language == "csharp" ? find_dotnet().problem : std::string();
+}
 const fs::path& bundled_directory() {
     static const fs::path directory = [] {
         std::wstring buffer(MAX_PATH, L'\0');
@@ -225,21 +292,36 @@ const fs::path& bundled_directory() {
     }();
     return directory;
 }
+// CONTRACT: every report of a missing bundled server names where shgrep expects it and this command, which downloads
+//   the pinned servers into the lsp folder beside this shgrep.exe (each deployed copy has its own).
+std::string fetch_command() {
+    const fs::path& base = bundled_directory();
+    const std::string folder = base.empty() ? std::string("<folder of shgrep.exe>") : utf8(base.parent_path().wstring());
+    std::string script = "<shgrep sources>\\tools\\fetch_lsp.py";
+#ifdef SHGREP_SOURCE_DIR
+    fs::path source = fs::path(SHGREP_SOURCE_DIR) / L"tools" / L"fetch_lsp.py";
+    std::error_code error;
+    if (fs::is_regular_file(source, error)) script = utf8(source.make_preferred().wstring());
+#endif
+    return "python \"" + script + "\" \"" + folder + "\"";
+}
 void add_bundled(std::vector<Config>& result, const fs::path& root, const std::set<std::string>& owned,
                  const SearchContext& context, bool cmake_configure) {
     const fs::path& base = bundled_directory();
     if (base.empty()) return;
     const fs::path state = root / L".shgrep" / L"lsp-state";
-    auto add = [&](const char* language, const fs::path& executable, std::vector<std::string> extensions,
+    auto add = [&](const BundledServer& server,
                    std::vector<std::string> arguments, J settings = J::Object{}, J initialization = J::Object{},
                    std::vector<fs::path> directories = {}, const std::string& variant = {}, J details = nullptr) {
+        const fs::path executable = base / server.executable;
         std::error_code error;
         if (!fs::is_regular_file(executable, error)) return;
+        std::vector<std::string> extensions = server.extensions;
         std::erase_if(extensions, [&](const std::string& ext) { return owned.contains(ext); });
         if (extensions.empty()) return;
         Config config;
         config.root = root;
-        config.language = language;
+        config.language = server.language;
         config.command.push_back(utf8(executable.wstring()));
         config.command.insert(config.command.end(), arguments.begin(), arguments.end());
         config.extensions = std::move(extensions);
@@ -250,14 +332,14 @@ void add_bundled(std::vector<Config>& result, const fs::path& root, const std::s
         config.indexes_workspace = true;
         config.details = std::move(details);
         // A new variant (clangd's compile database changed) is a new key, so the old server is retired.
-        config.key = lower(utf8(root.wstring())) + ":bundled:" + language + ":" + variant;
+        config.key = lower(utf8(root.wstring())) + ":bundled:" + server.language + ":" + variant;
         for (const auto& ext : config.extensions) config.key += ":" + ext;
         result.push_back(std::move(config));
     };
     // COMPAT: LuaLS keeps logs and generated meta files in the folders it is given; Lua 5.1 suits the owner's
     //   game scripts, and a workspace .luarc.json still overrides it.
     const fs::path lua = state / L"lua";
-    add("lua", base / L"lua" / L"bin" / L"lua-language-server.exe", {".lua"},
+    add(bundled_server("lua"),
         {"--logpath=" + utf8((lua / L"logs").wstring()), "--metapath=" + utf8((lua / L"meta").wstring())},
         J::Object{{"Lua", J::Object{{"runtime", J::Object{{"version", "Lua 5.1"}}},
                                     {"telemetry", J::Object{{"enable", false}}},
@@ -271,11 +353,11 @@ void add_bundled(std::vector<Config>& result, const fs::path& root, const std::s
         {"telemetry", J::Object{{"enabled", false}}},
         {"downloadExternalResources", J::Object{{"enabled", false}}},
         {"validation", J::Object{{"resolveExternalEntities", false}}}}}};
-    add("xml", base / L"xml" / L"lemminx.exe", {".xml", ".xsd", ".xsl", ".xslt", ".svg"}, {},
+    add(bundled_server("xml"), {},
         xml_settings, J::Object{{"settings", xml_settings}}, {xml});
     // compile_db.cpp finds or generates clangd's compile flags. SHGREP_CLANGD_LOG=info|verbose raises its stderr log
     // for diagnosing index problems.
-    const fs::path clangd = base / L"clangd" / L"bin" / L"clangd.exe";
+    const fs::path clangd = base / bundled_server("cpp").executable;
     std::string clangd_log = "error";
     wchar_t level[16];
     if (const DWORD n = GetEnvironmentVariableW(L"SHGREP_CLANGD_LOG", level, 16); n && n < 16) {
@@ -285,7 +367,7 @@ void add_bundled(std::vector<Config>& result, const fs::path& root, const std::s
     std::error_code clangd_error;
     if (fs::is_regular_file(clangd, clangd_error)) {
         const CompileSetup setup = cpp_compile_setup(root, context, cmake_configure);
-        add("cpp", clangd, {".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".hxx", ".inl", ".ipp"},
+        add(bundled_server("cpp"),
             // --background-index keeps its shards beside the compile database; limits of 0 return every result.
             {"--log=" + clangd_log, "--header-insertion=never", "--background-index", "--limit-results=0", "--limit-references=0",
              "--rename-file-limit=0"},
@@ -294,9 +376,19 @@ void add_bundled(std::vector<Config>& result, const fs::path& root, const std::s
     }
     // rust-analyzer loads Cargo projects through the user's cargo; without it only syntax-level features work.
     // The default workspace/symbol limit of 128 would cut symbol searches short.
-    add("rust", base / L"rust" / L"rust-analyzer.exe", {".rs"}, {}, J::Object{},
+    add(bundled_server("rust"), {}, J::Object{},
         J::Object{{"workspace", J::Object{{"symbol", J::Object{{"search", J::Object{{"limit", 1000000}}}}}}}});
-    add("python", base / L"python" / L"ty.exe", {".py", ".pyi"}, {"server"});
+    add(bundled_server("python"), {"server"});
+    // SAFETY: package restore would write obj\ folders into the workspace and fetch packages from the network;
+    //   without it, projects whose packages were never restored lack those references.
+    if (const DotNet dotnet = find_dotnet(); dotnet.problem.empty()) {
+        // A different dotnet is a new variant, so the server restarts on it; the status shows which one is used.
+        const std::string dotnet_root = utf8(dotnet.root.wstring());
+        add(bundled_server("csharp"), {"-lsp", "DotNet:enablePackageRestore=false"}, J::Object{}, J::Object{}, {},
+            dotnet_root, J::Object{{"dotnet_root", dotnet_root}});
+        if (!result.empty() && result.back().language == "csharp")
+            result.back().environment.emplace_back(L"DOTNET_ROOT", dotnet.root.wstring());
+    }
 }
 std::vector<Config> configs_from_disk(const fs::path& root, const SearchContext& context) {
     const fs::path path = root / L".shgrep" / L"lsp.json";
@@ -377,6 +469,26 @@ std::optional<Config> configuration(const SourceText& source, const SearchContex
         if (std::find(config.extensions.begin(), config.extensions.end(), ext) != config.extensions.end()) return config;
     }
     return std::nullopt;
+}
+// Why a file that configuration() left without a server has none, when a bundled server would serve its type:
+//   the server was not installed, or "bundled": false turned it off. Empty for types no bundled server knows.
+std::string missing_bundled(const SourceText& source) {
+    const std::string ext = lower(utf8(source.path.extension().wstring()));
+    for (const auto& server : bundled_servers()) {
+        if (std::find(server.extensions.begin(), server.extensions.end(), ext) == server.extensions.end()) continue;
+        const fs::path& base = bundled_directory();
+        std::error_code error;
+        if (!base.empty() && fs::is_regular_file(base / server.executable, error)) {
+            if (const std::string problem = bundled_prerequisite(server.language); !problem.empty())
+                return std::string("no language server for ") + ext + " files: the bundled " + server.name + " " + problem;
+            return std::string("no language server for ") + ext + " files: the bundled " + server.name +
+                   " is turned off by \"bundled\": false in .shgrep/lsp.json and no server there handles " + ext;
+        }
+        return std::string("no language server for ") + ext + " files: the bundled " + server.name + " is not installed; shgrep " +
+               "expects it at " + (base.empty() ? std::string("lsp\\ beside shgrep.exe") : utf8((base / server.executable).wstring())) +
+               ". Download the bundled servers there with: " + fetch_command() + " (or add a server to .shgrep/lsp.json)";
+    }
+    return {};
 }
 struct Position {
     int64_t line = 0, column = 0;
@@ -543,6 +655,7 @@ class Session {
     std::string reader_error_;
     std::map<std::wstring, J, PathLess> published_diagnostics_;
     std::map<std::string, std::pair<std::string, J>> registrations_;
+    Clock::time_point initialized_at_{};  // when "initialized" was sent; late dynamic registrations settle after it
     int64_t next_id_ = 0;
     J capabilities_ = J::Object{};
     int sync_kind_ = 0;
@@ -860,10 +973,36 @@ public:
             if (!command.empty()) command.push_back(L' ');
             command += quoted(wide(part));
         }
+        // config.environment overrides same-named variables (case-insensitive) of shgrep's own environment.
+        std::wstring environment;
+        if (!config.environment.empty()) {
+            std::vector<std::wstring> entries;
+            if (wchar_t* block = GetEnvironmentStringsW()) {
+                for (const wchar_t* entry = block; *entry; entry += wcslen(entry) + 1) {
+                    const std::wstring_view text(entry);
+                    const size_t equals = text.find(L'=', 1);  // "=C:=C:\\dir" entries start with '='
+                    const bool overridden = std::any_of(config.environment.begin(), config.environment.end(), [&](const auto& item) {
+                        return equals == item.first.size() &&
+                            CompareStringOrdinal(entry, static_cast<int>(equals), item.first.data(), static_cast<int>(item.first.size()), TRUE) == CSTR_EQUAL;
+                    });
+                    if (!overridden) entries.emplace_back(text);
+                }
+                FreeEnvironmentStringsW(block);
+            }
+            for (const auto& [name, value] : config.environment) entries.push_back(name + L"=" + value);
+            // CreateProcess expects the block sorted by name, case-insensitively.
+            std::sort(entries.begin(), entries.end(), [](const std::wstring& a, const std::wstring& b) {
+                const size_t na = a.find(L'=', 1), nb = b.find(L'=', 1);
+                return CompareStringOrdinal(a.data(), static_cast<int>(std::min(na, a.size())),
+                                            b.data(), static_cast<int>(std::min(nb, b.size())), TRUE) == CSTR_LESS_THAN;
+            });
+            for (const auto& entry : entries) { environment += entry; environment.push_back(L'\0'); }
+            environment.push_back(L'\0');
+        }
         PROCESS_INFORMATION process{};
         const BOOL created = CreateProcessW(nullptr, command.data(), nullptr, nullptr, TRUE,
-            CREATE_NO_WINDOW | CREATE_SUSPENDED | EXTENDED_STARTUPINFO_PRESENT, nullptr, config.root.c_str(),
-            &startup.StartupInfo, &process);
+            CREATE_NO_WINDOW | CREATE_SUSPENDED | EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT,
+            environment.empty() ? nullptr : environment.data(), config.root.c_str(), &startup.StartupInfo, &process);
         const DWORD error = GetLastError();
         DeleteProcThreadAttributeList(attributes);
         if (!created) fail("cannot start LSP command (Windows error " + std::to_string(error) + ")");
@@ -917,10 +1056,15 @@ public:
         sync_kind_ = sync ? static_cast<int>(std::holds_alternative<int64_t>(sync->value) ? sync->integer() : number(*sync, "change", 0)) : 0;
         if (sync_kind_ != 1 && sync_kind_ != 2) fail("language server does not support live document synchronization");
         notify("initialized", J::Object{}, control);
+        initialized_at_ = Clock::now();
         notify("workspace/didChangeConfiguration", J::Object{{"settings", config.settings}}, control);
         { std::lock_guard lock(messages_mutex_); last_activity_ = Clock::now(); }
     }
     void require(const char* capability) const {
+        // COMPAT: OmniSharp registers every navigation feature dynamically a few milliseconds after "initialized", so a
+        //   request right after start waits up to 3 seconds for registrations before calling a feature missing.
+        const auto settle = initialized_at_ + std::chrono::seconds(3);
+        while (!supports(capability) && Clock::now() < settle) std::this_thread::sleep_for(std::chrono::milliseconds(10));
         if (!supports(capability)) fail(std::string("language server lacks ") + capability);
     }
     static std::string capability_method(const std::string& capability) {
@@ -1699,7 +1843,7 @@ bool contains_folded(std::string_view text, std::string_view needle) {
 } // namespace
 
 std::string lsp_failure_banner(const std::string& detail, const std::string& fallback) {
-    return "[LSP FAILURE - tell the user about this in your next message, before continuing: " + detail + ". " + fallback + "]\n";
+    return failure_banner("LSP FAILURE", detail, fallback);
 }
 
 std::shared_timed_mutex& workspace_operation_mutex() {
@@ -1709,6 +1853,28 @@ std::shared_timed_mutex& workspace_operation_mutex() {
 
 bool lsp_configured(const SourceText& source, const SearchContext& context) {
     return configuration(source, context).has_value();
+}
+
+std::string lsp_missing(const SourceText& source, const SearchContext& context) {
+    return configuration(source, context) ? std::string() : missing_bundled(source);
+}
+
+std::vector<std::string> lsp_health() {
+    std::vector<std::string> problems;
+    std::string missing;
+    const fs::path& base = bundled_directory();
+    for (const auto& server : bundled_servers()) {
+        std::error_code error;
+        if (base.empty() || !fs::is_regular_file(base / server.executable, error))
+            missing += (missing.empty() ? "" : ", ") + std::string(server.name) + " (" + server.language + ") at " +
+                       (base.empty() ? std::string("lsp\\ beside shgrep.exe") : utf8((base / server.executable).wstring()));
+        else if (const std::string problem = bundled_prerequisite(server.language); !problem.empty())
+            problems.push_back(std::string("the bundled ") + server.name + " (" + server.language + ") " + problem);
+    }
+    if (!missing.empty())
+        problems.insert(problems.begin(), "bundled language servers are missing, so their files fall back to text: shgrep "
+                        "expects " + missing + ". Download them there with: " + fetch_command());
+    return problems;
 }
 
 Json lsp_query(const std::string& operation, const Json& arguments, const SearchContext& context,
@@ -1747,7 +1913,11 @@ Json lsp_query(const std::string& operation, const Json& arguments, const Search
         if (!directory) {
             const SourceText source = read_source_text(context, path);
             const auto config = configuration(source, context);
-            if (!config) fail("no language server for this file type (install the bundled ones with tools/fetch_lsp.py or add one to .shgrep/lsp.json); use operation: text");
+            if (!config) {
+                const std::string missing = missing_bundled(source);
+                server_fail(missing.empty() ? "no language server for this file type (add one to .shgrep/lsp.json); use operation: text"
+                                            : missing + "; use operation: text");
+            }
             return query_file(operation, arguments, source, *config, context, control, synchronized);
         }
     }
@@ -1762,6 +1932,7 @@ Json lsp_query(const std::string& operation, const Json& arguments, const Search
     };
     J::Array results;
     std::set<std::wstring, PathLess> scanned;
+    bool any_server = false;
     for (const auto& root : context.allowed_roots) {
         const fs::path absolute = fs::absolute(root).lexically_normal();
         if (scope && !below(scope->path, absolute) && !below(absolute, scope->path) &&
@@ -1788,6 +1959,7 @@ Json lsp_query(const std::string& operation, const Json& arguments, const Search
         for (const auto& config : configured)
             extensions.insert(extensions.end(), config.extensions.begin(), config.extensions.end());
         if (extensions.empty()) continue;
+        any_server = true;
         const auto paths = source_paths(context, utf8(absolute.wstring()), extensions, control.deadline, cancelled);
         // PERF: a workspace-wide symbol search opens a file in an indexing server only when one of the names occurs in
         //   its text (ASCII case folded); a symbol's name always appears where it is declared or defined, so this
@@ -1826,7 +1998,8 @@ Json lsp_query(const std::string& operation, const Json& arguments, const Search
             }
         }
     }
-    if (operation != "files" && synchronized.empty() && !scope) fail("no LSP source files found; install the bundled servers with tools/fetch_lsp.py, add one to .shgrep/lsp.json, or use operation: text");
+    // A scoped folder may hold no source files, but with no server at all an empty answer would hide the gap.
+    if (operation != "files" && synchronized.empty() && (!scope || !any_server)) server_fail("no LSP source files found; install the bundled servers with tools/fetch_lsp.py, add one to .shgrep/lsp.json, or use operation: text");
     return J::Object{{"results", std::move(results)}, {"backend", "lsp"}};
 }
 
@@ -2020,7 +2193,10 @@ Json lsp_edit(const Json& arguments, const SearchContext& context,
     if (const J* expected = arguments.get("expected_mtime"))
         if (source.mtime != expected->string()) fail("expected_mtime does not match current file");
     const auto config = configuration(source, context);
-    if (!config) fail("no language server configured for this file; use operation=text");
+    if (!config) {
+        const std::string missing = missing_bundled(source);
+        server_fail(missing.empty() ? "no language server configured for this file; use operation=text" : missing + "; use operation=text");
+    }
     auto session = session_for(*config);
     auto lock = acquire(*session, control);
     try {

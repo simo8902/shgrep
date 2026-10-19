@@ -15,6 +15,12 @@ import threading
 import time
 import urllib.parse
 
+# MCP sessions require intent on operation=text and a reranker on 127.0.0.1:8081. The suites need exhaustive
+# scan-order text results and run without a reranker, so they opt out unless the caller set these; the checks of
+# that enforcement (rank_checks.py) set them back per client.
+os.environ.setdefault("SHGREP_REQUIRE_INTENT", "0")
+os.environ.setdefault("SHGREP_RERANK_PORT", "0")
+
 
 def units(text):
     return len(text.encode("utf-16-le")) // 2

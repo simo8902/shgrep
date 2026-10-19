@@ -89,4 +89,20 @@ if(MSVC)
     target_compile_options(shgrep PRIVATE /W4 /permissive- /utf-8)
 endif()
 
+target_compile_definitions(shgrep PRIVATE "SHGREP_SOURCE_DIR=\"${CMAKE_CURRENT_SOURCE_DIR}\"")
+
+set(SHGREP_DEPLOY
+    "${CMAKE_CURRENT_SOURCE_DIR}/dist/shgrep.exe"
+    "C:/Users/Simeon/Documents/shgrep.exe"
+)
+if(SHGREP_DEPLOY)
+    string(REPLACE ";" "\n" SHGREP_DEPLOY_LINES "${SHGREP_DEPLOY}")
+    file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/deploy-targets.txt" "${SHGREP_DEPLOY_LINES}\n")
+    add_custom_target(deploy ALL
+        COMMAND "${CMAKE_COMMAND}" "-DSOURCE=$<TARGET_FILE:shgrep>" "-DTARGETS_FILE=${CMAKE_CURRENT_BINARY_DIR}/deploy-targets.txt"
+                -P "${CMAKE_CURRENT_SOURCE_DIR}/tools/deploy.cmake"
+        COMMENT "Deploying shgrep.exe" VERBATIM)
+    add_dependencies(deploy shgrep)
+endif()
+
 install(TARGETS shgrep RUNTIME DESTINATION . COMPONENT shgrep)

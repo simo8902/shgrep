@@ -27,6 +27,7 @@ import time
 from lsp_smoke import Client
 
 SLOW = {"timeout_ms": 300000}
+OUTLINE = {"on": True}  # map hits to enclosing functions through the language server; --no-outline keeps text hunks
 EXTRA = {}  # extra search arguments for every ranked/unranked search, set from the command line
 SKIP = {"target", "node_modules", "libs", "third_party", "vendor", "build", "dist", "__pycache__"}
 STOP = set("""a an and are as at be by can for from has have if in into is it its of on or that the this to was
@@ -170,10 +171,15 @@ def lexical(client, keys, extensions, intent=None):
         hit_lines = sorted(by_file[path])
         covered = set()
         try:
+            if not OUTLINE["on"]:
+                raise AssertionError("outline disabled")
             outline = client.tool("read_file", {"path": path, "operation": "overview", "depth": -1, "format": "json", **SLOW})["results"]
         except (AssertionError, KeyError, json.JSONDecodeError) as error:
+            if not OUTLINE["on"]:
+                error = ""
             # Keep every hit as text if LSP cannot provide an outline for this file.
-            print(f"Outline unavailable for {path}; retaining text candidates: {error}", file=sys.stderr)
+            if OUTLINE["on"]:
+                print(f"Outline unavailable for {path}; retaining text candidates: {error}", file=sys.stderr)
             outline = []
         for symbol in outline:
             if symbol.get("kind") not in (6, 12):
@@ -227,11 +233,14 @@ def main():
     parser.add_argument("--hard", action="store_true",
                         help="drop the question words that also appear in the answer's code; keep questions with 3+ words left")
     parser.add_argument("--rerank-port", type=int, help="port of a running llama-server --reranking: adds a reranked arm")
+    parser.add_argument("--no-outline", action="store_true",
+                        help="skip the language server: every candidate is a text hunk (fast, same pool for every model)")
     parser.add_argument("--context-bytes", type=int,
                         help="json context bytes around each match (default 80): the code a ranker and reranker see per hunk")
     args = parser.parse_args()
     if args.context_bytes:
         EXTRA["context_bytes"] = args.context_bytes
+    OUTLINE["on"] = not args.no_outline
     repo = args.repo.resolve()
     asked = questions(repo, args.count, args.seed, args.hard)
     print(f"{len(asked)} questions from doc comments in {repo}")

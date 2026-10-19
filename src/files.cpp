@@ -1,5 +1,6 @@
 #include "files.hpp"
 #include "lsp.hpp"
+#include "rank.hpp"
 #include "ignore.hpp"
 #include "winfs.hpp"
 
@@ -892,15 +893,19 @@ Json read_file(const Json& args, const SearchContext& context, const std::shared
         if (cancelled && cancelled->load()) fail("read_file cancelled");
         auto read = [&] {
             const bool text_range = operation == "text" || args.get("offset") || args.get("limit");
-            // CONTRACT: when the language server fails on a file, the read falls back to the file's text under the
-            //   failure banner; a folder outline has no text fallback and fails with the banner.
+            // CONTRACT: when the language server fails on a file, or the bundled server for its type is missing, the
+            //   read falls back to the file's text under the failure banner; a folder outline has no text fallback
+            //   and fails with the banner. Types no server knows (.md, .txt) read as text without a banner.
             std::string failure;
             if (!text_range) {
                 bool directory = false;
                 const SourceText descriptor = source_descriptor(context, path, &directory);
                 bool semantic = directory || operation != "auto" || args.get("name_path");
                 if (!semantic) {
-                    try { semantic = lsp_configured(descriptor, context); }
+                    try {
+                        semantic = lsp_configured(descriptor, context);
+                        if (!semantic) failure = lsp_missing(descriptor, context);
+                    }
                     catch (const LspFailure& e) { failure = e.what(); }
                 }
                 if (semantic) {
@@ -2091,7 +2096,17 @@ Json run_file_tool(const std::string& name, const Json& arguments, const SearchC
         if (operation != "diagnostics" && (arguments.get("name_path") || arguments.get("severity")))
             fail("name_path/severity require diagnostics");
         const std::string method = operation == "lsp" ? "status" : operation;
-        if (!arguments.get("paths")) return Json::Object{{"text", lsp_query(method, arguments, context, cancelled).dump() + "\n"}};
+        if (!arguments.get("paths")) {
+            Json status = lsp_query(method, arguments, context, cancelled);
+            // The status also says whether the reranker that ranked text searches need answers.
+            if (method == "status" && std::holds_alternative<Json::Object>(status.value)) {
+                std::string problem;
+                try { problem = Ranker("health check").check_reranker(); }
+                catch (const std::exception& e) { problem = e.what(); }
+                std::get<Json::Object>(status.value).emplace("reranker", Json(problem.empty() ? std::string("working") : problem));
+            }
+            return Json::Object{{"text", status.dump() + "\n"}};
+        }
         std::string out;
         for (const auto& path : path_args(arguments)) {
             Json::Object query = arguments.object(); query.erase("paths"); query["path"] = path;
@@ -2180,7 +2195,7 @@ Json file_tool_definitions(bool read_only) {
     Json::Array tools;
     tools.push_back(Json::Object{{"name", "read_file"}, {"description",
         "Read live code through LSP: symbol overview by default (one \"LINE kind name_path\" line each; format=json for ranges), or name_path for a symbol body. "
-        "Explicit offset/limit or operation=text reads lines (all remaining lines unless limit is set). Unconfigured formats use text. "
+        "Explicit offset/limit or operation=text reads lines (all remaining lines unless limit is set). Unconfigured formats use text; a code file whose bundled server is missing reads as text under an [LSP FAILURE ...] line to relay to the user. "
         "No output byte cap. Text header includes encoding, mtime and sha256; binary and >256 MiB refused (UTF-16 >64 MiB)." + common_paths},
         {"inputSchema", schema(Json::Object{{"path", path}, {"paths", paths},
             {"offset", field("integer", "First line, from 1.")},
@@ -2206,7 +2221,7 @@ Json file_tool_definitions(bool read_only) {
             {"timeout_ms", field("integer", "Default 30000.")},
             {"max_output_bytes", max_output}})}});
     tools.push_back(Json::Object{{"name", "file_info"}, {"description",
-        "Disk metadata, or operation=lsp for server capabilities, diagnostics for current file/symbol problems, restart for LSP recovery." + common_paths},
+        "Disk metadata, or operation=lsp for server capabilities and whether the reranker works, diagnostics for current file/symbol problems, restart for LSP recovery." + common_paths},
         {"inputSchema", schema(Json::Object{{"path", path}, {"paths", paths},
             {"operation", choice(Json::Array{"metadata", "lsp", "diagnostics", "restart"}, "Default metadata. lsp/restart may omit path to address all configured servers.")},
             {"name_path", field("string", "diagnostics: restrict to this symbol.")},

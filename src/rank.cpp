@@ -1,4 +1,5 @@
 #include "rank.hpp"
+#include "banner.hpp"
 #include <windows.h>
 #include <winhttp.h>
 #include <algorithm>
@@ -177,7 +178,7 @@ Ranker::Ranker(std::string intent) : intent_(std::move(intent)) {
     if (intent_.size() > 4096) throw std::runtime_error("intent is at most 4096 UTF-8 bytes");
     return_limit_ = setting_number(L"SHGREP_RANK_RETURN", 10, 100000);
     per_file_ = setting_number(L"SHGREP_RANK_PER_FILE", 3, 100000);
-    rerank_port_ = setting_number(L"SHGREP_RERANK_PORT", 0, 65535);  // 0 = no reranker
+    rerank_port_ = setting_number(L"SHGREP_RERANK_PORT", 8081, 65535);  // 0 = reranker off (tests, benchmarks)
     rerank_pool_ = setting_number(L"SHGREP_RERANK_POOL", 24, 100000);
     rerank_budget_ms_ = std::max<uint32_t>(setting_number(L"SHGREP_RERANK_BUDGET_MS", 3000, 300000), 1);
 }
@@ -245,13 +246,15 @@ std::vector<Ranked> Ranker::rank(const std::vector<RankCandidate>& candidates) {
     reranked_ = rerank_ms_ = 0;
     if (use_reranker && ranked.size() > 1) {
         const auto started = std::chrono::steady_clock::now();
-        const std::vector<Ranked> keyword_order = ranked;
         try {
             rerank(candidates, ranked);
             mode_ = "rerank";
         } catch (const std::exception& error) {
-            ranked = keyword_order;  // never fail a search because the optional reranker failed
-            rerank_error_ = error.what();
+            const std::string port = std::to_string(rerank_port_);
+            throw std::runtime_error(failure_banner("RERANK FAILURE",
+                "the reranker on 127.0.0.1:" + port + " failed (" + error.what() + "), so this ranked search returned "
+                "nothing", "Start it with: llama-server -m <reranker>.gguf --reranking --pooling rank --embedding "
+                "--host 127.0.0.1 --port " + port + " (SHGREP_RERANK_PORT names another port), then retry"));
         }
         rerank_ms_ = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - started).count());
@@ -262,10 +265,24 @@ std::vector<Ranked> Ranker::rank(const std::vector<RankCandidate>& candidates) {
     return ranked;
 }
 
+std::string Ranker::check_reranker() {
+    if (!rerank_port_) return "the reranker is turned off by SHGREP_RERANK_PORT=0, so ranked searches use BM25 only";
+    const std::vector<RankCandidate> candidates{{"health.txt", 1, 1, "merge two sorted lists"}, {"health.txt", 3, 3, "draw a circle"}};
+    std::vector<Ranked> ranked{{0, 0, 0}, {1, 1, 0}};
+    try { rerank(candidates, ranked); }
+    catch (const std::exception& error) {
+        return "the reranker on 127.0.0.1:" + std::to_string(rerank_port_) + " does not work (" + error.what() +
+               "); start it with: llama-server -m <reranker>.gguf --reranking --pooling rank --embedding --host 127.0.0.1 "
+               "--port " + std::to_string(rerank_port_);
+    }
+    return {};
+}
+
 Json Ranker::report() const {
     Json::Object report{{"mode", mode_}, {"candidates", candidates_}, {"returned", returned_},
                         {"return_limit", static_cast<int64_t>(return_limit_)},
                         {"per_file_cap", static_cast<int64_t>(per_file_)}, {"ranking", "bm25(k1=1.2,b=0.75)"}};
+    if (!rerank_port_) report.emplace("reranker", "off (SHGREP_RERANK_PORT=0)");
     if (rerank_port_) {
         report.emplace("rerank_port", static_cast<int64_t>(rerank_port_));
         report.emplace("rerank_scored", reranked_);

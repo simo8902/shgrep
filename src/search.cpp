@@ -4,6 +4,7 @@
 #include "files.hpp"
 #include "lsp.hpp"
 #include "rank.hpp"
+#include "banner.hpp"
 #include "ignore.hpp"
 #include "teddy.hpp"
 #include "winfs.hpp"
@@ -5612,23 +5613,32 @@ Json word_search(const std::vector<std::string>& names, const Json& arguments, c
     if (arguments.get("timeout_ms")) query.emplace("timeout_ms", *arguments.get("timeout_ms"));
     if (!path.empty()) query.emplace("path", path);
     if (!extension.empty()) query.emplace("extensions", Json::Array{extension});
-    Json result = run_unlocked("search", query, context, cancelled);
+    Json result;
+    // A failing ranked search (the reranker is down) keeps the note, so the LSP failure is still reported.
+    try { result = run_unlocked("search", query, context, cancelled); }
+    catch (const std::exception& e) { throw std::runtime_error(note + e.what()); }
     auto& object = std::get<Json::Object>(result.value);
     object["text"] = note + object["text"].string();
     return result;
 }
 
 // CONTRACT: a navigation request that no language server can answer (none handles the file type, or the server
-//   failed: failure is then its message) answers with whole-word text matches for the symbol's name under a
-//   leading note instead of failing. symbols and hover stay in the file or folder; the other operations search
-//   every file with the same extension. nullopt when no name can be derived or a server should answer.
+//   failed: failure is then its message) answers with whole-word text matches for the symbol's name under the
+//   failure banner instead of failing, so the user learns semantic results were unavailable. symbols and hover
+//   stay in the file or folder; the other operations search every file with the same extension. nullopt when no
+//   name can be derived or a server should answer.
 std::optional<Json> text_fallback(const std::string& operation, const Json& arguments, const SearchContext& context,
                                   const std::shared_ptr<std::atomic_bool>& cancelled, const std::string& failure = {}) {
     const std::string path = text(arguments, "path");
     bool directory = false;
     std::optional<SourceText> descriptor;
     if (!path.empty()) descriptor = source_descriptor(context, path, &directory);
-    if (failure.empty() && (!descriptor || directory || lsp_configured(*descriptor, context))) return std::nullopt;
+    std::string reason = failure;
+    if (reason.empty()) {
+        if (!descriptor || directory || lsp_configured(*descriptor, context)) return std::nullopt;
+        reason = lsp_missing(*descriptor, context);
+        if (reason.empty()) reason = "no language server for this file type (add one to .shgrep/lsp.json)";
+    }
     std::vector<std::string> names = requested_names(arguments);
     if (names.empty() && descriptor && !directory && arguments.get("line") && arguments.get("column")) {
         std::string name = identifier_at(read_source_text(context, path).text, arguments.get("line")->integer(),
@@ -5648,10 +5658,8 @@ std::optional<Json> text_fallback(const std::string& operation, const Json& argu
         }
     }
     const std::string matches = "whole-word text matches for " + joined(names) + " " + where;
-    const std::string note = failure.empty()
-        ? "[no language server for this file type; " + operation + " fell back to " + matches + "]\n"
-        : lsp_failure_banner(failure, "Fallback below: " + matches + ", not semantic results");
-    return word_search(names, arguments, scope, extension, "lines", note, context, cancelled);
+    return word_search(names, arguments, scope, extension, "lines",
+                       lsp_failure_banner(reason, "Fallback below: " + matches + ", not semantic results"), context, cancelled);
 }
 } // namespace
 
@@ -5674,6 +5682,24 @@ Json run_tool(const std::string& name, const Json& arguments,
         // Requests without a fallback still carry the banner, so the model relays the failure.
         throw std::runtime_error(lsp_failure_banner(e.what(), "No fallback exists for this operation; nothing was written"));
     }
+}
+
+std::string health_notice(const SearchContext& context) {
+    (void)context;
+    std::vector<std::string> problems;
+    // BM25 is local and always available; its settings are still validated by building a ranker.
+    try {
+        Ranker ranker("health check");
+        if (std::string problem = ranker.check_reranker(); !problem.empty()) problems.push_back(std::move(problem));
+    } catch (const std::exception& e) {
+        problems.push_back(std::string("ranking settings are invalid: ") + e.what());
+    }
+    for (auto& problem : lsp_health()) problems.push_back(std::move(problem));
+    if (problems.empty()) return {};
+    std::string detail = "shgrep is not fully working: ";
+    for (size_t i = 0; i < problems.size(); ++i) detail += (i ? "; " : "") + problems[i];
+    return failure_banner("SHGREP HEALTH", detail, "Everything else works; a request that needs a broken part fails "
+                          "or falls back under its own banner");
 }
 
 namespace {
@@ -5721,6 +5747,9 @@ Json run_unlocked(const std::string& name, const Json& arguments, const SearchCo
         if (operation == "text") {
             for (const char* key : {"name_path", "include_body", "include_info", "include_kinds", "exclude_kinds", "depth", "substring_matching", "line", "column", "include_declaration"})
                 if (arguments.get(key)) throw std::runtime_error(std::string(key) + " is only supported by LSP navigation");
+            if (context.require_intent && text(arguments, "intent").find_first_not_of(" \t\r\n") == std::string::npos)
+                throw std::runtime_error("operation=text requires intent: the user's task in words. Findings are ranked by "
+                                         "BM25 and the reranker and the best 10 hunks return; for symbols use the LSP operations");
         }
         if (operation != "text") {
             if (operation != "symbols" && operation != "definition" && operation != "references" && operation != "declaration" &&
@@ -6064,7 +6093,7 @@ Json run_unlocked(const std::string& name, const Json& arguments, const SearchCo
         rank_report = ranker->report();
         if (ranked.size() < pieces.size())
             rank_note = "showing " + std::to_string(ranked.size()) + " of " + std::to_string(pieces.size()) +
-                        " matching hunks, best first for the intent; to see every match search again without intent";
+                        " matching hunks, best first for the intent; narrow path, include or the patterns, or use LSP references, to see the rest";
         if (state == "limit")
             rank_note += std::string(rank_note.empty() ? "" : ". ") +
                          "the scan stopped at SHGREP_RANK_SCAN_LIMIT matches, so these are the best of the first matches found; "
@@ -6261,9 +6290,8 @@ Json tool_definitions() {
 
     auto search_props = content_props;
     search_props.emplace("intent", field("string",
-        "Optional for operation=text: the task in words, to locate where something is. With it only the best 10 hunks return, ranked by "
-        "keywords (at most 3 per file), and a note says how many were left out. Omit it when you need every occurrence "
-        "(renames, all callers, counts): then every match returns in scan order."));
+        "Required for operation=text: the task in words, to locate where something is. Only the best 10 hunks return, ranked by "
+        "BM25 keywords (at most 3 per file) and then the local reranker, and a note says how many were left out."));
     search_props.emplace("operation", choice(Json::Array{"symbols", "definition", "declaration", "type_definition", "implementation", "references", "hover", "text"},
         "Default symbols via LSP. text uses live grep; its text filters and budgets apply only there."));
     search_props.emplace("path", field("string", "File or folder to limit text search or symbols to; other navigation needs a file. Omit for all workspaces."));
@@ -6322,11 +6350,12 @@ Json tool_definitions() {
     return Json::Array{
         Json::Object{{"name", "search"}, {"description",
             "Navigate live code through LSP: symbols, definition/declaration/type_definition, implementation, references, or hover. "
-            "Bodies are opt-in; no LSP output cap. Lua, XML, C/C++, Rust and Python work out of the box; .shgrep/lsp.json adds or overrides servers. "
-            "A failing server is reported in a leading [LSP FAILURE ...] line, to relay to the user, followed by whole-word text matches. "
-            "operation=text: pass intent (the task in words) to LOCATE something: only the best 10 hunks return, ranked by keywords "
-            "(at most 3 per file, optionally re-ordered by a local reranker), and a note states how many were left out. Omit intent when "
-            "you need EVERY occurrence (renames, all callers, counts): then every match returns in scan order. "
+            "Bodies are opt-in; no LSP output cap. Lua, XML, C/C++, Rust, Python and C# (with the .NET 10+ SDK) work out of the box; .shgrep/lsp.json adds or overrides servers. "
+            "A missing or failing server is reported in a leading [LSP FAILURE ...] line, to relay to the user, followed by whole-word text matches. "
+            "operation=text requires intent (the task in words): only the best 10 hunks return, ranked by BM25 keywords "
+            "(at most 3 per file) and then a local reranker, and a note states how many were left out. A reranker that is down "
+            "fails the search with a leading [RERANK FAILURE ...] line, to relay to the user; for every reference to a symbol "
+            "use operation=references. "
             "Grep filters apply, including XML and files without a language server."},
             {"inputSchema", schema(search_props)}},
         Json::Object{{"name", "search_bytes"}, {"description",

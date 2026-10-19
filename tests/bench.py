@@ -20,6 +20,9 @@ import subprocess
 import tempfile
 import time
 
+# Time the scan, not a reranker: the server column runs ranked searches with the reranker stage off.
+os.environ.setdefault("SHGREP_RERANK_PORT", "0")
+
 WORDS = ["alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel", "india", "juliet"]
 
 

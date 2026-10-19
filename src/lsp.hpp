@@ -14,6 +14,12 @@ struct LspFailure : std::runtime_error {
 std::string lsp_failure_banner(const std::string& detail, const std::string& fallback);
 // Shared navigation, refactoring and lifecycle backend for the existing tool surface.
 bool lsp_configured(const SourceText& source, const SearchContext& context);
+// Why source has no server although a bundled one serves its type (not installed, or turned off); empty when a
+//   server is configured or no bundled server knows the type. Callers report it through lsp_failure_banner.
+std::string lsp_missing(const SourceText& source, const SearchContext& context);
+// Problems with the bundled servers: not installed beside shgrep.exe, or missing what they need (OmniSharp's .NET).
+//   Starts nothing, so it is cheap enough for the session health check.
+std::vector<std::string> lsp_health();
 Json lsp_query(const std::string& operation, const Json& arguments, const SearchContext& context,
                const std::shared_ptr<std::atomic_bool>& cancelled);
 Json lsp_edit(const Json& arguments, const SearchContext& context,

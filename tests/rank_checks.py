@@ -1,9 +1,10 @@
 """User-run checks of shgrep's keyword ranking; no model, no server.
 Usage: python tests/rank_checks.py build-rel/shgrep.exe
-Checks: an intent ranks hunks best first, no intent keeps scan order and every finding, the per-file cap and return
-limit (defaults and SHGREP_RANK_* settings), explicit max_results, bad settings, that edits show up at once, and that
-an unreachable reranker never fails a search. With --rerank-port N (a llama-server running a reranker model with
---reranking --pooling rank) it also checks the real reranker stage.
+Checks: an intent ranks hunks best first, no intent keeps scan order and every finding (SHGREP_REQUIRE_INTENT=0),
+the per-file cap and return limit (defaults and SHGREP_RANK_* settings), explicit max_results, bad settings, that
+edits show up at once, that MCP sessions require intent and report their health on the first result, and that an
+unreachable reranker fails the search with a RERANK FAILURE banner. With --rerank-port N (a llama-server running a
+reranker model with --reranking --pooling rank) it also checks the real reranker stage.
 retrieval_eval.py measures ranking quality on a real repository.
 """
 import argparse
@@ -90,7 +91,7 @@ def check_limits(client):
                                                                         intent="handle the request")[1]), "note missing"
     text = client.tool("search", {"operation": "text", "pattern": "def handler_", "path": "many",
                                   "intent": "handle the request"}, raw=True)
-    assert "[showing 10 of 30 matching hunks" in text and "without intent" in text, text[:400]
+    assert "[showing 10 of 30 matching hunks" in text and "to see the rest" in text, text[:400]
     _, whole = results_of(client, pattern="def ", path="pair", include=["*.py"], intent=INTENT)
     assert "note" not in whole["ranking"], whole["ranking"]
 
@@ -142,20 +143,40 @@ def check_fresh(client, root):
 
 
 def check_unreachable_reranker(executable, root):
-    # A bound but unlistened port refuses connections: the reranker is down, and the search must not notice.
+    # A bound but unlistened port refuses connections: the reranker is down, so the ranked search fails loudly.
     with socket.socket() as reserved:
         reserved.bind(("127.0.0.1", 0))
         port = reserved.getsockname()[1]
         client = Client(executable, root, environment={**os.environ, "SHGREP_RERANK_PORT": str(port),
                                                        "SHGREP_RERANK_BUDGET_MS": "1000"})
         try:
-            results, reply = results_of(client, pattern="def ", path="pair", include=["*.py"], intent=INTENT)
-            assert [Path(r["path"]).name for r in results] == ["intervals.py", "render.py"], results
-            report = reply["ranking"]
-            assert report["mode"] == "keyword" and report["rerank_error"] and report["rerank_scored"] == 0, report
-            assert all("rerank_score" not in r["ranking"] for r in results), results
+            first = client.call("tools/call", {"name": "search", "arguments": {
+                "operation": "text", "pattern": "def ", "path": "pair", "include": ["*.py"], "intent": INTENT}})
+            text = first["content"][0]["text"]
+            assert first.get("isError") and text.startswith("[RERANK FAILURE - tell the user"), first
+            assert f"127.0.0.1:{port}" in text and "llama-server" in text, text
+            # The session health check found the same reranker down and says so on this first result.
+            assert len(first["content"]) == 2 and f"127.0.0.1:{port} does not work" in first["content"][1]["text"], first
         finally:
             client.close()
+
+
+def check_enforcement(executable, root):
+    client = Client(executable, root, environment={**os.environ, "SHGREP_REQUIRE_INTENT": "1"})
+    try:
+        first = client.call("tools/call", {"name": "search", "arguments": {"operation": "text", "pattern": "def ", "path": "pair"}})
+        assert first.get("isError") and "requires intent" in first["content"][0]["text"], first
+        # The first result of a session carries the health notice as a second block; here the reranker is off.
+        health = first["content"][1]["text"] if len(first["content"]) == 2 else ""
+        assert health.startswith("[SHGREP HEALTH - tell the user") and "SHGREP_RERANK_PORT=0" in health, first
+        blank = client.tool("search", {"operation": "text", "pattern": "def ", "path": "pair", "intent": "  "}, error=True)
+        assert "requires intent" in blank, blank
+        later = client.call("tools/call", {"name": "search", "arguments": {"operation": "text", "pattern": "def ", "path": "pair",
+                                                                         "include": ["*.py"], "intent": INTENT}})
+        assert not later.get("isError") and len(later["content"]) == 1, later
+        assert "off (SHGREP_RERANK_PORT=0)" in later["content"][0]["text"], later
+    finally:
+        client.close()
 
 
 def check_real_reranker(executable, root, port):
@@ -211,8 +232,10 @@ def main():
             client.close()
         check_settings(executable, root)
         print("ok  settings")
+        check_enforcement(executable, root)
+        print("ok  intent required and session health reported")
         check_unreachable_reranker(executable, root)
-        print("ok  unreachable reranker falls back to keyword order")
+        print("ok  unreachable reranker fails the search with a RERANK FAILURE banner")
         if args.rerank_port:
             check_real_reranker(executable, root, args.rerank_port)
             print("ok  real reranker")

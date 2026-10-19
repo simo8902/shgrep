@@ -2,10 +2,15 @@
 
 import hashlib
 import json
+import os
 import pathlib
 import subprocess
 import sys
 import tempfile
+
+# Exhaustive scan-order text results and no reranker: opt out of what MCP sessions enforce (see lsp_smoke.py).
+os.environ.setdefault("SHGREP_REQUIRE_INTENT", "0")
+os.environ.setdefault("SHGREP_RERANK_PORT", "0")
 
 
 def main():
@@ -306,12 +311,14 @@ def main():
             named = call("tools/call", {"name": "search", "arguments": {"pattern": "scoped hit", "path": "scope/inner/skip.log"}}, 142)
             assert "scope/inner/skip.log:1:" in named["content"][0]["text"].replace("\\", "/"), named
             assert "not both" in tool_error("search", {"operation": "text", "pattern": "x", "path": "scope", "roots": [str(root)]}, 143)
-            # Navigation on a file type without a language server falls back to whole-word text matches.
+            # Navigation on a file type without a language server falls back to whole-word text matches under the
+            # failure banner, so the model tells the user.
             (root / "scope" / "notes.txt").write_text("alpha beta\nalphabet\nbeta alpha\n", encoding="utf-8")
             fallback = call("tools/call", {"name": "search", "arguments": {"operation": "references", "path": "scope/notes.txt",
                                                                            "line": 1, "column": 2}}, 144)
             fallback_text = fallback["content"][0]["text"].replace("\\", "/")
-            assert not fallback.get("isError") and fallback_text.startswith("[no language server for this file type;"), fallback
+            assert not fallback.get("isError") and fallback_text.startswith("[LSP FAILURE - tell the user"), fallback
+            assert "no language server for this file type" in fallback_text.splitlines()[0], fallback_text
             assert "notes.txt:1:alpha beta" in fallback_text and "notes.txt:3:beta alpha" in fallback_text, fallback_text
             assert "alphabet" not in fallback_text, fallback_text
             # PCRE2 whole-word: a rejected first candidate must not hide a valid later one (lookahead forces PCRE2).

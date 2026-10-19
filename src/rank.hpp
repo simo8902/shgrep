@@ -29,16 +29,19 @@ uint32_t rank_scan_limit();
 // CONTRACT: BM25 (k1 1.2, b 0.75) over path + code, identifiers split at _ and camelCase, instruction words ignored;
 //   ties keep scan order. At most SHGREP_RANK_PER_FILE (default 3, 0 = no cap) candidates per file and at most
 //   SHGREP_RANK_RETURN (default 10, 0 = all) in total are returned, best first.
-// CONTRACT: optional reranker. When SHGREP_RERANK_PORT names a llama-server started with --reranking, the best
-//   SHGREP_RERANK_POOL (default 24, 0 = all) keyword candidates are scored in one POST /v1/rerank and returned in the
-//   reranker's order. The reranker never makes a search fail: when it is unreachable, slow (SHGREP_RERANK_BUDGET_MS,
-//   default 3000) or answers badly, the keyword order is returned and the report carries rerank_error. A search
-//   cannot be cancelled while it waits for the reranker, for at most the budget.
+// CONTRACT: required reranker. A llama-server started with --reranking on 127.0.0.1:SHGREP_RERANK_PORT (default 8081)
+//   scores the best SHGREP_RERANK_POOL (default 24, 0 = all) keyword candidates in one POST /v1/rerank, and they
+//   return in its order. When it is unreachable, slow (SHGREP_RERANK_BUDGET_MS, default 3000) or answers badly, rank()
+//   throws a RERANK FAILURE banner and the search returns nothing, so a broken reranker is never silent.
+//   SHGREP_RERANK_PORT=0 turns the stage off (keyword order only) for test and benchmark runs. A search cannot be
+//   cancelled while it waits for the reranker, for at most the budget.
 class Ranker {
 public:
     explicit Ranker(std::string intent);
     std::vector<Ranked> rank(const std::vector<RankCandidate>& candidates);
     Json report() const;
+    // Empty when the reranker answers a two-document request correctly; otherwise why it cannot be used.
+    std::string check_reranker();
 private:
     void rerank(const std::vector<RankCandidate>& candidates, std::vector<Ranked>& ranked);
     std::string intent_;

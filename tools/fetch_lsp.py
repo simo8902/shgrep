@@ -1,7 +1,8 @@
 """Download the language servers shgrep starts without any user configuration.
 
 Build-time step, run once per output folder: python tools/fetch_lsp.py dist
-Installs <folder>/lsp/{lua,xml,clangd,rust,python}; shgrep.exe in <folder> finds them by itself.
+Installs <folder>/lsp/{lua,xml,clangd,rust,python,csharp}; shgrep.exe in <folder> finds them by itself.
+OmniSharp (csharp) also needs the .NET 10 or newer SDK on the machine; shgrep reports it when missing.
 Every archive is pinned to an exact upstream release and SHA-256. Nothing is installed globally.
 python tools/fetch_lsp.py --resolve prints the newest upstream releases and digests for bumping PINS.
 """
@@ -18,7 +19,7 @@ import urllib.request
 import uuid
 import zipfile
 
-# CONTRACT: exe paths must match kBundled in src/lsp.cpp. A zip whose entries share one top folder is unpacked
+# CONTRACT: exe paths must match bundled_servers() in src/lsp.cpp. A zip whose entries share one top folder is unpacked
 #   without it; "find" moves the one matching .exe to "exe" when the archive keeps it elsewhere.
 PINS = {
     "lua": {"version": "3.19.2", "exe": "bin/lua-language-server.exe",
@@ -36,6 +37,10 @@ PINS = {
     "python": {"version": "0.0.89", "exe": "ty.exe", "find": "ty",
                "url": "https://github.com/astral-sh/ty/releases/download/0.0.89/ty-x86_64-pc-windows-msvc.zip",
                "sha256": "59232824e08b30b5aed11bab9a2d1296eab75c736938f6b8884e4597700a0fb2"},
+    # OmniSharp 2 is framework-dependent: it runs on the machine's .NET 10+ runtime and loads projects with its SDK.
+    "csharp": {"version": "v2.0.0", "exe": "OmniSharp.exe",
+               "url": "https://github.com/OmniSharp/omnisharp-roslyn/releases/download/v2.0.0/omnisharp-win-x64.zip",
+               "sha256": "05e961233b4b620f46e6bd46d762122e3008f49b01e6fd31c8d7a70e917f7bfb"},
 }
 ALLOWED_HOSTS = {"github.com", "api.github.com", "release-assets.githubusercontent.com", "objects.githubusercontent.com"}
 
@@ -156,6 +161,7 @@ def resolve():
         "clangd": ("clangd/clangd", lambda n: n.startswith("clangd-windows-") and n.endswith(".zip")),
         "rust": ("rust-lang/rust-analyzer", lambda n: n == "rust-analyzer-x86_64-pc-windows-msvc.zip"),
         "python": ("astral-sh/ty", lambda n: n == "ty-x86_64-pc-windows-msvc.zip"),
+        "csharp": ("OmniSharp/omnisharp-roslyn", lambda n: n == "omnisharp-win-x64.zip"),
     }
     found = {}
     for name, (repo, wanted) in choices.items():
