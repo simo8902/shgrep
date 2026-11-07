@@ -1,0 +1,86 @@
+shgrep portable package (Windows x64, @SHGREP_HS_ARCH@)
+
+Keep shgrep.exe, shgrep-compiler.dll and shgrep.dat from the same build together.
+The compiler DLL contains Clang, LLVM and LLD; the executable loads it only for
+REPL workers. Ordinary search, MCP startup and --license do not load it.
+shgrep.dat holds only Clang's builtin x86 headers, compressed; they are read without
+extraction. Dependency notices are plain files in licenses\, this guide is README.txt
+and the optional LSP download script is tools\fetch_lsp.py. MSVC and Windows SDK headers
+and libraries are discovered on the target PC and are not bundled.
+Each C++ worker writes generated objects and DLLs into a private temporary session
+directory. DLLs remain loaded for the worker's lifetime; the parent removes the
+directory after confirming worker exit. Crashes or failed deletion can leave files.
+Windows system libraries remain OS dependencies.
+
+C++ REPL requirements:
+  Install Visual Studio or Build Tools with Desktop development with C++ and a
+  Windows 10/11 SDK. The MSVC toolset must match the build's major.minor family
+  (@SHGREP_MSVC_VERSION@); servicing patch versions may differ.
+  A compatible x64 Visual C++ Redistributable must also be installed. Cells use
+  the shared runtime; shgrep.exe and shgrep-compiler.dll each retain a static runtime.
+  Only scalar values and caller-owned bytes cross the compiler DLL entry point.
+  Discovery uses the developer environment first, then Visual Studio Setup
+  Configuration. The SDK is found through its environment settings or registry.
+  To select installations explicitly, set VCToolsInstallDir, WindowsSdkDir and
+  WindowsSDKVersion in the environment inherited by the MCP server.
+  Missing or incompatible resources produce a C++ worker startup error.
+  Semantic navigation through the REPL has the same requirements.
+  Direct filesystem and text tools do not require these REPL resources.
+  Native TLS belongs to each generated DLL. Cross-cell accesses use owner
+  accessors, preserving per-thread storage and initialization.
+  One execution thread persists across cells. Normal reset drains the native
+  CRT TLS destructor lists, then cell globals, on that same thread before it exits.
+  Generated DLL callback forwarding suppresses repeated CRT TLS destruction;
+  other TLS notifications retain their normal delivery. Callback metadata is
+  prepared before Windows loads each DLL, with image/ASLR checks. Unsupported
+  CRT callback layouts fail explicitly. This integration remains experimental.
+  Normal reset requests cooperative shutdown, with a one-second grace period.
+  Timeouts and stuck shutdowns terminate the worker; destructors are not guaranteed.
+  Link/load or cell-initialization failure also resets the affected session.
+  Errors carry the compiler's and linker's messages. To debug the DLL executor itself, set
+  SHGREP_REPL_EMISSION_DIAGNOSTICS=1: link failures and worker crashes then also include LLVM IR
+  snapshots of the cell's DLL (up to a few hundred kilobytes), and every cell records them.
+
+Start the MCP STDIO server for a repository:
+  C:\tools\shgrep\shgrep.exe --root C:\work\my-repo
+The first root is the workspace: only it gets a live search index, searches without a path
+cover only it, and its language servers start in the background (SHGREP_LSP_WARMUP=0 turns
+that off). Other roots are searched when named. Index and server start-up progress goes to
+.shgrep\index.log in the workspace (rewritten at each start), not into tool results. A drive
+root or user profile is never indexed; its log is %LOCALAPPDATA%\shgrep\index.log.
+SHGREP_INDEX_MAX_FILES (default 500000, 0 for no limit) stops the index for larger trees.
+.shignore (created empty in the workspace at start) lists what shgrep skips in search, file
+listing and its index, in .gitignore syntax. It is read after .gitignore and .ignore, so its
+rules win, and it works in any folder like .gitignore. Language servers keep their own rules.
+The MCP client starts shgrep.exe. REPL sessions use isolated child processes of
+that same executable; each worker loads shgrep-compiler.dll from the executable
+directory and retains it until process exit. Missing or incompatible compiler
+DLLs produce a worker startup error. The internal worker and data-packer modes
+should not be launched as an MCP server.
+
+Example MCP client entry (replace both paths):
+  command = 'C:\tools\shgrep\shgrep.exe'
+  args = ['--root', 'C:\work\my-repo']
+
+Regular search:
+  C:\tools\shgrep\shgrep.exe search "TODO|FIXME" --root C:\work\my-repo
+
+Print the dependency notices in licenses\:
+  C:\tools\shgrep\shgrep.exe --license
+
+LSP servers are separate downloads. Run tools\fetch_lsp.py from this package on an
+internet-connected PC:
+  python tools\fetch_lsp.py C:\shared\shgrep
+Transfer its resulting lsp folder alongside the three core files for offline use,
+or set SHGREP_LSP_ROOT to its parent directory. .shgrep/lsp.json can add or override
+servers. The downloader and any dependencies of those language servers are
+separate from shgrep's core files and C++ runtime dependencies.
+
+Repository dependencies, generated headers, compile databases, language toolchains
+and package caches must be available for semantic analysis of the target project.
+Native C++ cells run with the Windows user's permissions.
+
+Requirements: Windows 8 or later, x64 and a CPU supported by this @SHGREP_HS_ARCH@ build.
+Microsoft compiler and Windows SDK resources retain their original license terms.
+The ZIP contains shgrep.exe, shgrep-compiler.dll, shgrep.dat, README.txt,
+tools\fetch_lsp.py and licenses\, with a separate .sha256 checksum.

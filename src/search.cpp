@@ -1,0 +1,7841 @@
+#include "search.hpp"
+#include "backend.hpp"
+#include "dfa.hpp"
+#include "files.hpp"
+#include "lsp.hpp"
+#include "rank.hpp"
+#include "meaning.hpp"
+#include "banner.hpp"
+#include "ignore.hpp"
+#include "teddy.hpp"
+#include "winfs.hpp"
+#include "path_match.hpp"
+
+#include <windows.h>
+#include <bcrypt.h>
+#include <winternl.h>
+#include <intrin.h>
+#include <hs.h>
+#if defined(SHGREP_PCRE2)
+#include <pcre2.h>
+#endif
+
+#include <algorithm>
+#include <atomic>
+#include <array>
+#include <chrono>
+#include <cctype>
+#include <condition_variable>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <cwchar>
+#include <cwctype>
+#include <exception>
+#include <fstream>
+#include <functional>
+#include <iterator>
+#include <limits>
+#include <list>
+#include <map>
+#include <memory>
+#include <mutex>
+#include <new>
+#include <optional>
+#include <set>
+#include <shared_mutex>
+#include <stdexcept>
+#include <string_view>
+#include <thread>
+#include <unordered_map>
+#include <unordered_set>
+#include <utility>
+
+namespace shgrep {
+namespace fs = std::filesystem;
+namespace {
+using Clock = std::chrono::steady_clock;
+// Opt-in per-worker phase timing for the diagnostic "profile" argument. Each worker writes only its own slot,
+// so the counters need no synchronization; alignas keeps slots on separate cache lines.
+#pragma warning(push)
+#pragma warning(disable : 4324)  // C4324 reports the alignas padding, which is the intent here.
+struct alignas(64) WorkerProfile {
+    int64_t wall = 0, busy = 0, list = 0, dir_open = 0, file_total = 0, file_open = 0, read = 0, scan = 0, close = 0;
+    int64_t started = 0, finished = 0, slowest_file = 0;  // absolute ticks; slowest_file is a duration
+    uint64_t files_opened = 0;
+};
+#pragma warning(pop)
+int64_t ticks() {
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    return now.QuadPart;
+}
+int64_t ticks_to_us(int64_t t) {
+    static const int64_t frequency = [] {
+        LARGE_INTEGER f;
+        QueryPerformanceFrequency(&f);
+        return f.QuadPart;
+    }();
+    return t * 1000000 / frequency;
+}
+// Adds the elapsed ticks to *slot when stopped or destroyed; a null slot (profiling off) costs one branch.
+class PhaseTimer {
+public:
+    explicit PhaseTimer(int64_t* slot) : slot_(slot), start_(slot ? ticks() : 0) {}
+    ~PhaseTimer() { stop(); }
+    PhaseTimer(const PhaseTimer&) = delete;
+    PhaseTimer& operator=(const PhaseTimer&) = delete;
+    void stop() {
+        if (slot_) *slot_ += ticks() - start_;
+        slot_ = nullptr;
+    }
+private:
+    int64_t* slot_;
+    int64_t start_;
+};
+int64_t* phase(WorkerProfile* p, int64_t WorkerProfile::*field) { return p ? &(p->*field) : nullptr; }
+std::string text(const Json& obj, const char* key, const std::string& fallback = {}) {
+    const Json* v = obj.get(key);
+    if (!v) return fallback;
+    return v->string();
+}
+bool boolean(const Json& obj, const char* key, bool fallback) {
+    const Json* v = obj.get(key);
+    return v ? v->boolean() : fallback;
+}
+uint32_t bounded(const Json& obj, const char* key, uint32_t fallback, uint32_t min, uint32_t max) {
+    const Json* v = obj.get(key);
+    if (!v) return fallback;
+    int64_t n = v->integer();
+    if (n < min || n > max) throw std::runtime_error(std::string(key) + " is out of range");
+    return static_cast<uint32_t>(n);
+}
+std::vector<std::string> strings(const Json& obj, const char* key, size_t max_count = 1024, size_t max_length = 4096) {
+    std::vector<std::string> out;
+    const Json* v = obj.get(key);
+    if (!v) return out;
+    if (auto one = std::get_if<std::string>(&v->value)) out.push_back(*one);
+    else for (const auto& item : v->array()) out.push_back(item.string());
+    if (out.size() > max_count) throw std::runtime_error(std::string(key) + " contains too many values");
+    for (const auto& s : out) if (s.size() > max_length) throw std::runtime_error(std::string(key) + " contains an oversized value");
+    return out;
+}
+bool glob_match(const std::string& pattern, const std::string& value) {
+    if (path_has_unicode(pattern) || path_has_unicode(value)) return path_glob_unicode(pattern, value);
+    size_t p = 0, v = 0, star = std::string::npos, retry = 0;
+    while (v < value.size()) {
+        auto fold = [](char c) { return static_cast<unsigned char>(std::tolower(static_cast<unsigned char>(c))); };
+        if (p < pattern.size() && (pattern[p] == '?' || fold(pattern[p]) == fold(value[v]))) { ++p; ++v; }
+        else if (p < pattern.size() && pattern[p] == '*') { star = p++; retry = v; }
+        else if (star != std::string::npos) { p = star + 1; v = ++retry; }
+        else return false;
+    }
+    while (p < pattern.size() && pattern[p] == '*') ++p;
+    return p == pattern.size();
+}
+bool any_glob(const std::vector<std::string>& globs, const std::string& rel, const std::string& name) {
+    for (const auto& g : globs) if (glob_match(g, rel) || (g.find('/') == std::string::npos && glob_match(g, name))) return true;
+    return false;
+}
+char fold_ascii(char c) { return c >= 'A' && c <= 'Z' ? static_cast<char>(c - 'A' + 'a') : c; }
+bool equals_folded(std::string_view a, std::string_view b) {
+    if (path_has_unicode(a) || path_has_unicode(b)) return path_equal_unicode(a, b);
+    return a.size() == b.size() &&
+           std::equal(a.begin(), a.end(), b.begin(), [](char x, char y) { return fold_ascii(x) == fold_ascii(y); });
+}
+struct Request {
+    bool file_only = false, binary = false, insensitive = false, line = true;
+    bool no_ignore = false, hidden = false, word = false, sniff_all = false, profile = false;
+    bool invert = false, multiline = false, relative = false, paths_explicit = false;
+    bool use_index = false;  // search only: consult the live index, else the snapshot built by `shgrep index`
+    bool index_requested = false;  // the request named index, so the result explains how the index was used
+    bool block = false;      // lines output: show each match inside its enclosing function or class
+    bool color = false;      // CLI terminal only: ANSI-colored paths, line numbers and matches
+    uint32_t max_block_lines = UINT32_MAX;
+    bool context_explicit = false;
+    // output: "lines" (path:line:text), "files" (paths with a match), "files_without_match", "count" (path:N),
+    // or "json".
+    std::string mode = "regex", output = "lines", exact_name, substring, name_glob, path_filter;
+    // Every pattern provably matches inside one line, so files over whole_text_bytes may be scanned in chunks.
+    bool line_local = false;
+    // Text search `path`: root-relative file or folder ('/' separators) the walk is limited to; empty means all.
+    std::string scope;
+    bool scope_file = false;
+    std::vector<std::string> patterns, includes, excludes, extensions, type_globs;
+    std::vector<fs::path> roots;
+    uint32_t max_results = UINT32_MAX, max_per_file = UINT32_MAX, timeout_ms = 30000;
+    size_t max_output = SIZE_MAX;
+    uint32_t context_before = 80, context_after = 80;
+    uint32_t before_lines = 0, after_lines = 0;
+    uint32_t max_line_bytes = 0;  // lines output: optional window around the match; 0 shows whole lines
+    uint64_t max_file_bytes = 268435456;
+    Backend backend = Backend::automatic;
+    // Set by run_tool, not parsed: directories, in walk path form, that are never entered (the pattern cache).
+    std::vector<std::wstring> excluded_directories;
+};
+bool contains_folded(std::string_view hay, std::string_view needle) {
+    if (path_has_unicode(hay) || path_has_unicode(needle)) return path_contains_unicode(hay, needle);
+    if (needle.empty()) return true;
+    return std::search(hay.begin(), hay.end(), needle.begin(), needle.end(),
+                       [](char x, char y) { return fold_ascii(x) == fold_ascii(y); }) != hay.end();
+}
+
+// File types for the `types` filter, named as in ripgrep/tgrep where they overlap. Globs are space-separated
+// and matched case-insensitively against the filename.
+struct FileType {
+    const char* name;
+    const char* globs;
+};
+constexpr FileType file_types[] = {
+    {"asm", "*.asm *.s *.S *.inc"},
+    {"bat", "*.bat *.cmd"},
+    {"c", "*.c *.h"},
+    {"cmake", "CMakeLists.txt *.cmake"},
+    {"cpp", "*.C *.cc *.cpp *.cxx *.c++ *.h *.H *.hh *.hpp *.hxx *.inl *.ipp *.tpp"},
+    {"cs", "*.cs *.csx"},
+    {"css", "*.css *.scss *.sass *.less"},
+    {"go", "*.go"},
+    {"h", "*.h *.hh *.hpp *.hxx *.inl"},
+    {"html", "*.html *.htm *.xhtml"},
+    {"java", "*.java"},
+    {"js", "*.js *.mjs *.cjs *.jsx"},
+    {"json", "*.json *.jsonc"},
+    {"lua", "*.lua"},
+    {"make", "Makefile makefile GNUmakefile *.mk *.mak"},
+    {"md", "*.md *.markdown"},
+    {"msbuild", "*.sln *.vcxproj *.vcxproj.filters *.csproj *.props *.targets"},
+    {"proto", "*.proto"},
+    {"ps", "*.ps1 *.psm1 *.psd1"},
+    {"py", "*.py *.pyi *.pyw"},
+    {"rust", "*.rs"},
+    {"sh", "*.sh *.bash *.zsh"},
+    {"sql", "*.sql"},
+    {"toml", "*.toml"},
+    {"ts", "*.ts *.tsx *.mts *.cts"},
+    {"txt", "*.txt"},
+    {"xml", "*.xml *.xaml *.xsd *.xsl"},
+    {"yaml", "*.yaml *.yml"},
+    // Aliases.
+    {"python", "*.py *.pyi *.pyw"},
+    {"rs", "*.rs"},
+    {"csharp", "*.cs *.csx"},
+    {"markdown", "*.md *.markdown"},
+    {"powershell", "*.ps1 *.psm1 *.psd1"},
+    {"javascript", "*.js *.mjs *.cjs *.jsx"},
+    {"typescript", "*.ts *.tsx *.mts *.cts"},
+    {"yml", "*.yaml *.yml"},
+};
+
+void append_type_globs(const std::string& type, std::vector<std::string>& globs) {
+    for (const auto& known : file_types) {
+        if (!equals_folded(type, known.name)) continue;
+        std::string_view list = known.globs;
+        while (!list.empty()) {
+            size_t space = list.find(' ');
+            globs.emplace_back(list.substr(0, space));
+            if (space == std::string_view::npos) break;
+            list.remove_prefix(space + 1);
+        }
+        return;
+    }
+    std::string names;
+    for (const auto& known : file_types) {
+        if (!names.empty()) names += ", ";
+        names += known.name;
+    }
+    throw std::runtime_error("unknown file type \"" + type + "\"; known types: " + names);
+}
+// CONTRACT: argument names a tool accepts are exactly its advertised schema properties, plus the hidden
+// "profile" diagnostic. Unknown names are errors, not ignored, so a misspelled or misplaced filter (say glob on
+// search) cannot silently widen a search.
+void reject_unknown_arguments(const std::string& tool, const Json& args) {
+    static const auto accepted = [] {
+        std::map<std::string, std::set<std::string>> names;
+        const Json definitions = tool_definitions();  // SAFETY: named; ranging over a temporary's member dangles
+        for (const auto& definition : definitions.array()) {
+            const auto& object = definition.object();
+            auto& known = names[object.at("name").string()];
+            for (const auto& entry : object.at("inputSchema").object().at("properties").object()) known.insert(entry.first);
+            known.insert("profile");
+            known.insert("backend");
+            known.insert("color");
+        }
+        return names;
+    }();
+    const auto& known = accepted.at(tool);
+    for (const auto& entry : args.object()) {
+        if (known.contains(entry.first)) continue;
+        std::string valid;
+        for (const auto& name : known) {
+            if (name == "profile" || name == "backend" || name == "color") continue;
+            if (!valid.empty()) valid += ", ";
+            valid += name;
+        }
+        std::string name = entry.first.size() > 64 ? entry.first.substr(0, 64) + "..." : entry.first;
+        throw std::runtime_error("unknown argument \"" + name + "\" for " + tool + "; valid arguments: " + valid);
+    }
+}
+
+// CONTRACT: true only when a match of pattern can neither contain a line break nor look past its own line or at the
+//   file's start or end, so scanning line-aligned chunks finds exactly what a whole-file scan finds. Conservative:
+//   lookaround, backreferences, \A \z \G, newline-capable escapes and classes, (?s) and \Q all say no.
+bool line_local(std::string_view pattern, bool regex) {
+    if (pattern.find_first_of("\r\n") != std::string_view::npos) return false;
+    if (!regex) return true;
+    static constexpr std::string_view safe_letters = "wdbBtfae";
+    for (size_t i = 0; i < pattern.size(); ++i) {
+        const char c = pattern[i];
+        if (c == '\\') {
+            if (++i >= pattern.size()) return false;
+            const unsigned char e = static_cast<unsigned char>(pattern[i]);
+            if (std::isalnum(e) && safe_letters.find(static_cast<char>(e)) == std::string_view::npos) return false;
+        } else if (c == '[') {
+            size_t j = i + 1;
+            if (j < pattern.size() && pattern[j] == '^') return false;  // a negated class matches line breaks
+            if (j < pattern.size() && pattern[j] == ']') ++j;
+            int previous = -1;
+            for (; j < pattern.size() && pattern[j] != ']'; ++j) {
+                if (pattern[j] == '\\') {
+                    if (++j >= pattern.size()) return false;
+                    const unsigned char e = static_cast<unsigned char>(pattern[j]);
+                    if (std::isalnum(e) && safe_letters.find(static_cast<char>(e)) == std::string_view::npos) return false;
+                    previous = -2;  // an escaped range start (\t, \f, ...) has a value this check does not track
+                    continue;
+                }
+                if (pattern[j] == '[' && j + 1 < pattern.size() && pattern[j + 1] == ':') return false;  // POSIX classes
+                if (pattern[j] == '-' && previous == -2 && j + 1 < pattern.size() && pattern[j + 1] != ']') return false;
+                if (pattern[j] == '-' && previous >= 0 && j + 1 < pattern.size() && pattern[j + 1] != ']') {
+                    const int high = static_cast<unsigned char>(pattern[j + 1]);
+                    if (pattern[j + 1] == '\\' || (previous <= '\r' && high >= '\n')) return false;
+                    previous = -1;
+                    ++j;
+                    continue;
+                }
+                previous = static_cast<unsigned char>(pattern[j]);
+            }
+            if (j >= pattern.size()) return false;
+            i = j;
+        } else if (c == '(' && i + 1 < pattern.size() && pattern[i + 1] == '?') {
+            const std::string_view rest = pattern.substr(i + 2);
+            if (rest.starts_with("=") || rest.starts_with("!") || rest.starts_with("<=") || rest.starts_with("<!")) return false;
+            for (size_t k = 0; k < rest.size() && std::isalpha(static_cast<unsigned char>(rest[k])) ; ++k)
+                if (rest[k] == 's') return false;  // (?s): '.' would cross line breaks
+            if (rest.starts_with("-")) {
+                for (size_t k = 1; k < rest.size() && rest[k] != ')' && rest[k] != ':'; ++k) if (rest[k] == 's') return false;
+            }
+        }
+    }
+    return true;
+}
+
+Request parse_request(const std::string& tool, const Json& args, const SearchContext& context) {
+    args.object();
+    reject_unknown_arguments(tool, args);
+    Request r;
+    r.file_only = tool == "find_files";
+    r.binary = tool == "search_bytes";
+    // CONTRACT: search defaults to regex like grep/rg/tgrep; search_bytes defaults to hex literals.
+    r.mode = text(args, "mode", r.binary ? "literal" : "regex");
+    if (r.mode != "literal" && r.mode != "regex") throw std::runtime_error("mode must be literal or regex");
+    r.output = text(args, "output", r.binary ? "json" : "lines");
+    if (r.file_only) {
+        if (r.output != "lines" && r.output != "json") throw std::runtime_error("find_files output must be lines or json");
+    } else if (r.binary) {
+        if (r.output != "json" && r.output != "files" && r.output != "count")
+            throw std::runtime_error("search_bytes output must be json, files, or count");
+    } else if (r.output != "lines" && r.output != "files" && r.output != "files_without_match" &&
+               r.output != "count" && r.output != "json") {
+        throw std::runtime_error("output must be lines, files, files_without_match, count, or json");
+    }
+    r.word = boolean(args, "word", false);
+    r.invert = boolean(args, "invert", false);
+    r.multiline = boolean(args, "multiline", false);
+    if (r.invert && (r.output == "json" || r.output == "files_without_match"))
+        throw std::runtime_error("invert works with lines, files, and count output");
+    const std::string paths = text(args, "paths", "relative");
+    if (paths != "absolute" && paths != "relative") throw std::runtime_error("paths must be absolute or relative");
+    r.relative = paths == "relative";
+    r.paths_explicit = args.get("paths") != nullptr;
+    r.sniff_all = boolean(args, "sniff_all", false);
+    // An MCP server keeps a live index unless started with --no-live-index; searches use it unless the request says
+    // index: false.
+    r.use_index = !r.file_only && !r.binary && boolean(args, "index", context.live_index);
+    r.index_requested = args.get("index") != nullptr;
+    // CONTRACT: diagnostic for benchmarks; deliberately absent from tool_definitions so models never see it.
+    r.profile = boolean(args, "profile", false);
+    // CONTRACT: set only by the CLI for a terminal; absent from tool_definitions, like profile.
+    r.color = boolean(args, "color", false);
+    // CONTRACT: benchmark override, hidden like profile: auto (default, or SHGREP_BACKEND), hyperscan, teddy, dfa,
+    // cuda, hip. An engine that cannot run the query is an error, never a silent substitute.
+    if (args.get("backend")) {
+        const auto backend = parse_backend(text(args, "backend"));
+        if (!backend) throw std::runtime_error("backend must be auto, hyperscan, teddy, dfa, cuda, or hip");
+        r.backend = *backend;
+    } else if (!r.file_only) {
+        r.backend = default_backend();
+    }
+    if (r.word && r.binary) throw std::runtime_error("word is supported by search only");
+    r.block = !r.binary && !r.file_only && boolean(args, "block", false);
+    r.max_block_lines = bounded(args, "max_block_lines", UINT32_MAX, 1, 100000);
+    if (r.block && (r.output != "lines" || r.invert)) throw std::runtime_error("block works with lines output, without invert");
+    r.context_explicit = args.get("context_lines") || args.get("before_lines") || args.get("after_lines");
+    uint32_t context_lines = bounded(args, "context_lines", 0, 0, 100);
+    r.before_lines = bounded(args, "before_lines", context_lines, 0, 100);
+    r.after_lines = bounded(args, "after_lines", context_lines, 0, 100);
+    r.max_line_bytes = bounded(args, "max_line_bytes", 0, 0, 1048576);
+    for (const auto& type : strings(args, "types", 32, 32)) append_type_globs(type, r.type_globs);
+    r.insensitive = boolean(args, "case_insensitive", false);
+    r.line = boolean(args, "line_numbers", !r.binary && !r.file_only);
+    r.no_ignore = boolean(args, "no_ignore", false);
+    r.hidden = boolean(args, "hidden", false);
+    r.max_file_bytes = bounded(args, "max_file_bytes", 268435456, 1, 536870912);
+    const uint32_t result_limit = bounded(args, "max_results", 0, 0, 10000);
+    r.max_results = result_limit ? result_limit : UINT32_MAX;
+    r.max_per_file = bounded(args, "max_matches_per_file", UINT32_MAX, 1, 10000);
+    r.max_output = args.get("max_output_bytes") ? bounded(args, "max_output_bytes", 65536, 512, 1048576) : SIZE_MAX;
+    r.timeout_ms = bounded(args, "timeout_ms", r.file_only ? 300000 : 30000, 1, 300000);
+    uint32_t context_bytes = bounded(args, "context_bytes", 80, 0, 1024);
+    r.context_before = bounded(args, "context_before_bytes", context_bytes, 0, 1024);
+    r.context_after = bounded(args, "context_after_bytes", context_bytes, 0, 1024);
+    r.includes = strings(args, "include", 256);
+    r.excludes = strings(args, "exclude", 256);
+    r.extensions = strings(args, "extensions", 256, 32);
+    r.path_filter = text(args, "path_filter");
+    if (r.path_filter.size() > 4096) throw std::runtime_error("path_filter is too long");
+    if (r.file_only) {
+        r.exact_name = text(args, "exact_name");
+        r.substring = text(args, "substring");
+        r.name_glob = text(args, "glob");
+        if (r.exact_name.size() > 4096 || r.substring.size() > 4096 || r.name_glob.size() > 4096)
+            throw std::runtime_error("filename filter is too long");
+    } else {
+        r.patterns = strings(args, "patterns", 1000, 4096);
+        if (r.patterns.empty()) r.patterns = strings(args, "pattern", 1, 4096);
+        if (r.patterns.empty()) throw std::runtime_error("at least one pattern is required");
+        for (const auto& p : r.patterns) {
+            if (p.empty()) throw std::runtime_error("empty patterns are unsupported");
+            if (!r.binary && (p.find('\0') != std::string::npos ||
+                MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, p.data(), static_cast<int>(p.size()), nullptr, 0) == 0))
+                throw std::runtime_error("text patterns must be valid UTF-8 without NUL");
+        }
+        if (r.mode == "regex") for (const auto& p : r.patterns)
+            if (p.find('\0') != std::string::npos) throw std::runtime_error("regex patterns cannot contain NUL; use byte escapes");
+        if (r.binary && r.mode == "literal") {
+            for (auto& p : r.patterns) {
+                if (p.size() % 2) throw std::runtime_error("binary literal patterns must be even-length hex strings");
+                std::string bytes;
+                for (size_t i = 0; i < p.size(); i += 2) {
+                    auto digit = [](char c) -> int {
+                        if (c >= '0' && c <= '9') return c - '0';
+                        if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+                        if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+                        return -1;
+                    };
+                    int a = digit(p[i]), b = digit(p[i + 1]);
+                    if (a < 0 || b < 0) throw std::runtime_error("binary literal patterns must be hex strings");
+                    bytes.push_back(static_cast<char>((a << 4) | b));
+                }
+                p = std::move(bytes);
+            }
+        }
+    }
+    r.line_local = !r.file_only && !r.binary && !r.multiline && !r.invert && !r.block &&
+                   std::all_of(r.patterns.begin(), r.patterns.end(), [&](const std::string& p) { return line_local(p, r.mode == "regex"); });
+    auto requested = strings(args, "roots", 64, 32768);
+    // CONTRACT: without roots or path a request covers the workspace (the first root) only, the one root with a live
+    //   index; other roots are searched when named, so a broad extra root never slows an unscoped search.
+    if (requested.empty()) {
+        if (!context.allowed_roots.empty()) r.roots = {context.allowed_roots.front()};
+    }
+    else for (const auto& s : requested) r.roots.push_back(native_path(s));
+    // CONTRACT: path limits a text search to one file or folder below a configured root. Output paths stay
+    //   relative to that root, and the named file or folder is searched even when hidden or .gitignore'd, as with
+    //   rg <path>; what lies inside a named folder follows the usual rules.
+    if (!r.file_only && !r.binary && args.get("path")) {
+        if (!requested.empty()) throw std::runtime_error("give path or roots, not both");
+        bool directory = false;
+        const SourceText target = source_descriptor(context, text(args, "path"), &directory);
+        const std::wstring root = target.root.wstring(), full = target.path.wstring();
+        if (full.size() < root.size() || CompareStringOrdinal(full.data(), static_cast<int>(root.size()), root.data(),
+                                                              static_cast<int>(root.size()), TRUE) != CSTR_EQUAL)
+            throw std::runtime_error("path is outside the configured roots");
+        std::wstring relative = full.substr(root.size());
+        while (!relative.empty() && (relative.front() == L'\\' || relative.front() == L'/')) relative.erase(0, 1);
+        std::replace(relative.begin(), relative.end(), L'\\', L'/');
+        if (!try_utf8(relative, r.scope)) throw std::runtime_error("path is not valid Unicode");
+        r.scope_file = !directory && !r.scope.empty();
+        r.roots = {target.root};
+        // A named file is read directly. A folder keeps the index: LiveIndex::serve keeps only the candidates below
+        // the scope, and walks when the index holds nothing there (an ignored or hidden folder that the scoped walk
+        // still enters because it is named).
+        if (r.scope_file) r.use_index = false;
+    }
+    if (r.roots.empty()) throw std::runtime_error("no roots configured");
+    return r;
+}
+
+bool extension_passes(const Request& r, std::string_view name) {
+    if (r.extensions.empty()) return true;
+    auto dot = name.find_last_of('.');
+    std::string_view ext = dot == std::string_view::npos ? std::string_view{} : name.substr(dot + 1);
+    for (std::string_view candidate : r.extensions) {
+        if (!candidate.empty() && candidate.front() == '.') candidate.remove_prefix(1);
+        if (equals_folded(candidate, ext)) return true;
+    }
+    return false;
+}
+
+// PERF: rejects regular files on name-only criteria before the relative path is built.
+bool type_passes(const Request& r, const std::string& name) {
+    if (r.type_globs.empty()) return true;
+    for (const auto& glob : r.type_globs) if (glob_match(glob, name)) return true;
+    return false;
+}
+
+// PERF: on Windows the open is the expensive step of reading a file (antivirus filters run there), so text
+// search skips files whose extension is an unambiguous binary format without opening them. Ambiguous ones
+// (.bin, .dat, ...) are not listed; they still get the NUL probe. Request.sniff_all turns this off.
+bool binary_extension(std::string_view name) {
+    static constexpr std::string_view extensions[] = {
+        "exe", "dll", "sys", "ocx", "obj", "o", "lib", "a", "so", "dylib", "pdb", "ilk", "exp", "idb", "pch",
+        "ipch", "iobj", "ipdb", "winmd", "node", "class", "jar", "pyc", "pyo", "pyd", "wasm",
+        "zip", "7z", "rar", "gz", "tgz", "bz2", "xz", "zst", "lz4", "cab", "msi", "nupkg", "whl", "iso",
+        "png", "jpg", "jpeg", "gif", "bmp", "ico", "tif", "tiff", "webp", "psd", "dds", "tga", "heic",
+        "mp3", "wav", "ogg", "flac", "aac", "m4a", "mp4", "mkv", "avi", "mov", "wmv", "webm",
+        "ttf", "otf", "woff", "woff2", "eot", "pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx",
+        "sqlite", "sqlite3", "mdb", "accdb", "fbx", "blend", "spv", "pak", "bnk"};
+    const size_t dot = name.find_last_of('.');
+    if (dot == std::string_view::npos || dot + 1 == name.size() || name.size() - dot - 1 > 8) return false;
+    const std::string_view ext = name.substr(dot + 1);
+    for (std::string_view candidate : extensions)
+        if (equals_folded(ext, candidate)) return true;
+    return false;
+}
+
+bool name_prefilter(const Request& r, const std::string& name) {
+    if (r.file_only && !r.exact_name.empty() && !equals_folded(name, r.exact_name)) return false;
+    return extension_passes(r, name) && type_passes(r, name);
+}
+
+// CONTRACT: relative uses '/' separators.
+bool path_passes(const Request& r, const std::string& relative, const std::string& name, bool directory) {
+    if (any_glob(r.excludes, relative, name)) return false;
+    if (directory) return true;
+    if (r.file_only) {
+        if (!r.exact_name.empty() && !equals_folded(name, r.exact_name)) return false;
+        if (!r.substring.empty() && !contains_folded(name, r.substring) && !contains_folded(relative, r.substring)) return false;
+        if (!r.name_glob.empty() && !glob_match(r.name_glob, name) && !glob_match(r.name_glob, relative)) return false;
+    }
+    if (!r.includes.empty() && !any_glob(r.includes, relative, name)) return false;
+    if (!extension_passes(r, name) || !type_passes(r, name)) return false;
+    if (!r.path_filter.empty() && !contains_folded(relative, r.path_filter)) return false;
+    return true;
+}
+std::string regex_literal(const std::string& bytes, bool binary) {
+    constexpr char hex[] = "0123456789abcdef";
+    std::string out;
+    out.reserve(bytes.size() * (binary ? 4 : 2));
+    for (unsigned char c : bytes) {
+        if (binary) {
+            out += "\\x";
+            out.push_back(hex[c >> 4]);
+            out.push_back(hex[c & 15]);
+        } else {
+            if (c == '\\' || c == '.' || c == '^' || c == '$' || c == '|' ||
+                c == '?' || c == '*' || c == '+' || c == '(' || c == ')' ||
+                c == '[' || c == ']' || c == '{' || c == '}') out.push_back('\\');
+            out.push_back(static_cast<char>(c));
+        }
+    }
+    return out;
+}
+// COMPAT: CMake builds the bundled Hyperscan with /arch:AVX2 (or /arch:AVX512), including its own
+// hs_valid_platform, so the CPU check lives here in code built for the baseline ISA and runs before any
+// Hyperscan call. Without it an older CPU would fault on the first scan instead of getting an error.
+void require_cpu() {
+    const CpuFeatures& cpu = cpu_features();
+#if defined(SHGREP_HS_AVX512)
+    const bool supported = cpu.popcnt && cpu.bmi1 && cpu.bmi2 && cpu.avx2 && cpu.avx512bw;
+#elif defined(SHGREP_HS_AVX2)
+    const bool supported = cpu.popcnt && cpu.bmi1 && cpu.bmi2 && cpu.avx2;
+#else
+    const bool supported = cpu.ssse3;  // Hyperscan's baseline
+#endif
+    if (!supported)
+        throw std::runtime_error("this CPU lacks the instruction set this shgrep build requires; "
+                                 "rebuild with -DSHGREP_HS_ARCH=SSE");
+}
+
+// Everything that changes a compiled database. It is also the cache key.
+struct CompileSpec {
+    std::vector<std::string> patterns;
+    bool binary = false, regex = false, insensitive = false, literal_api = false, som = false;
+    // Requested engine, and whether the output depends on the order of same-end matches (lines, json). Neither is
+    // part of the on-disk key: they never change the Hyperscan database.
+    Backend backend = Backend::automatic;
+    bool ordered = false;
+    bool operator==(const CompileSpec&) const = default;
+};
+
+template<auto Free>
+struct ResourceDeleter {
+    void operator()(auto* value) const noexcept { Free(value); }
+};
+using HsDatabase = std::unique_ptr<hs_database_t, ResourceDeleter<hs_free_database>>;
+using HsScratch = std::unique_ptr<hs_scratch_t, ResourceDeleter<hs_free_scratch>>;
+using HsCompileError = std::unique_ptr<hs_compile_error_t, ResourceDeleter<hs_free_compile_error>>;
+using HsExpressionInfo = std::unique_ptr<hs_expr_info_t, ResourceDeleter<std::free>>;
+using HsSerialized = std::unique_ptr<char, ResourceDeleter<std::free>>;
+
+CompileSpec compile_spec(const Request& r) {
+    CompileSpec spec;
+    spec.patterns = r.patterns;
+    spec.binary = r.binary;
+    spec.regex = r.mode == "regex";
+    spec.insensitive = r.insensitive;
+    spec.backend = r.backend;
+    spec.ordered = r.output == "lines" || r.output == "json";
+    const bool ascii = std::all_of(r.patterns.begin(), r.patterns.end(), [](const std::string& p) {
+        return std::all_of(p.begin(), p.end(), [](char c) { return static_cast<unsigned char>(c) < 0x80; });
+    });
+    // PERF: the literal API skips regex parsing and accepts any byte, but its caseless mode folds ASCII only,
+    // so caseless non-ASCII text literals use the UTF-8 regex compiler instead.
+    // COMPAT: Hyperscan 5.4.2 addLitExpression rejects a literal whose first byte is NUL as "empty"
+    // (strcmp(expression, "") in compiler.cpp), although the length is passed separately; such byte patterns
+    // go through the escaped-regex path instead.
+    const bool leading_nul = std::any_of(r.patterns.begin(), r.patterns.end(),
+                                         [](const std::string& p) { return !p.empty() && p.front() == '\0'; });
+    // COMPAT: two ASCII letters fold to non-ASCII ones under Unicode simple case folding (k to U+212A KELVIN SIGN, s
+    // to U+017F LONG S), so caseless literals containing them also take the UTF-8 regex compiler.
+    const bool ascii_folds_suffice = ascii && std::none_of(r.patterns.begin(), r.patterns.end(), [](const std::string& p) {
+        return p.find_first_of("kKsS") != std::string::npos;
+    });
+    spec.literal_api = !spec.regex && !leading_nul && (r.binary || !r.insensitive || ascii_folds_suffice);
+    // PERF: start-of-match tracking costs scan speed and stream state (performance.rst). json needs exact starts;
+    // whole-word checks and multiline spans need them unless the literal length gives the start.
+    spec.som = r.output == "json" || ((r.word || r.multiline) && !spec.literal_api);
+    // Empty matches have no last byte: using end - 1 assigns ^ to the previous line (#80).
+    // Ask for exact starts for nullable text regexes; unsupported SOM patterns use the PCRE2 path.
+    if (spec.regex && !spec.binary && !spec.som) {
+        const unsigned flags = HS_FLAG_UTF8 | HS_FLAG_UCP | HS_FLAG_MULTILINE |
+                               (spec.insensitive ? HS_FLAG_CASELESS : 0);
+        for (const auto& pattern : spec.patterns) {
+            HsExpressionInfo info;
+            HsCompileError error;
+            const hs_error_t rc = hs_expression_info(pattern.c_str(), flags, std::out_ptr(info), std::out_ptr(error));
+            const bool nullable = rc == HS_SUCCESS && info && info->min_width == 0;
+            if (nullable) { spec.som = true; break; }
+        }
+    }
+    return spec;
+}
+
+bool env_off(const wchar_t* name) {
+    wchar_t value[4] = {};
+    return GetEnvironmentVariableW(name, value, 4) == 1 && value[0] == L'0';
+}
+
+bool env_on(const wchar_t* name) {
+    wchar_t value[4] = {};
+    return GetEnvironmentVariableW(name, value, 4) == 1 && value[0] == L'1';
+}
+
+// SHGREP_WORKERS=N (1-256) overrides the walk's thread count, one per active processor by default, for the
+// worker-count sweep. Anything else is ignored.
+unsigned env_workers() {
+    wchar_t value[8] = {};
+    const DWORD length = GetEnvironmentVariableW(L"SHGREP_WORKERS", value, 8);
+    if (length == 0 || length >= 8) return 0;
+    unsigned n = 0;
+    for (DWORD i = 0; i < length; ++i) {
+        if (value[i] < L'0' || value[i] > L'9') return 0;
+        n = n * 10 + static_cast<unsigned>(value[i] - L'0');
+    }
+    return n >= 1 && n <= 256 ? n : 0;
+}
+
+
+// PERF: compiled Hyperscan databases persist across processes in <workspace>\.shgrep\db-cache, the workspace
+// being the first configured root, so a CLI run does not pay the compile again (about 85 ms for 100 regexes).
+// Owner-approved 2026-10-07; moved from %LOCALAPPDATA% into the workspace 2026-10-09.
+// CONTRACT: only compiled patterns are stored, never file contents or results, so freshness is unaffected.
+// Each file carries its full key (cache format, Hyperscan version, ISA build, every compile input) and is used
+// only on an exact key match; hs_deserialize_database also rejects other versions and CPUs. Writes go to a
+// temporary file and are renamed into place. --read-only loads existing entries but never writes into the
+// workspace. Walks never enter the workspace's .shgrep directory. SHGREP_DB_CACHE=0 disables the cache.
+constexpr size_t db_cache_files = 64;
+constexpr auto db_cache_min_compile = std::chrono::milliseconds(5);
+constexpr char db_cache_magic[8] = {'S', 'H', 'G', 'D', 'B', '0', '0', '2'};
+constexpr wchar_t cache_directory_name[] = L".shgrep";
+
+struct DbCache {
+    std::wstring dir;  // empty: the cache is off
+    bool writable = false;
+};
+
+// SAFETY: cache files live in the workspace, which anyone able to edit the workspace can write. Each file carries an
+//   HMAC-SHA256 under a per-user secret kept outside it (%LOCALAPPDATA%\\shgrep\\db-cache.key); a file whose MAC does
+//   not verify is ignored, so a planted database can never stand in for a query. Without the secret the cache is off.
+using CacheMac = std::array<unsigned char, 32>;
+const std::optional<CacheMac>& cache_secret() {
+    static const std::optional<CacheMac> secret = []() -> std::optional<CacheMac> {
+        wchar_t base[MAX_PATH];
+        const DWORD n = GetEnvironmentVariableW(L"LOCALAPPDATA", base, MAX_PATH);
+        if (!n || n >= MAX_PATH) return std::nullopt;
+        const std::wstring folder = std::wstring(base, n) + L"\\shgrep";
+        CreateDirectoryW(folder.c_str(), nullptr);
+        const std::wstring path = folder + L"\\db-cache.key";
+        for (int attempt = 0; attempt < 2; ++attempt) {
+            CacheMac key{};
+            Handle existing(CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr));
+            if (existing) {
+                DWORD got = 0;
+                if (ReadFile(existing.h, key.data(), static_cast<DWORD>(key.size()), &got, nullptr) && got == key.size()) return key;
+                return std::nullopt;
+            }
+            if (!BCRYPT_SUCCESS(BCryptGenRandom(nullptr, key.data(), static_cast<ULONG>(key.size()), BCRYPT_USE_SYSTEM_PREFERRED_RNG)))
+                return std::nullopt;
+            Handle created(CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr));
+            if (created) {
+                DWORD put = 0;
+                if (WriteFile(created.h, key.data(), static_cast<DWORD>(key.size()), &put, nullptr) && put == key.size() &&
+                    FlushFileBuffers(created.h)) return key;
+                return std::nullopt;
+            }
+            // Another process created the key meanwhile; the next pass reads it.
+        }
+        return std::nullopt;
+    }();
+    return secret;
+}
+std::optional<CacheMac> cache_mac(std::string_view header, std::string_view body) {
+    const auto& secret = cache_secret();
+    static const BCRYPT_ALG_HANDLE algorithm = [] {
+        BCRYPT_ALG_HANDLE handle = nullptr;
+        return BCRYPT_SUCCESS(BCryptOpenAlgorithmProvider(&handle, BCRYPT_SHA256_ALGORITHM, nullptr, BCRYPT_ALG_HANDLE_HMAC_FLAG))
+            ? handle : nullptr;
+    }();
+    if (!secret || !algorithm) return std::nullopt;
+    BCRYPT_HASH_HANDLE hash = nullptr;
+    if (!BCRYPT_SUCCESS(BCryptCreateHash(algorithm, &hash, nullptr, 0, const_cast<PUCHAR>(secret->data()),
+                                         static_cast<ULONG>(secret->size()), 0))) return std::nullopt;
+    CacheMac mac{};
+    const bool ok =
+        BCRYPT_SUCCESS(BCryptHashData(hash, reinterpret_cast<PUCHAR>(const_cast<char*>(header.data())), static_cast<ULONG>(header.size()), 0)) &&
+        BCRYPT_SUCCESS(BCryptHashData(hash, reinterpret_cast<PUCHAR>(const_cast<char*>(body.data())), static_cast<ULONG>(body.size()), 0)) &&
+        BCRYPT_SUCCESS(BCryptFinishHash(hash, mac.data(), static_cast<ULONG>(mac.size()), 0));
+    BCryptDestroyHash(hash);
+    if (!ok) return std::nullopt;
+    return mac;
+}
+
+// SAFETY: the cache must stay below the workspace. A link or junction at .shgrep or db-cache would send cache writes
+//   and retention deletes elsewhere, so the cache is off then; it is checked again right before writing or deleting.
+bool cache_dir_is_plain(const std::wstring& dir) {
+    const std::wstring parent = dir.substr(0, dir.rfind(L'\\'));
+    for (const std::wstring* path : {&parent, &dir}) {
+        const DWORD attributes = GetFileAttributesW(path->c_str());
+        if (attributes == INVALID_FILE_ATTRIBUTES) continue;  // not created yet; created below as a plain folder
+        if ((attributes & FILE_ATTRIBUTE_REPARSE_POINT) || !(attributes & FILE_ATTRIBUTE_DIRECTORY)) return false;
+    }
+    return true;
+}
+
+// Resolved only when the in-memory database cache misses, so cached queries pay no extra open.
+DbCache db_cache_for(const SearchContext& context) {
+    if (env_off(L"SHGREP_DB_CACHE") || context.allowed_roots.empty() || !cache_secret()) return {};
+    Handle h(CreateFileW(absolute_long_path(context.allowed_roots.front()).c_str(), FILE_READ_ATTRIBUTES,
+                         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+                         FILE_FLAG_BACKUP_SEMANTICS, nullptr));
+    if (!h) return {};
+    try {
+        std::wstring dir = join_path(join_path(final_path(h.h), cache_directory_name), L"db-cache");
+        if (!cache_dir_is_plain(dir)) return {};
+        return {std::move(dir), !context.read_only};
+    } catch (const std::runtime_error&) {
+        return {};
+    }
+}
+
+std::string db_cache_key(const CompileSpec& spec) {
+    std::string key = "shgrep-db-1|";
+    key += hs_version();
+#if defined(SHGREP_HS_AVX512)
+    key += "|avx512|";
+#elif defined(SHGREP_HS_AVX2)
+    key += "|avx2|";
+#else
+    key += "|sse|";
+#endif
+    key += spec.binary ? 'b' : 't';
+    key += spec.regex ? 'r' : 'l';
+    key += spec.insensitive ? 'i' : 's';
+    key += spec.literal_api ? 'a' : 'x';
+    key += spec.som ? 'o' : 'n';
+    for (const auto& p : spec.patterns) {
+        key += '|';
+        key += std::to_string(p.size());
+        key += ':';
+        key += p;
+    }
+    return key;
+}
+
+std::wstring db_cache_path(const std::wstring& dir, const std::string& key) {
+    uint64_t hash = 1469598103934665603ull; // FNV-1a; the full key inside the file settles collisions
+    for (unsigned char c : key) {
+        hash ^= c;
+        hash *= 1099511628211ull;
+    }
+    wchar_t name[32] = {};
+    swprintf_s(name, L"\\%016llx.hsdb", static_cast<unsigned long long>(hash));
+    return dir + name;
+}
+
+// The cache folder <root>\<metadata>\db-cache, opened by handle one component at a time (winfs.hpp), and the file name
+// for key inside it.
+Handle open_cache_directory(const std::wstring& dir, bool create) {
+    const size_t cache_at = dir.rfind(L'\\');
+    if (cache_at == std::wstring::npos) return Handle{};
+    const std::wstring parent = dir.substr(0, cache_at);
+    const size_t meta_at = parent.rfind(L'\\');
+    if (meta_at == std::wstring::npos) return Handle{};
+    const std::wstring root = parent.substr(0, meta_at), meta = parent.substr(meta_at + 1), cache = dir.substr(cache_at + 1);
+    return open_metadata_directory(root, {std::wstring_view(meta), std::wstring_view(cache)}, create);
+}
+std::wstring db_cache_name(const std::wstring& dir, const std::string& key) {
+    const std::wstring path = db_cache_path(dir, key);
+    return path.substr(path.rfind(L'\\') + 1);
+}
+
+HsDatabase load_cached_database(const std::wstring& dir, const std::string& key) {
+    const Handle directory = open_cache_directory(dir, false);
+    if (!directory) return nullptr;
+    Handle file;
+    if (!open_metadata_entry(directory.h, db_cache_name(dir, key), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE, file))
+        return nullptr;
+    LARGE_INTEGER size{};
+    if (!GetFileSizeEx(file.h, &size) || size.QuadPart < 16 || size.QuadPart > (256ll << 20)) return nullptr;
+    std::string data(static_cast<size_t>(size.QuadPart), '\0');
+    for (size_t done = 0; done < data.size();) {
+        DWORD got = 0;
+        const auto want = static_cast<DWORD>(std::min<size_t>(data.size() - done, 1u << 20));
+        if (!ReadFile(file.h, data.data() + done, want, &got, nullptr) || got == 0) return nullptr;
+        done += got;
+    }
+    uint64_t key_length = 0;
+    std::memcpy(&key_length, data.data() + 8, sizeof(key_length));
+    if (std::memcmp(data.data(), db_cache_magic, sizeof(db_cache_magic)) != 0 || key_length != key.size() ||
+        16 + key_length + sizeof(CacheMac) > data.size() || data.compare(16, key.size(), key) != 0) return nullptr;
+    const size_t mac_at = 16 + key.size(), offset = mac_at + sizeof(CacheMac);
+    const auto expected = cache_mac(std::string_view(data).substr(0, mac_at), std::string_view(data).substr(offset));
+    if (!expected || std::memcmp(expected->data(), data.data() + mac_at, expected->size()) != 0) return nullptr;
+    HsDatabase db;
+    if (hs_deserialize_database(data.data() + offset, data.size() - offset, std::out_ptr(db)) != HS_SUCCESS) return nullptr;
+    return db;
+}
+
+// SAFETY (#65): every step works on handles opened one name at a time below the root, never following a link (see
+//   winfs.hpp): the .shgrep and db-cache folders, the temporary file (a stale entry of that name is removed as the
+//   link it may be), the rename onto the final name and the retention deletes. A folder swapped for a junction at any
+//   moment can therefore never redirect a write or delete outside the workspace.
+void store_cached_database(const std::wstring& dir, const std::string& key, const hs_database_t* db) {
+    HsSerialized serialized;
+    size_t length = 0;
+    if (hs_serialize_database(db, std::out_ptr(serialized), &length) != HS_SUCCESS) return;
+    const Handle directory = open_cache_directory(dir, true);
+    if (!directory) return;
+    const std::wstring name = db_cache_name(dir, key);
+    static std::atomic<uint64_t> serial{0};
+    const std::wstring temp = name + L"." + std::to_wstring(GetCurrentProcessId()) + L"." + std::to_wstring(++serial) + L".tmp";
+    Handle file;
+    if (!create_metadata_file(directory.h, temp, FILE_GENERIC_WRITE, false, file)) return;
+    const auto write_all = [&](const char* p, size_t n) {
+        while (n) {
+            DWORD put = 0;
+            const auto want = static_cast<DWORD>(std::min<size_t>(n, 1u << 20));
+            if (!WriteFile(file.h, p, want, &put, nullptr) || put == 0) return false;
+            p += put;
+            n -= put;
+        }
+        return true;
+    };
+    const uint64_t key_length = key.size();
+    std::string header(db_cache_magic, sizeof(db_cache_magic));
+    header.append(reinterpret_cast<const char*>(&key_length), sizeof(key_length));
+    header += key;
+    const auto mac = cache_mac(header, std::string_view(serialized.get(), length));
+    const bool written = mac && write_all(header.data(), header.size()) &&
+        write_all(reinterpret_cast<const char*>(mac->data()), mac->size()) && write_all(serialized.get(), length);
+    if (!written || !rename_metadata_entry(file.h, directory.h, name, true)) {
+        FILE_DISPOSITION_INFO remove{TRUE};
+        SetFileInformationByHandle(file.h, FileDispositionInfo, &remove, sizeof(remove));
+        return;
+    }
+    file.close();
+    // Keep the newest db_cache_files databases. Names come from a read-only listing; deletes go through the handle.
+    WIN32_FIND_DATAW found{};
+    const HANDLE listing = FindFirstFileW((dir + L"\\*.hsdb").c_str(), &found);
+    if (listing == INVALID_HANDLE_VALUE) return;
+    std::unique_ptr<void, ResourceDeleter<FindClose>> search(listing);
+    std::vector<std::pair<uint64_t, std::wstring>> files;
+    do {
+        if (found.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) continue;
+        files.emplace_back((static_cast<uint64_t>(found.ftLastWriteTime.dwHighDateTime) << 32) |
+                               found.ftLastWriteTime.dwLowDateTime, found.cFileName);
+    } while (FindNextFileW(search.get(), &found));
+    search.reset();
+    if (files.size() <= db_cache_files) return;
+    std::sort(files.begin(), files.end());
+    for (size_t i = 0; i + db_cache_files < files.size(); ++i) delete_metadata_entry(directory.h, files[i].second);
+}
+
+std::runtime_error unsupported_backend(Backend backend, const std::string& why) {
+    return std::runtime_error(std::string("backend ") + backend_name(backend) + " cannot run this query: " + why);
+}
+
+// Null when Teddy can reproduce Hyperscan's report for the query; otherwise why it cannot.
+const char* teddy_unsupported(const CompileSpec& spec) {
+    if (!spec.literal_api) return "Teddy runs literal patterns only (mode literal; caseless literals must be ASCII)";
+    if (spec.patterns.size() > Teddy::max_patterns) return "Teddy runs at most 64 patterns";
+    if (!cpu_features().ssse3) return "Teddy needs SSSE3";
+    return nullptr;
+}
+
+// Null when the query is one the DFA could run (its patterns may still be declined); otherwise why not.
+const char* dfa_unsupported(const CompileSpec& spec) {
+    if (spec.binary || !spec.regex) return "the DFA runs search regexes only";
+    if (spec.som) return "the DFA does not track match starts (json output, word, multiline)";
+    return nullptr;
+}
+
+#if defined(SHGREP_PCRE2)
+using PcreCode = std::unique_ptr<pcre2_code, ResourceDeleter<pcre2_code_free>>;
+using PcreMatchData = std::unique_ptr<pcre2_match_data, ResourceDeleter<pcre2_match_data_free>>;
+using PcreMatchContext = std::unique_ptr<pcre2_match_context, ResourceDeleter<pcre2_match_context_free>>;
+using PcreJitStack = std::unique_ptr<pcre2_jit_stack, ResourceDeleter<pcre2_jit_stack_free>>;
+#endif
+
+struct Database {
+    HsDatabase db;
+    HsScratch scratch; // prototype for hs_clone_scratch; never scanned with; destroyed before db
+    bool som = false, stream = false;
+    std::vector<uint32_t> lengths;   // literal byte lengths by pattern id; empty for regex databases
+    // Set when another engine scans text instead of db (see select_engine); db stays compiled as its fallback.
+    std::unique_ptr<TextEngine> engine;
+#if defined(SHGREP_PCRE2)
+    // Set instead of db when Hyperscan rejected a text regex and PCRE2 accepted it: one code per pattern.
+    std::vector<PcreCode> pcre;
+    std::vector<bool> pcre_jit;
+#endif
+    ~Database() = default;
+    Database(const Database&) = delete;
+    Database& operator=(const Database&) = delete;
+    // Each member owns its resource even when construction fails inside build().
+    Database(const CompileSpec& spec, const DbCache& cache) : som(spec.som), stream(spec.binary) {
+        build(spec, cache);
+    }
+    void build(const CompileSpec& spec, const DbCache& cache) {
+        // PERF: text files are scanned as one in-memory block ("prefer block-based matching", performance.rst);
+        // only search_bytes streams files in chunks.
+        const unsigned mode = stream ? (HS_MODE_STREAM | (som ? HS_MODE_SOM_HORIZON_LARGE : 0)) : HS_MODE_BLOCK;
+        const unsigned common = (spec.insensitive ? HS_FLAG_CASELESS : 0) | (som ? HS_FLAG_SOM_LEFTMOST : 0);
+        const auto count = static_cast<unsigned>(spec.patterns.size());
+        std::vector<std::string> expressions;
+        std::vector<const char*> ptrs;
+        std::vector<unsigned> flags(count, common), ids(count);
+        std::vector<size_t> lens;
+        for (unsigned i = 0; i < count; ++i) ids[i] = i;
+        if (spec.literal_api)
+            for (const auto& p : spec.patterns) lengths.push_back(static_cast<uint32_t>(p.size()));
+        const std::string cache_key = cache.dir.empty() ? std::string() : db_cache_key(spec);
+        if (!cache_key.empty()) db = load_cached_database(cache.dir, cache_key);
+        if (db) {
+            if (hs_alloc_scratch(db.get(), std::inout_ptr(scratch)) != HS_SUCCESS)
+                throw std::runtime_error("Hyperscan scratch allocation failed");
+            select_engine(spec);
+            return;
+        }
+        const auto compile_start = Clock::now();
+        HsCompileError error;
+        hs_error_t rc;
+        if (spec.literal_api) {
+            for (const auto& p : spec.patterns) {
+                ptrs.push_back(p.data());
+                lens.push_back(p.size());
+            }
+            rc = hs_compile_lit_multi(ptrs.data(), flags.data(), ids.data(), lens.data(), count, mode, nullptr, std::out_ptr(db), std::out_ptr(error));
+        } else {
+            // CONTRACT: text regexes are line-oriented like rg/tgrep: ^ and $ match at every line and '.' never
+            // crosses '\n' (no HS_FLAG_DOTALL).
+            const unsigned text = spec.binary ? 0 : (HS_FLAG_UTF8 | HS_FLAG_UCP | (spec.regex ? HS_FLAG_MULTILINE : 0));
+            for (auto& f : flags) f |= text;
+            expressions.reserve(count);
+            for (const auto& p : spec.patterns) expressions.push_back(spec.regex ? p : regex_literal(p, spec.binary));
+            for (const auto& e : expressions) ptrs.push_back(e.c_str());
+            rc = hs_compile_multi(ptrs.data(), flags.data(), ids.data(), count, mode, nullptr, std::out_ptr(db), std::out_ptr(error));
+        }
+        if (rc != HS_SUCCESS) {
+            std::string message = error && error->message ? error->message : "Hyperscan compilation failed";
+            if (error && error->expression >= 0) message = "pattern " + std::to_string(error->expression) + ": " + message;
+            error.reset();
+            db.reset();
+#if defined(SHGREP_PCRE2)
+            // CONTRACT: text regexes that Hyperscan rejects (backreferences, lookaround, \b under UCP, other
+            // PCRE-only syntax) fall back to PCRE2 JIT, the engine ripgrep uses for -P. If PCRE2 rejects the
+            // pattern too, its message is reported.
+            if (spec.regex && !spec.binary) {
+                if (spec.backend != Backend::automatic && spec.backend != Backend::hyperscan)
+                    throw unsupported_backend(spec.backend, "Hyperscan rejects the pattern (" + message + "), so only PCRE2 can run it");
+                compile_pcre(spec);
+                return;
+            }
+#endif
+            throw std::runtime_error(message);
+        }
+        error.reset();
+        if (!cache_key.empty() && cache.writable && Clock::now() - compile_start >= db_cache_min_compile)
+            store_cached_database(cache.dir, cache_key, db.get());
+        if (hs_alloc_scratch(db.get(), std::inout_ptr(scratch)) != HS_SUCCESS)
+            throw std::runtime_error("Hyperscan scratch allocation failed");
+        select_engine(spec);
+    }
+
+    // The compile-time half of backend dispatch: picks the engine that scans text for this query once Hyperscan
+    // has compiled it. An explicit backend that cannot run the query is an error; auto keeps Hyperscan.
+    void select_engine(const CompileSpec& spec) {
+        const Backend want = spec.backend;
+        if (want == Backend::hyperscan) return;
+        if (want == Backend::teddy) {
+            const char* why = teddy_unsupported(spec);
+            if (!why) engine = Teddy::build(spec.patterns, spec.insensitive);
+            if (!engine) throw unsupported_backend(want, why ? why : "Teddy rejected the patterns");
+            return;
+        }
+        if (want == Backend::dfa) {
+            // CONTRACT: without starts, the collector places a regex match at its last byte, so matches that end
+            // together differ only in pattern id, which no output that the DFA serves shows; their order is free.
+            const char* why = dfa_unsupported(spec);
+            std::string declined;
+            if (!why) engine = Dfa::build(spec.patterns, spec.insensitive, DfaLimits{}, declined);
+            if (!engine) throw unsupported_backend(want, why ? std::string(why) : declined);
+            return;
+        }
+        if (want == Backend::automatic) {
+            // PERF: the DFA is not chosen automatically until benchmarks show where it beats Hyperscan.
+            // PERF: up to Teddy::max_patterns text literals scan with the native AVX2 Teddy matcher; db stays
+            // compiled as its fallback. Auto keeps Hyperscan where Teddy is unmeasured: without AVX2, and for
+            // search_bytes. SHGREP_TEDDY=0 keeps auto off it.
+            // CONTRACT: where two patterns can end at the same offset and the output shows which match came
+            // first (lines focus, json per-file cap), auto keeps Hyperscan, whose order for such ties is undefined.
+            if (!teddy_unsupported(spec) && !spec.binary && cpu_features().avx2 && !env_off(L"SHGREP_TEDDY")) {
+                auto teddy = Teddy::build(spec.patterns, spec.insensitive);
+                if (teddy && !(teddy->ties && spec.ordered)) engine = std::move(teddy);
+            }
+            return;
+        }
+        throw unsupported_backend(want, "not available in this build");
+    }
+
+#if defined(SHGREP_PCRE2)
+    void compile_pcre(const CompileSpec& spec) {
+        // CONTRACT: same line-oriented semantics as the Hyperscan path: UTF-8 with Unicode properties, ^ and $ at
+        // every line, '.' never crossing '\n'.
+        const uint32_t options = PCRE2_UTF | PCRE2_UCP | PCRE2_MULTILINE | PCRE2_AUTO_CALLOUT | (spec.insensitive ? PCRE2_CASELESS : 0);
+        std::vector<PcreCode> compiled_patterns;
+        std::vector<bool> compiled_jit;
+        compiled_patterns.reserve(spec.patterns.size());
+        compiled_jit.reserve(spec.patterns.size());
+        for (size_t i = 0; i < spec.patterns.size(); ++i) {
+            int code = 0;
+            PCRE2_SIZE offset = 0;
+            PcreCode compiled(pcre2_compile(reinterpret_cast<PCRE2_SPTR>(spec.patterns[i].data()),
+                                            spec.patterns[i].size(), options, &code, &offset, nullptr));
+            if (!compiled) {
+                PCRE2_UCHAR message[256] = {};
+                pcre2_get_error_message(code, message, sizeof(message));
+                throw std::runtime_error("pattern " + std::to_string(i) + ": " +
+                                         reinterpret_cast<const char*>(message) + " at offset " + std::to_string(offset));
+            }
+            // PERF: JIT-compile the complete-match path; a pattern JIT cannot handle runs on the interpreter.
+            compiled_jit.push_back(pcre2_jit_compile(compiled.get(), PCRE2_JIT_COMPLETE) == 0);
+            compiled_patterns.push_back(std::move(compiled));
+        }
+        pcre = std::move(compiled_patterns);
+        pcre_jit = std::move(compiled_jit);
+        // PCRE2 always reports exact start and end offsets.
+        som = true;
+        lengths.clear();
+    }
+#endif
+};
+
+// CONTRACT: caches compiled databases only, never file contents or results (CLAUDE.md "Allowed caching").
+// Keyed by the full CompileSpec; least recently used entries are dropped past database_cache_entries.
+std::shared_ptr<const Database> compiled_database(const Request& r, const SearchContext& context) {
+    constexpr size_t database_cache_entries = 16;
+    require_cpu();
+    CompileSpec spec = compile_spec(r);
+    static std::mutex mutex;
+    static std::list<std::pair<CompileSpec, std::shared_ptr<const Database>>> cache;
+    {
+        std::lock_guard lock(mutex);
+        for (auto it = cache.begin(); it != cache.end(); ++it) {
+            if (it->first == spec) {
+                cache.splice(cache.begin(), cache, it);
+                return cache.front().second;
+            }
+        }
+    }
+    auto database = std::make_shared<const Database>(spec, db_cache_for(context));
+    std::lock_guard lock(mutex);
+    cache.emplace_front(std::move(spec), database);
+    if (cache.size() > database_cache_entries) cache.pop_back();
+    return database;
+}
+
+struct Event { unsigned id; uint64_t from, to; };
+struct Collector {
+    std::vector<Event> events;
+    uint64_t found = 0;
+    uint32_t max_per_file, remaining;
+    bool full = false;
+    // Count mode stores no events and never stops early; it counts distinct matching lines of `text`
+    // (for bytes, where text is empty, every match counts).
+    bool count_only = false;
+    // COMPAT: Hyperscan rejects \b in UCP mode, so whole-word matching filters reported matches instead, like
+    // rg -w: the bytes before and after must not be word characters. Non-ASCII bytes count as word characters.
+    bool word = false;
+    // Without SOM Hyperscan reports only end offsets: literal starts come from their lengths, and a regex
+    // match is placed at its last byte, which is enough to find its line.
+    bool som = true;
+    const std::vector<uint32_t>* lengths = nullptr;
+    // Lines output keeps the first match per line, so max_per_file and max_results count lines like rg -m.
+    bool per_line = false;
+    // Set when PCRE2 hit its match, depth or JIT stack limit, so the file was not fully searched.
+    bool pcre_limit = false;
+    std::string_view text;
+    uint64_t line_end = 0, lines = 0;
+    // Count output with several patterns also counts lines (matches, for bytes) per pattern id; empty otherwise.
+    std::vector<uint64_t> pattern_lines, pattern_line_end;
+    // CONTRACT: true when no match can cross a line break (Request::line_local), so matches arrive in line order and
+    //   one remembered line end tells whether a line already has a match. Otherwise a match that spans lines can
+    //   arrive after a shorter one that starts later, and lines are remembered by their start offsets instead.
+    bool ordered_lines = true;
+    std::unordered_set<uint64_t> seen_lines;
+    // Inverse search needs the union of every matched span: a later match that starts on an already-seen line can
+    // reach further (patterns "a" and "a\nb"), so it extends that line's stored event instead of being dropped.
+    bool union_spans = false;
+    std::unordered_map<uint64_t, size_t> line_events;  // line start -> index in events, when union_spans
+    std::vector<std::unordered_set<uint64_t>> pattern_seen;
+    // CONTRACT: with SOM, Hyperscan reports every end offset of a match, each with its leftmost start, so one match
+    //   of "a[^x]{0,9}" arrives as up to ten reports. Per pattern id, the latest accepted match is kept here so later
+    //   reports of the same match grow it instead of counting as new matches. PCRE2 reports are already
+    //   non-overlapping per pattern and never repeat.
+    struct Span {
+        uint64_t from = 0, to = 0;
+        size_t event = SIZE_MAX;  // index in events when the general events path stored it, else SIZE_MAX
+        bool seen = false;
+    };
+    std::vector<Span> spans;
+    uint64_t line_start(uint64_t at) const {
+        const size_t limit = static_cast<size_t>(std::min<uint64_t>(at, text.size()));
+        if (limit == 0) return 0;
+        const size_t newline = text.rfind('\n', limit - 1);
+        return newline == std::string_view::npos ? 0 : newline + 1;
+    }
+    static bool word_byte(char c) {
+        unsigned char u = static_cast<unsigned char>(c);
+        return std::isalnum(u) || u == '_' || u >= 0x80;
+    }
+    static int callback(unsigned id, unsigned long long from, unsigned long long to, unsigned, void* raw) {
+        auto& c = *static_cast<Collector*>(raw);
+        // SAFETY: an id outside this query's patterns cannot come from its own database; it is ignored rather than
+        //   used to index the per-pattern tables.
+        if ((c.lengths && id >= c.lengths->size()) || (!c.pattern_lines.empty() && id >= c.pattern_lines.size())) return 0;
+        // A final newline ends the last physical line; its following empty position is not a line.
+        if (c.som && from == to && to == c.text.size() && !c.text.empty() && c.text.back() == '\n')
+            return 0;
+        if (!c.som) {
+            const uint64_t length = c.lengths ? (*c.lengths)[id] : 1;
+            from = to >= length ? to - length : 0;
+        }
+        if (c.word && ((from > 0 && from <= c.text.size() && word_byte(c.text[static_cast<size_t>(from - 1)])) ||
+                       (to < c.text.size() && word_byte(c.text[static_cast<size_t>(to)]))))
+            return 0;
+        // A report that starts where the latest match of this pattern started, or earlier, is that match grown
+        //   (leftmost-longest); one that starts inside it overlaps it. Neither is a new match. The events path, and
+        //   any path without text (bytes, streams), grows the stored event and stops here; the line and count paths
+        //   over text go on with found unchanged, so their line checks still see every line a report touches.
+        bool repeat = false;
+        if (c.som) {
+            if (c.spans.size() <= id) c.spans.resize(static_cast<size_t>(id) + 1);
+            Span& last = c.spans[id];
+            if (last.seen && (from <= last.from || from < last.to)) {
+                repeat = true;
+                if (from <= last.from) {
+                    last.from = from;
+                    last.to = std::max<uint64_t>(last.to, to);
+                    if (last.event != SIZE_MAX && last.event < c.events.size()) {
+                        c.events[last.event].from = last.from;
+                        c.events[last.event].to = last.to;
+                    }
+                }
+                if (c.text.empty() || (!c.per_line && !c.count_only)) return 0;
+            } else {
+                last = Span{from, to, SIZE_MAX, true};
+            }
+        }
+        // CONTRACT (#78): a regex scanned without SOM for line output reports every end offset of one variable-length
+        //   match, so its reports cannot be told apart; `found` then counts matching lines (one per line, like the
+        //   line events). Literals (known lengths) and SOM scans keep per-match counts.
+        const bool count_lines = !c.som && !c.lengths && c.per_line && !c.count_only && !c.text.empty();
+        if (!repeat && !count_lines) ++c.found;
+        if (!c.ordered_lines && !c.text.empty() && (c.count_only || c.per_line)) {
+            const uint64_t start = c.line_start(from);
+            if (c.count_only) {
+                if (!c.pattern_lines.empty()) {
+                    if (c.pattern_seen.size() < c.pattern_lines.size()) c.pattern_seen.resize(c.pattern_lines.size());
+                    if (c.pattern_seen[id].insert(start).second) ++c.pattern_lines[id];
+                }
+                if (c.seen_lines.insert(start).second) ++c.lines;
+                return 0;
+            }
+            if (!c.seen_lines.insert(start).second) {
+                if (c.union_spans)
+                    if (const auto stored = c.line_events.find(start); stored != c.line_events.end() && c.events[stored->second].to < to)
+                        c.events[stored->second].to = to;
+                return 0;
+            }
+            if (count_lines) ++c.found;
+            if (c.events.size() < std::min(c.max_per_file, c.remaining)) {
+                c.events.push_back({id, from, to});
+                if (c.union_spans) c.line_events.emplace(start, c.events.size() - 1);
+            } else { c.full = true; return 1; }
+            return 0;
+        }
+        if (c.count_only) {
+            if (!c.pattern_lines.empty()) {
+                if (c.text.empty()) ++c.pattern_lines[id];
+                else if (from >= c.pattern_line_end[id]) {
+                    ++c.pattern_lines[id];
+                    size_t newline = from < c.text.size() ? c.text.find('\n', static_cast<size_t>(from)) : std::string_view::npos;
+                    c.pattern_line_end[id] = newline == std::string_view::npos ? c.text.size() + 1 : newline + 1;
+                }
+            }
+            // Hyperscan reports matches in end-offset order, so a start before line_end is on a counted line.
+            if (c.text.empty()) ++c.lines;
+            else if (from >= c.line_end) {
+                ++c.lines;
+                size_t newline = from < c.text.size() ? c.text.find('\n', static_cast<size_t>(from)) : std::string_view::npos;
+                c.line_end = newline == std::string_view::npos ? c.text.size() + 1 : newline + 1;
+            }
+            return 0;
+        }
+        if (c.per_line && !c.text.empty()) {
+            // Matches arrive in end-offset order and never cross '\n', so a start before line_end is on a
+            // line that already has an event.
+            if (from < c.line_end) return 0;
+            if (count_lines) ++c.found;
+            size_t newline = from < c.text.size() ? c.text.find('\n', static_cast<size_t>(from)) : std::string_view::npos;
+            c.line_end = newline == std::string_view::npos ? c.text.size() + 1 : newline + 1;
+        }
+        if (c.events.size() < std::min(c.max_per_file, c.remaining)) {
+            c.events.push_back({id, from, to});
+            if (c.som && (c.text.empty() || !c.per_line)) c.spans[id].event = c.events.size() - 1;
+        } else { c.full = true; return 1; }
+        return 0;
+    }
+};
+
+// Count output line: "path:N", plus " [id:N ...]" per matching pattern when several patterns were given.
+std::string count_line(const std::string& display, const Collector& c) {
+    std::string line = display + ":" + std::to_string(c.lines);
+    if (!c.pattern_lines.empty()) {
+        std::string parts;
+        for (size_t id = 0; id < c.pattern_lines.size(); ++id) {
+            if (!c.pattern_lines[id]) continue;
+            if (!parts.empty()) parts.push_back(' ');
+            parts += std::to_string(id) + ":" + std::to_string(c.pattern_lines[id]);
+        }
+        line += " [" + parts + "]";
+    }
+    return line + "\n";
+}
+
+// Lines of `text` that no match touches (rg -v), as events at each such line's first byte.
+struct InvertedLines {
+    std::vector<Event> events;  // at most `keep`
+    uint64_t count = 0;         // all such lines
+};
+// CONTRACT: matched are match events in any order. A match touches the line holding its start and, when spans is
+// set (multiline), every line up to its last byte.
+InvertedLines invert_lines(std::string_view text, std::vector<Event> matched, uint32_t keep, bool spans) {
+    std::sort(matched.begin(), matched.end(), [](const Event& a, const Event& b) { return a.from < b.from; });
+    InvertedLines out;
+    size_t next = 0, start = 0;
+    uint64_t reach = 0;  // last byte touched by the matches seen so far
+    bool seen = false;
+    while (start < text.size()) {
+        const size_t newline = text.find('\n', start);
+        const size_t end = newline == std::string_view::npos ? text.size() : newline;  // the line is [start, end]
+        for (; next < matched.size() && matched[next].from <= end; ++next) {
+            const Event& m = matched[next];
+            const uint64_t last = spans && m.to > m.from ? m.to - 1 : m.from;
+            reach = seen ? std::max(reach, last) : last;
+            seen = true;
+        }
+        if (!seen || reach < start) {
+            ++out.count;
+            if (out.events.size() < keep) out.events.push_back({0, start, start});
+        }
+        if (newline == std::string_view::npos) break;
+        start = newline + 1;
+    }
+    return out;
+}
+
+bool seek(HANDLE h, uint64_t offset) {
+    LARGE_INTEGER pos; pos.QuadPart = static_cast<LONGLONG>(offset);
+    return SetFilePointerEx(h, pos, nullptr, FILE_BEGIN) != 0;
+}
+
+// CONTRACT: Sampling only classifies an already oversized file; it never proves text contents.
+std::optional<bool> probe_binary(HANDLE h, uint64_t size) {
+    std::array<char, 4096> sample{};
+    if (!seek(h, 0)) return std::nullopt;
+    DWORD got = 0;
+    DWORD want = static_cast<DWORD>(std::min<uint64_t>(sample.size(), size));
+    if (want && (!ReadFile(h, sample.data(), want, &got, nullptr) || got != want))
+        return std::nullopt;
+    if (got >= 2) {
+        unsigned char first = static_cast<unsigned char>(sample[0]);
+        unsigned char second = static_cast<unsigned char>(sample[1]);
+        if ((first == 0xff && second == 0xfe) || (first == 0xfe && second == 0xff))
+            return false;
+    }
+    if (std::find(sample.begin(), sample.begin() + got, '\0') != sample.begin() + got)
+        return true;
+    if (size > sample.size()) {
+        if (!seek(h, size - sample.size())) return std::nullopt;
+        if (!ReadFile(h, sample.data(), static_cast<DWORD>(sample.size()), &got, nullptr) ||
+            got != static_cast<DWORD>(sample.size())) return std::nullopt;
+        if (std::find(sample.begin(), sample.end(), '\0') != sample.end()) return true;
+    }
+    return false;
+}
+// nullopt when the window cannot be read; the caller counts a file error instead of showing empty context.
+template<class Interrupted>
+std::optional<std::string> read_window(HANDLE h, uint64_t start, uint64_t end, Interrupted&& interrupted) {
+    if (end < start || end - start > SIZE_MAX || !seek(h, start)) return std::nullopt;
+    const size_t length = static_cast<size_t>(end - start);
+    std::string out;
+    while (out.size() < length) {
+        if (interrupted()) return std::nullopt;
+        const size_t used = out.size();
+        const DWORD want = static_cast<DWORD>(std::min<size_t>(length - used, 1u << 20));
+        out.resize(used + want);
+        DWORD read = 0;
+        if (!ReadFile(h, out.data() + used, want, &read, nullptr) || !read) return std::nullopt;
+        out.resize(used + read);
+    }
+    return out;
+}
+std::string hex(const std::string& s) {
+    constexpr char digits[] = "0123456789abcdef";
+    std::string out; out.reserve(s.size() * 2);
+    for (unsigned char c : s) { out.push_back(digits[c >> 4]); out.push_back(digits[c & 15]); }
+    return out;
+}
+// CONTRACT: strict UTF-8 (RFC 3629: no overlongs, surrogates, or code points above U+10FFFF), the same set
+// MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS) accepts.
+// PERF: ASCII runs are skipped 16 bytes at a time; MultiByteToWideChar ran at about 1 GB/s on source text.
+// Length of the well-formed UTF-8 sequence at p[i] (lead byte >= 0x80), or 0 when it is not one. Same rules as
+// valid_utf8: no overlongs, surrogates or code points above U+10FFFF.
+size_t utf8_width(const unsigned char* p, size_t i, size_t n) {
+    const unsigned char c = p[i];
+    size_t length = 0;
+    unsigned char low = 0x80, high = 0xbf;
+    if (c >= 0xc2 && c <= 0xdf) length = 2;
+    else if (c >= 0xe0 && c <= 0xef) {
+        length = 3;
+        if (c == 0xe0) low = 0xa0;
+        else if (c == 0xed) high = 0x9f;
+    } else if (c >= 0xf0 && c <= 0xf4) {
+        length = 4;
+        if (c == 0xf0) low = 0x90;
+        else if (c == 0xf4) high = 0x8f;
+    } else return 0;
+    if (n - i < length || p[i + 1] < low || p[i + 1] > high) return 0;
+    for (size_t k = 2; k < length; ++k)
+        if ((p[i + k] & 0xc0) != 0x80) return 0;
+    return length;
+}
+
+bool valid_utf8(std::string_view s) {
+    const auto* p = reinterpret_cast<const unsigned char*>(s.data());
+    const size_t n = s.size();
+    size_t i = 0;
+    while (i < n) {
+        if (i + 16 <= n) {
+            const int mask = _mm_movemask_epi8(_mm_loadu_si128(reinterpret_cast<const __m128i*>(p + i)));
+            if (mask == 0) { i += 16; continue; }
+            unsigned long first = 0;
+            _BitScanForward(&first, static_cast<unsigned long>(mask));
+            i += first;
+        } else if (p[i] < 0x80) {
+            ++i;
+            continue;
+        }
+        const unsigned char c = p[i];
+        size_t length = 0;
+        unsigned char low = 0x80, high = 0xbf;
+        if (c >= 0xc2 && c <= 0xdf) length = 2;
+        else if (c >= 0xe0 && c <= 0xef) {
+            length = 3;
+            if (c == 0xe0) low = 0xa0;
+            else if (c == 0xed) high = 0x9f;
+        } else if (c >= 0xf0 && c <= 0xf4) {
+            length = 4;
+            if (c == 0xf0) low = 0x90;
+            else if (c == 0xf4) high = 0x8f;
+        } else return false;
+        if (n - i < length || p[i + 1] < low || p[i + 1] > high) return false;
+        for (size_t k = 2; k < length; ++k)
+            if ((p[i + k] & 0xc0) != 0x80) return false;
+        i += length;
+    }
+    return true;
+}
+
+struct DecodedText {
+    std::string text;
+    // UTF-16: one (decoded end, raw end) pair per code point.
+    std::vector<std::pair<uint32_t, uint32_t>> boundaries;
+    // Repaired UTF-8: valid bytes are copied verbatim, so offsets differ only after a U+FFFD; one (decoded end, raw
+    // end) pair per replacement, and offsets between them map linearly.
+    std::vector<std::pair<uint32_t, uint32_t>> anchors;
+    uint32_t bom = 0;
+    bool identity = true, sparse = false;
+
+    uint64_t raw_offset(uint64_t decoded, bool end) const {
+        if (identity) return bom + decoded;
+        if (sparse) {
+            // An offset inside a code point maps to its raw start, or its raw end when `end`, as below.
+            size_t at = static_cast<size_t>(std::min<uint64_t>(decoded, text.size()));
+            if (end) while (at < text.size() && (static_cast<unsigned char>(text[at]) & 0xc0) == 0x80) ++at;
+            else while (at > 0 && at < text.size() && (static_cast<unsigned char>(text[at]) & 0xc0) == 0x80) --at;
+            auto it = std::upper_bound(anchors.begin(), anchors.end(), at,
+                [](size_t value, const auto& point) { return value < point.first; });
+            if (it == anchors.begin()) return bom + at;
+            --it;
+            return it->second + (at - it->first);
+        }
+        if (decoded == 0) return bom;
+        auto it = std::lower_bound(boundaries.begin(), boundaries.end(), decoded,
+            [](const auto& point, uint64_t value) { return point.first < value; });
+        if (it == boundaries.end()) return boundaries.empty() ? bom : boundaries.back().second;
+        if (it->first == decoded) return it->second;
+        return end ? it->second : (it == boundaries.begin() ? bom : (it - 1)->second);
+    }
+};
+
+void append_codepoint(DecodedText& out, uint32_t cp, uint32_t raw_end) {
+    if (cp <= 0x7f) out.text.push_back(static_cast<char>(cp));
+    else if (cp <= 0x7ff) {
+        out.text.push_back(static_cast<char>(0xc0 | (cp >> 6)));
+        out.text.push_back(static_cast<char>(0x80 | (cp & 0x3f)));
+    } else if (cp <= 0xffff) {
+        out.text.push_back(static_cast<char>(0xe0 | (cp >> 12)));
+        out.text.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3f)));
+        out.text.push_back(static_cast<char>(0x80 | (cp & 0x3f)));
+    } else {
+        out.text.push_back(static_cast<char>(0xf0 | (cp >> 18)));
+        out.text.push_back(static_cast<char>(0x80 | ((cp >> 12) & 0x3f)));
+        out.text.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3f)));
+        out.text.push_back(static_cast<char>(0x80 | (cp & 0x3f)));
+    }
+    out.boundaries.emplace_back(static_cast<uint32_t>(out.text.size()), raw_end);
+}
+
+// Bytes the repaired-UTF-8 decoder replaces with U+FFFD.
+size_t invalid_utf8_bytes(std::string_view body) {
+    const auto* p = reinterpret_cast<const unsigned char*>(body.data());
+    const size_t n = body.size();
+    size_t bad = 0;
+    for (size_t i = 0; i < n;) {
+        if (p[i] < 0x80) { ++i; continue; }
+        if (const size_t width = utf8_width(p, i, n)) { i += width; continue; }
+        ++bad;
+        ++i;
+    }
+    return bad;
+}
+
+// SAFETY: decode_text reserves its text and offset map exactly to these bounds, so a memory charge computed here
+//   covers its whole allocation (no growth slack): UTF-16 needs up to 3 text bytes and one 8-byte boundary pair per
+//   code unit; repaired UTF-8 needs 2 more text bytes and one 8-byte anchor per invalid byte.
+uint64_t decoded_text_bytes(std::string_view raw) {
+    const auto byte = [&](size_t i) { return static_cast<unsigned char>(raw[i]); };
+    if (raw.size() >= 2 && ((byte(0) == 0xff && byte(1) == 0xfe) || (byte(0) == 0xfe && byte(1) == 0xff))) {
+        const uint64_t units = raw.size() / 2 + 1;
+        return units * 3 + units * sizeof(std::pair<uint32_t, uint32_t>);
+    }
+    const size_t bom = raw.size() >= 3 && byte(0) == 0xef && byte(1) == 0xbb && byte(2) == 0xbf ? 3 : 0;
+    const std::string_view body = raw.substr(bom);
+    if (valid_utf8(body)) return body.size();
+    const uint64_t bad = invalid_utf8_bytes(body);
+    return body.size() + 2 * bad + bad * sizeof(std::pair<uint32_t, uint32_t>);
+}
+
+DecodedText decode_text(std::string_view raw) {
+    DecodedText out;
+    const auto byte = [&](size_t i) { return static_cast<unsigned char>(raw[i]); };
+    const bool utf16le = raw.size() >= 2 && byte(0) == 0xff && byte(1) == 0xfe;
+    const bool utf16be = raw.size() >= 2 && byte(0) == 0xfe && byte(1) == 0xff;
+    if (utf16le || utf16be) {
+        out.identity = false;
+        out.bom = 2;
+        // Exact worst-case reservations; see decoded_text_bytes.
+        out.text.reserve((raw.size() / 2 + 1) * 3);
+        out.boundaries.reserve(raw.size() / 2 + 1);
+        const auto unit = [&](size_t i) -> uint16_t {
+            return utf16le ? static_cast<uint16_t>(byte(i) | (byte(i + 1) << 8))
+                           : static_cast<uint16_t>((byte(i) << 8) | byte(i + 1));
+        };
+        for (size_t i = 2; i < raw.size();) {
+            uint32_t cp = 0xfffd;
+            if (i + 1 < raw.size()) {
+                cp = unit(i);
+                i += 2;
+                if (cp >= 0xd800 && cp <= 0xdbff) {
+                    if (i + 1 < raw.size()) {
+                        uint32_t low = unit(i);
+                        if (low >= 0xdc00 && low <= 0xdfff) {
+                            cp = 0x10000 + ((cp - 0xd800) << 10) + (low - 0xdc00);
+                            i += 2;
+                        } else cp = 0xfffd;
+                    } else cp = 0xfffd;
+                } else if (cp >= 0xdc00 && cp <= 0xdfff) cp = 0xfffd;
+            } else ++i;
+            append_codepoint(out, cp, static_cast<uint32_t>(i));
+        }
+        return out;
+    }
+    out.bom = raw.size() >= 3 && byte(0) == 0xef && byte(1) == 0xbb && byte(2) == 0xbf ? 3 : 0;
+    const std::string_view body = raw.substr(out.bom);
+    if (valid_utf8(body)) {
+        out.text.assign(body);
+        return out;
+    }
+    // PERF: lossy repair in bulk. Valid runs (ASCII skipped 16 bytes at a time) are copied verbatim and each
+    // invalid byte becomes U+FFFD; only replacements record an offset anchor. Decoding per code point with a
+    // boundary entry each took ~0.75 s and ~16 bytes of map per byte for a 60 MB file.
+    out.identity = false;
+    out.sparse = true;
+    // Exact reservations; see decoded_text_bytes.
+    const size_t bad = invalid_utf8_bytes(body);
+    out.text.reserve(body.size() + 2 * bad);
+    out.anchors.reserve(bad);
+    const auto* p = reinterpret_cast<const unsigned char*>(body.data());
+    const size_t n = body.size();
+    size_t copied = 0, i = 0;
+    while (i < n) {
+        if (i + 16 <= n) {
+            const int mask = _mm_movemask_epi8(_mm_loadu_si128(reinterpret_cast<const __m128i*>(p + i)));
+            if (mask == 0) { i += 16; continue; }
+            unsigned long first = 0;
+            _BitScanForward(&first, static_cast<unsigned long>(mask));
+            i += first;
+        } else if (p[i] < 0x80) {
+            ++i;
+            continue;
+        }
+        if (const size_t width = utf8_width(p, i, n)) {
+            i += width;
+            continue;
+        }
+        out.text.append(body.data() + copied, i - copied);
+        out.text.append("\xef\xbf\xbd");
+        copied = ++i;
+        out.anchors.emplace_back(static_cast<uint32_t>(out.text.size()), static_cast<uint32_t>(out.bom + i));
+    }
+    out.text.append(body.data() + copied, n - copied);
+    return out;
+}
+// nullopt when the file cannot be read back; cancellation and timeout set state instead.
+std::optional<std::vector<uint64_t>> lines_for(HANDLE h, const std::vector<Event>& events, std::vector<char>& buffer,
+                                               const std::shared_ptr<std::atomic_bool>& cancelled, Clock::time_point deadline,
+                                               std::string& state) {
+    std::vector<uint64_t> lines(events.size(), 0);
+    std::vector<size_t> order;
+    order.reserve(events.size());
+    for (size_t i = 0; i < events.size(); ++i) order.push_back(i);
+    std::sort(order.begin(), order.end(), [&](size_t a, size_t b) { return events[a].from < events[b].from; });
+    if (!seek(h, 0)) return std::nullopt;
+    uint64_t line = 1, done = 0;
+    for (size_t index : order) {
+        while (done < events[index].from) {
+            if (cancelled->load()) { state = "cancelled"; return lines; }
+            if (Clock::now() >= deadline) { state = "timeout"; return lines; }
+            DWORD want = static_cast<DWORD>(std::min<uint64_t>(buffer.size(), events[index].from - done)), got = 0;
+            if (!ReadFile(h, buffer.data(), want, &got, nullptr) || got == 0) return std::nullopt;
+            line += std::count(buffer.begin(), buffer.begin() + got, '\n');
+            done += got;
+        }
+        lines[index] = line;
+    }
+    return lines;
+}
+Json::Object summary(uint64_t files, uint64_t bytes, uint64_t found, uint64_t returned,
+                     uint64_t errors, uint64_t skipped_size, uint64_t skipped_binary,
+                     uint64_t elapsed, const std::string& state) {
+    Json::Object result{{"files_scanned", files}, {"bytes_scanned", bytes}, {"matches_found", found},
+                        {"matches_returned", returned}, {"file_errors", errors},
+                        {"files_skipped_size", skipped_size}, {"files_skipped_binary", skipped_binary},
+                        {"elapsed_ms", elapsed}, {"truncated", state != "complete"}, {"status", state}};
+    if (state == "limit")
+        result.emplace("hint", "Narrow the search or raise max_results; use max_results=0 for exhaustive results.");
+    return result;
+}
+
+constexpr size_t listing_buffer_bytes = 64 * 1024;
+constexpr uint64_t text_memory_budget = 512ull << 20;
+constexpr uint64_t small_text_bytes = 1ull << 20;
+constexpr uint64_t binary_probe_bytes = 64 * 1024;
+// Text files up to this size are read and scanned whole; larger ones in line-aligned chunks (scan_large_text).
+constexpr uint64_t whole_text_bytes = 64ull << 20;
+// Issue #57: a chunk's events and rendered lines are held at once, so chunks stay small enough that one dense file
+// (millions of short matching lines) needs bounded memory; results are published every large_batch_bytes.
+constexpr size_t large_chunk_bytes = 1u << 20;
+constexpr size_t large_batch_bytes = 4u << 20;
+// Line-local text searches scan files above this size chunk by chunk instead of whole.
+constexpr uint64_t chunked_text_bytes = 2ull << 20;
+constexpr size_t retained_text_capacity = 8u << 20;
+
+struct Control {
+    std::shared_ptr<std::atomic_bool> cancelled;
+    Clock::time_point deadline;
+    std::atomic_bool stop{false};
+    const char* interrupted() const {
+        if (cancelled->load()) return "cancelled";
+        if (Clock::now() >= deadline) return "timeout";
+        return nullptr;
+    }
+};
+
+// One file's rendered block for text output (lines, files, count).
+// PERF: plain strings, not a Json object: map nodes cost an allocation each to build, to move while sorting
+// (MSVC's map move allocates) and to free, which made sorting ~4,000 results take 3.5 ms.
+struct TextBlock {
+    std::string path, text;
+    uint32_t units = 1;
+    // Set when the text lives in the request's TextSpill (text is then empty).
+    bool spilled = false;
+    uint64_t spill_offset = 0, spill_length = 0;
+};
+
+// Issue #48: nothing is cut by default. Over 50 matches, the first output line counts matches and files, names the
+// busiest files and how to narrow, so the preview of an offloaded result is enough to refine the query.
+std::string narrow_hint(const std::vector<TextBlock>& blocks, uint64_t found) {
+    if (found <= 50) return {};
+    std::map<std::string, uint64_t> per_file;
+    for (const auto& block : blocks) per_file[block.path] += block.units;
+    std::vector<std::pair<uint64_t, std::string>> busiest;
+    for (const auto& [path, count] : per_file) busiest.emplace_back(count, path);
+    std::sort(busiest.begin(), busiest.end(), [](const auto& a, const auto& b) {
+        return a.first != b.first ? a.first > b.first : a.second < b.second;
+    });
+    std::string hint = "[summary: " + std::to_string(found) + " matches in " + std::to_string(per_file.size()) + " file" +
+        (per_file.size() == 1 ? "" : "s");
+    if (per_file.size() > 1) {
+        hint += "; most in";
+        for (size_t i = 0; i < std::min<size_t>(5, busiest.size()); ++i)
+            hint += (i ? ", " : " ") + busiest[i].second + " (" + std::to_string(busiest[i].first) + ")";
+    }
+    return hint + ". Narrow with path, include, exclude or word=true, or use output=files or output=count]\n";
+}
+
+// Remove the repeated file prefix only after ranking and result limiting have consumed grep-style lines.
+class GroupedLines {
+    std::string prefix_, pending_;
+    bool line_start_ = true;
+public:
+    explicit GroupedLines(std::string prefix) : prefix_(std::move(prefix)) {}
+    std::string append(std::string_view input, bool final = false) {
+        std::string out;
+        out.reserve(input.size());
+        for (char c : input) {
+            if (line_start_) {
+                pending_.push_back(c);
+                if (c == '\n' || pending_.size() > prefix_.size()) {
+                    if (pending_.size() > prefix_.size() &&
+                        pending_.compare(0, prefix_.size(), prefix_) == 0 &&
+                        (pending_[prefix_.size()] == ':' || pending_[prefix_.size()] == '-'))
+                        out.append(pending_, prefix_.size() + 1, std::string::npos);
+                    else out += pending_;
+                    line_start_ = c == '\n';
+                    pending_.clear();
+                }
+            } else {
+                out.push_back(c);
+                if (c == '\n') line_start_ = true;
+            }
+        }
+        if (final && !pending_.empty()) { out += pending_; pending_.clear(); }
+        return out;
+    }
+};
+
+// Text output beyond this many resident bytes goes to a temporary file (see TextSpill).
+constexpr uint64_t text_spill_threshold = 64ull << 20;
+
+// Append-only temporary file that holds output text kept out of memory. It is created on first use, shared with no
+// one, and deleted by Windows when the last handle closes, even if the process dies. Appends need the caller's lock;
+// reads happen after the writers have finished.
+class TextSpill {
+public:
+    uint64_t size() const { return size_; }
+    uint64_t append(std::string_view text) {
+        if (!file_) create();
+        const uint64_t offset = size_;
+        for (size_t done = 0; done < text.size();) {
+            const auto want = static_cast<DWORD>(std::min<size_t>(text.size() - done, 1u << 24));
+            OVERLAPPED at = position(offset + done);
+            DWORD put = 0;
+            if (!WriteFile(file_.h, text.data() + done, want, &put, &at) || put == 0) io_failure("write", GetLastError());
+            done += put;
+        }
+        size_ += text.size();
+        return offset;
+    }
+    void read(uint64_t offset, uint64_t length, std::string& bytes) const {
+        bytes.resize(static_cast<size_t>(length));
+        for (size_t done = 0; done < bytes.size();) {
+            const auto want = static_cast<DWORD>(std::min<size_t>(bytes.size() - done, 1u << 24));
+            OVERLAPPED at = position(offset + done);
+            DWORD got = 0;
+            if (!ReadFile(file_.h, bytes.data() + done, want, &got, &at) || got == 0) io_failure("read", GetLastError());
+            done += got;
+        }
+    }
+
+private:
+    static OVERLAPPED position(uint64_t at) {
+        OVERLAPPED overlapped{};
+        overlapped.Offset = static_cast<DWORD>(at);
+        overlapped.OffsetHigh = static_cast<DWORD>(at >> 32);
+        return overlapped;
+    }
+    [[noreturn]] static void io_failure(const char* action, DWORD error) {
+        throw std::runtime_error(std::string("cannot ") + action + " the temporary file that holds large search output (Windows error " +
+                                 std::to_string(error) + "); narrow the search or free disk space in the temporary folder");
+    }
+    void create() {
+        std::wstring folder(32768, L'\0');
+        const DWORD length = GetTempPathW(static_cast<DWORD>(folder.size()), folder.data());
+        if (!length || length >= folder.size()) io_failure("locate", GetLastError());
+        folder.resize(length);
+        static std::atomic<uint32_t> serial{0};
+        DWORD error = ERROR_FILE_EXISTS;
+        for (unsigned attempt = 0; attempt != 16 && (error == ERROR_FILE_EXISTS || error == ERROR_ALREADY_EXISTS); ++attempt) {
+            const std::wstring path = folder + L"shgrep-spill-" + std::to_wstring(GetCurrentProcessId()) + L"-" +
+                                      std::to_wstring(++serial) + L".tmp";
+            Handle opened(CreateFileW(path.c_str(), GENERIC_READ | GENERIC_WRITE | DELETE, 0, nullptr, CREATE_NEW,
+                                      FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE, nullptr));
+            if (opened) {
+                file_ = std::move(opened);
+                return;
+            }
+            error = GetLastError();
+        }
+        io_failure("create", error);
+    }
+    Handle file_;
+    uint64_t size_ = 0;
+};
+
+// Request-wide results and counters shared by all workers.
+struct Outcome {
+    std::mutex mutex;
+    Json::Array results;            // guarded by mutex; JSON output
+    std::vector<TextBlock> blocks;  // guarded by mutex; text output
+    Json::Array skipped_files;      // guarded by mutex
+    std::string state = "complete"; // guarded by mutex
+    size_t projected_bytes = 200;   // guarded by mutex
+    size_t units = 0;               // guarded by mutex; matches, or files for files/count/find_files output
+    std::exception_ptr failure;     // guarded by mutex
+    std::atomic<size_t> returned{0};
+    std::atomic<uint64_t> files{0}, bytes{0}, found{0}, errors{0}, skipped_size{0}, skipped_binary{0};
+    std::atomic<uint64_t> regular_seen{0}, files_filtered{0}, files_ignored{0}, files_hidden{0};
+    std::atomic<uint64_t> directories_pruned{0}, reparse_skipped{0};
+    std::atomic<uint64_t> engine_fallbacks{0};  // files an engine failed on and Hyperscan rescanned
+    std::atomic<uint64_t> skipped_lsp{0}, text_fallbacks{0};
+    std::string fallback_reason;  // guarded by mutex
+    std::atomic<uint64_t> index_missing{0};     // index candidates that no longer exist
+    std::atomic_bool per_file_limited{false};
+    // Set only when main.cpp can stream the result: large text blocks are then kept there instead of in memory.
+    std::shared_ptr<TextSpill> spill;
+    uint64_t resident_text = 0;     // guarded by mutex; bytes of block text held in memory while spill is set
+    // When raw_limit is set, over_limit says the accepted block text passed it (raw_bytes counts it); guarded by mutex.
+    uint64_t raw_limit = 0, raw_bytes = 0;
+    bool over_limit = false;
+    // CONTRACT: mutex held. Blocks stay in memory until text_spill_threshold bytes are resident; later ones go to spill.
+    void store(TextBlock block) {
+        raw_bytes += block.text.size();
+        if (raw_limit && raw_bytes > raw_limit) over_limit = true;
+        if (spill && !block.text.empty()) {
+            if (resident_text + block.text.size() > text_spill_threshold) {
+                block.spill_length = block.text.size();
+                block.spill_offset = spill->append(block.text);
+                block.spilled = true;
+                std::string().swap(block.text);
+            } else {
+                resident_text += block.text.size();
+            }
+        }
+        blocks.push_back(std::move(block));
+    }
+};
+
+void finish(Outcome& out, Control& control, const char* state) {
+    std::lock_guard lock(out.mutex);
+    if (out.state == "complete") out.state = state;
+    control.stop.store(true);
+}
+
+void fail(Outcome& out, Control& control, std::exception_ptr error) {
+    std::lock_guard lock(out.mutex);
+    if (!out.failure) out.failure = std::move(error);
+    control.stop.store(true);
+}
+
+// A JSON-output item, or with `text` set a text-output block.
+struct Candidate {
+    Json item;
+    size_t bytes;
+    uint32_t units = 1;
+    bool text = false;
+    TextBlock block;
+};
+
+// Text-output candidate: `text` is one file's rendered block. bytes is its JSON-escaped size, which is what it
+// costs inside the MCP response.
+void add_text_candidate(std::vector<Candidate>& items, const std::string& display, std::string text, uint32_t units) {
+    const size_t bytes = Json::escaped_size(text);
+    items.push_back({Json(), bytes, units, true, TextBlock{display, std::move(text), units}});
+}
+
+// CONTRACT: called once per file; applies the request-wide result and output limits in arrival order.
+// find_files JSON candidates carry bytes == 0 and are bounded by the final serialization pass instead.
+std::string painted(const Request& r, const std::string& display);
+
+// Cuts an over-budget block to the whole lines that fit in budget escaped bytes, starting at its first match; the
+// first line itself is cut at a character boundary when no whole line fits. False when nothing can be kept.
+bool trim_block(const Request& r, TextBlock& block, size_t budget) {
+    const std::string prefix = painted(r, block.path);
+    auto matched_at = [&](size_t pos) {
+        return block.text.compare(pos, prefix.size(), prefix) == 0 && pos + prefix.size() < block.text.size() &&
+               block.text[pos + prefix.size()] == ':';
+    };
+    size_t begin = 0;
+    if (r.output == "lines") {
+        for (size_t pos = 0; pos < block.text.size();) {
+            if (matched_at(pos)) { begin = pos; break; }
+            const size_t newline = block.text.find('\n', pos);
+            pos = newline == std::string::npos ? block.text.size() : newline + 1;
+        }
+    }
+    size_t used = 2, end = begin;
+    uint32_t matches = 0;
+    while (end < block.text.size()) {
+        const size_t newline = block.text.find('\n', end);
+        const size_t next = newline == std::string::npos ? block.text.size() : newline + 1;
+        const size_t cost = Json::escaped_size(std::string_view(block.text).substr(end, next - end)) - 2;
+        if (used + cost > budget) break;
+        if (matched_at(end)) ++matches;
+        used += cost;
+        end = next;
+    }
+    std::string kept;
+    if (end == begin) {
+        size_t cut = std::min(block.text.size() - begin, budget > 16 ? (budget - 16) / 6 : 0);  // worst case \u00XX escapes
+        while (cut > 0 && (static_cast<unsigned char>(block.text[begin + cut]) & 0xc0) == 0x80) --cut;
+        if (cut == 0) return false;
+        kept = block.text.substr(begin, cut) + "\n";
+        matches = 1;
+    } else {
+        kept = block.text.substr(begin, end - begin);
+        if (kept.ends_with("--\n")) kept.resize(kept.size() - 3);
+    }
+    block.text = std::move(kept);
+    block.units = r.output == "lines" ? std::max<uint32_t>(matches, 1) : 1;
+    return true;
+}
+
+// Shortens the context of an over-budget json result by at least excess escaped bytes; false when it has none left.
+bool shrink_context(Json& item, size_t excess) {
+    auto& object = std::get<Json::Object>(item.value);
+    for (const char* key : {"context", "context_text", "context_hex"}) {
+        const auto it = object.find(key);
+        if (it == object.end() || !std::holds_alternative<std::string>(it->second.value) || it->second.string().empty()) continue;
+        std::string text = it->second.string();
+        size_t keep = text.size() > excess + 8 ? text.size() - excess - 8 : 0;
+        if (std::string_view(key) == "context_hex") keep -= keep % 2;
+        else while (keep > 0 && (static_cast<unsigned char>(text[keep]) & 0xc0) == 0x80) --keep;
+        text.resize(keep);
+        it->second = std::move(text);
+        object["context_truncated"] = true;
+        return true;
+    }
+    return false;
+}
+
+// Keeps a lines block's first `keep` matched lines (the ':' lines), dropping what follows and a trailing "--".
+std::string keep_matched_lines(const Request& r, const std::string& text, const std::string& display, uint32_t keep) {
+    const std::string prefix = painted(r, display);
+    uint32_t matched = 0;
+    for (size_t pos = 0; pos < text.size();) {
+        const size_t newline = text.find('\n', pos);
+        const size_t next = newline == std::string::npos ? text.size() : newline + 1;
+        if (text.compare(pos, prefix.size(), prefix) == 0 && pos + prefix.size() < text.size() && text[pos + prefix.size()] == ':') {
+            if (matched == keep) {
+                std::string kept = text.substr(0, pos);
+                if (kept.ends_with("--\n")) kept.resize(kept.size() - 3);
+                return kept;
+            }
+            ++matched;
+        }
+        pos = next;
+    }
+    return text;
+}
+
+void publish(const Request& r, Outcome& out, Control& control, std::vector<Candidate>& items, size_t content_budget) {
+    if (items.empty()) return;
+    std::lock_guard lock(out.mutex);
+    for (auto& candidate : items) {
+        if (out.state != "complete") break;
+        if (out.units >= r.max_results) {
+            out.state = "limit";
+            control.stop.store(true);
+            break;
+        }
+        // CONTRACT: workers size their files from a count that other workers may have raised since, so a block is
+        //   cut to the allowance left here, under the lock, and max_results is never exceeded.
+        const size_t allowance = r.max_results - out.units;
+        if (candidate.units > allowance) {
+            if (candidate.text && r.output == "lines") {
+                candidate.block.text = keep_matched_lines(r, candidate.block.text, candidate.block.path, static_cast<uint32_t>(allowance));
+                candidate.block.units = candidate.units = static_cast<uint32_t>(allowance);
+                candidate.bytes = Json::escaped_size(candidate.block.text);
+            } else {
+                candidate.units = static_cast<uint32_t>(allowance);
+            }
+        }
+        if (candidate.bytes > content_budget || out.projected_bytes > content_budget - candidate.bytes) {
+            // CONTRACT: matches never yield an empty answer: the first result is kept even when it alone is over the
+            //   budget, and the final fit shortens it (fit_output) instead of dropping it.
+            if (out.blocks.empty() && out.results.empty()) {
+                out.projected_bytes += candidate.bytes;
+                out.units += candidate.units;
+                if (candidate.text) out.store(std::move(candidate.block));
+                else out.results.push_back(std::move(candidate.item));
+            }
+            out.state = "output_limit";
+            control.stop.store(true);
+            break;
+        }
+        out.projected_bytes += candidate.bytes;
+        out.units += candidate.units;
+        if (candidate.text) out.store(std::move(candidate.block));
+        else out.results.push_back(std::move(candidate.item));
+        if (out.over_limit) {
+            control.stop.store(true);
+            break;
+        }
+    }
+    if (out.state == "complete" && out.units >= r.max_results) {
+        out.state = "limit";
+        control.stop.store(true);
+    }
+    out.returned.store(out.units);
+}
+
+// SAFETY: bounds the raw and decoded copies that concurrent text scans hold at once.
+struct MemoryBudget {
+    std::mutex mutex;
+    std::condition_variable released;
+    uint64_t in_use = 0;
+    const uint64_t limit;
+
+    explicit MemoryBudget(uint64_t bytes) : limit(bytes) {}
+    // A single file larger than the budget still runs once nothing else holds memory.
+    bool acquire(uint64_t bytes, const Control& control) {
+        std::unique_lock lock(mutex);
+        while (in_use != 0 && in_use + bytes > limit) {
+            if (control.stop.load() || control.interrupted()) return false;
+            released.wait_for(lock, std::chrono::milliseconds(20));
+        }
+        in_use += bytes;
+        return true;
+    }
+    bool grow(uint64_t& held, uint64_t required) {
+        if (required <= held) return true;
+        std::lock_guard lock(mutex);
+        const uint64_t extra = required - held;
+        if (extra > limit || in_use > limit - extra) return false;
+        in_use += extra;
+        held = required;
+        return true;
+    }
+    void release(uint64_t bytes) {
+        {
+            std::lock_guard lock(mutex);
+            in_use -= bytes;
+        }
+        released.notify_all();
+    }
+    // Raises held to required. When that does not fit now, held is given back and required is acquired afresh, so
+    // two growing scans never wait on each other's charge; while waiting, the caller's held buffer is uncharged.
+    bool grow_or_wait(uint64_t& held, uint64_t required, const Control& control) {
+        if (grow(held, required)) return true;
+        release(held);
+        held = 0;
+        if (!acquire(required, control)) return false;
+        held = required;
+        return true;
+    }
+};
+
+// SAFETY: Hyperscan scratch is not thread-safe, so each worker owns a clone of the database prototype.
+struct Worker {
+    std::vector<char> buffer;  // 1 MiB chunk buffer for files over binary_probe_bytes; see chunk()
+    // PERF: allocated on first use; zero-filling 1 MiB for every worker of every request cost ~1.5 ms of setup,
+    // and small text files never touch it.
+    std::vector<char>& chunk() {
+        if (buffer.empty()) buffer.resize(1 << 20);
+        return buffer;
+    }
+    // PERF: the whole-file read buffer is allocated without zero-filling (std::string::resize would memset it).
+    std::unique_ptr<char[]> raw;
+    size_t raw_capacity = 0;
+    char* raw_buffer(size_t bytes) {
+        if (bytes > raw_capacity || !raw) {
+            raw = std::make_unique_for_overwrite<char[]>(std::max<size_t>(bytes, 1));
+            raw_capacity = std::max<size_t>(bytes, 1);
+        }
+        return raw.get();
+    }
+    bool head_is_utf16() const {
+        return raw_capacity >= 2 && ((static_cast<unsigned char>(raw[0]) == 0xff && static_cast<unsigned char>(raw[1]) == 0xfe) ||
+                                     (static_cast<unsigned char>(raw[0]) == 0xfe && static_cast<unsigned char>(raw[1]) == 0xff));
+    }
+    void trim_raw() {
+        if (raw_capacity > retained_text_capacity) {
+            raw.reset();
+            raw_capacity = 0;
+        }
+    }
+    HsScratch scratch;
+    std::unique_ptr<EngineScratch> engine_scratch;  // the database engine's per-worker state, if it keeps any
+    WorkerProfile* profile = nullptr;  // null unless the request asked for profile
+    bool index_snapshot = false;       // scanning index candidates: a file deleted since the build is not an error
+#if defined(SHGREP_PCRE2)
+    // Worker-local PCRE2 state, committed together on first use.
+    // Members are destroyed in reverse order: match data, context, then its borrowed JIT stack.
+    PcreJitStack pcre_stack;
+    PcreMatchContext pcre_context;
+    PcreMatchData pcre_match;
+#endif
+    Worker() = default;
+    Worker(const Worker&) = delete;
+    Worker& operator=(const Worker&) = delete;
+    ~Worker() = default;
+};
+
+struct ScanShared {
+    const Request& r;
+    const Database* database;
+    Control& control;
+    Outcome& out;
+    MemoryBudget& memory;
+    size_t content_budget;
+    std::vector<std::wstring> relative_prefixes;  // configured root spellings with separators; empty for absolute paths
+    const SearchContext& context;
+};
+
+// Appends text[start, end) for display: control bytes are escaped, and lines over max_line_bytes (0: no limit)
+// are cut to a window starting a little before `focus` (the first match on a matched line).
+// ANSI colors for the CLI's terminal output (request color, never set by MCP), as rg paints them.
+// 24-bit colors, light enough for dark terminal themes.
+constexpr const char* color_path = "\x1b[38;2;255;135;255m";     // light magenta #FF87FF
+constexpr const char* color_line = "\x1b[38;2;135;255;135m";     // light green #87FF87
+constexpr const char* color_match = "\x1b[1;38;2;255;95;135m";   // bold red-pink #FF5F87
+constexpr const char* color_reset = "\x1b[0m";
+
+std::string painted(const Request& r, const std::string& display) {
+    return r.color ? color_path + display + color_reset : display;
+}
+
+void append_display_line(std::string& out, std::string_view text, size_t start, size_t end, size_t focus,
+                         size_t max_line_bytes, const std::vector<std::pair<size_t, size_t>>* spans = nullptr) {
+    const size_t lead_in = std::min<size_t>(100, max_line_bytes / 4);
+    constexpr char digits[] = "0123456789abcdef";
+    size_t from = start, to = end;
+    if (max_line_bytes && end - start > max_line_bytes) {
+        from = focus > start + lead_in ? focus - lead_in : start;
+        while (from > start && (static_cast<unsigned char>(text[from]) & 0xc0) == 0x80) --from;
+        to = std::min(end, from + max_line_bytes);
+        while (to > from && to < end && (static_cast<unsigned char>(text[to]) & 0xc0) == 0x80) --to;
+    }
+    if (from > start) out += "...";
+    // spans: sorted byte ranges of matches, painted while the bytes inside them are written.
+    size_t span = 0;
+    bool painting = false;
+    for (size_t i = from; i < to; ++i) {
+        if (spans) {
+            while (span < spans->size() && (*spans)[span].second <= i) ++span;
+            const bool inside = span < spans->size() && (*spans)[span].first <= i;
+            if (inside != painting) {
+                out += inside ? color_match : color_reset;
+                painting = inside;
+            }
+        }
+        unsigned char c = static_cast<unsigned char>(text[i]);
+        if ((c < 0x20 && c != '\t') || c == 0x7f) {
+            out += "\\x";
+            out.push_back(digits[c >> 4]);
+            out.push_back(digits[c & 15]);
+        } else out.push_back(static_cast<char>(c));
+    }
+    if (painting) out += color_reset;
+    if (to < end) out += "...";
+}
+
+// Renders one file as grep/rg/tgrep lines: "path:N:text" for matched lines, "path-N-text" for context lines,
+// and "--" between non-adjacent groups.
+// ---- Enclosing-block context -------------------------------------------------------------------------------------
+// Owner-approved (2026-10-09): search's block option shows each match inside its whole enclosing function (or class
+// when no function encloses it), so an agent reads exactly that code in one call.
+// CONTRACT: a structural heuristic, not a parser. Brace languages: braces in comments, strings, character literals
+// and preprocessor lines are skipped, but preprocessor branches with unbalanced braces can still mislead it.
+// Python: indentation. A match with no enclosing function or class, a file of another language, or a block longer
+// than max_block_lines keeps its header and match context (three lines per side unless explicitly configured).
+enum class BlockSyntax { none, braces, indent };
+
+BlockSyntax block_syntax(std::string_view path) {
+    const size_t dot = path.rfind('.');
+    const size_t slash = path.find_last_of("/\\");
+    if (dot == std::string_view::npos || (slash != std::string_view::npos && dot < slash)) return BlockSyntax::none;
+    std::string ext(path.substr(dot + 1));
+    for (char& c : ext) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    static const std::set<std::string, std::less<>> braces{"c", "h", "cc", "cpp", "cxx", "c++", "hpp", "hh", "hxx",
+        "h++", "inl", "ipp", "tpp", "cu", "cuh", "cs", "java", "js", "jsx", "mjs", "cjs", "ts", "tsx", "rs", "go",
+        "swift", "kt", "kts", "scala", "php", "dart", "m", "mm", "groovy", "hlsl", "glsl", "fx", "shader"};
+    if (braces.count(ext)) return BlockSyntax::braces;
+    if (ext == "py" || ext == "pyw" || ext == "pyi") return BlockSyntax::indent;
+    return BlockSyntax::none;
+}
+
+struct BraceBlock {
+    size_t open, close, header;  // byte offsets of '{', its matching '}', and where its statement starts
+};
+
+// Every balanced brace block of `text`, ignoring braces in comments, strings, character literals and preprocessor
+// lines; blocks are listed in order of their closing brace.
+std::vector<BraceBlock> brace_blocks(std::string_view text, bool rust) {
+    std::vector<BraceBlock> blocks;
+    std::vector<std::pair<size_t, size_t>> open;  // '{' offset, statement start
+    size_t statement = 0;
+    bool line_start = true;
+    const size_t n = text.size();
+    const auto ident = [](char c) { return std::isalnum(static_cast<unsigned char>(c)) || c == '_'; };
+    for (size_t i = 0; i < n; ++i) {
+        const char c = text[i];
+        if (c == '\n') { line_start = true; continue; }
+        if (c == ' ' || c == '\t' || c == '\r') continue;
+        const bool at_line_start = line_start;
+        line_start = false;
+        if (c == '#' && at_line_start && !rust) {
+            // Preprocessor directive, with backslash continuations.
+            while (i < n && text[i] != '\n') i += text[i] == '\\' && i + 1 < n ? 2 : 1;
+            statement = i;
+            line_start = true;
+            continue;
+        }
+        if (c == '/' && i + 1 < n && text[i + 1] == '/') {
+            while (i < n && text[i] != '\n') ++i;
+            line_start = true;
+            continue;
+        }
+        if (c == '/' && i + 1 < n && text[i + 1] == '*') {
+            const size_t end = text.find("*/", i + 2);
+            i = end == std::string_view::npos ? n : end + 1;
+            continue;
+        }
+        if (c == '"') {
+            if (i > 0 && text[i - 1] == 'R' && (i < 2 || !ident(text[i - 2]) || text[i - 2] == 'u' || text[i - 2] == 'U' ||
+                                                text[i - 2] == 'L' || text[i - 2] == '8')) {
+                // C++ raw string R"delim( ... )delim"
+                const size_t paren = text.find('(', i + 1);
+                if (paren != std::string_view::npos && paren - i <= 17) {
+                    const std::string close = ")" + std::string(text.substr(i + 1, paren - i - 1)) + "\"";
+                    const size_t end = text.find(close, paren + 1);
+                    i = end == std::string_view::npos ? n : end + close.size() - 1;
+                    continue;
+                }
+            }
+            if (i > 0 && text[i - 1] == '@') {
+                // C# verbatim string: "" is a quote, no escapes.
+                for (++i; i < n; ++i) {
+                    if (text[i] != '"') continue;
+                    if (i + 1 < n && text[i + 1] == '"') { ++i; continue; }
+                    break;
+                }
+                continue;
+            }
+            if (rust && i > 0 && (text[i - 1] == 'r' || text[i - 1] == '#')) {
+                // Rust raw string r#"..."#: count the hashes before the quote.
+                size_t hashes = 0, at = i;
+                while (at > 0 && text[at - 1] == '#') { --at; ++hashes; }
+                if (at > 0 && text[at - 1] == 'r') {
+                    const std::string close = "\"" + std::string(hashes, '#');
+                    const size_t end = text.find(close, i + 1);
+                    i = end == std::string_view::npos ? n : end + close.size() - 1;
+                    continue;
+                }
+            }
+            for (++i; i < n && text[i] != '"'; ++i) {
+                if (text[i] == '\\') ++i;
+                else if (text[i] == '\n' && !rust) break;  // unterminated: stop at the line end
+            }
+            continue;
+        }
+        if (c == '\'') {
+            if (rust && i + 2 < n && ident(text[i + 1]) && text[i + 2] != '\'') continue;  // lifetime 'a
+            size_t j = i + 1;
+            while (j < n && j - i <= 12 && text[j] != '\'' && text[j] != '\n') j += text[j] == '\\' ? 2 : 1;
+            if (j < n && text[j] == '\'') i = j;
+            continue;
+        }
+        if (c == '`') {
+            for (++i; i < n && text[i] != '`'; ++i)
+                if (text[i] == '\\') ++i;
+            continue;
+        }
+        if (c == '{') {
+            open.emplace_back(i, statement);
+            statement = i + 1;
+            continue;
+        }
+        if (c == '}') {
+            if (!open.empty()) {
+                blocks.push_back({open.back().first, i, open.back().second});
+                open.pop_back();
+            }
+            statement = i + 1;
+            continue;
+        }
+        if (c == ';') statement = i + 1;
+    }
+    return blocks;
+}
+
+// The first identifier of a block header, skipping comments, template<...> and attributes.
+std::string_view header_word(std::string_view header) {
+    size_t i = 0;
+    const size_t n = header.size();
+    while (i < n) {
+        const char c = header[i];
+        if (std::isspace(static_cast<unsigned char>(c))) { ++i; continue; }
+        if (c == '/' && i + 1 < n && header[i + 1] == '/') {
+            while (i < n && header[i] != '\n') ++i;
+            continue;
+        }
+        if (c == '/' && i + 1 < n && header[i + 1] == '*') {
+            const size_t end = header.find("*/", i + 2);
+            i = end == std::string_view::npos ? n : end + 2;
+            continue;
+        }
+        if (c == '[' || c == '@' || c == '#') {  // [[attribute]], [Attribute], @Annotation, #[attr]
+            int depth = 0;
+            for (; i < n; ++i) {
+                if (header[i] == '[' || header[i] == '(') ++depth;
+                else if ((header[i] == ']' || header[i] == ')') && --depth <= 0) { ++i; break; }
+                else if (depth == 0 && std::isspace(static_cast<unsigned char>(header[i]))) break;
+            }
+            continue;
+        }
+        size_t end = i;
+        while (end < n && (std::isalnum(static_cast<unsigned char>(header[end])) || header[end] == '_')) ++end;
+        const std::string_view word = header.substr(i, end - i);
+        if (word == "template" || word == "export") {
+            i = end;
+            if (word == "template") {
+                int depth = 0;
+                for (; i < n; ++i) {
+                    if (header[i] == '<') ++depth;
+                    else if (header[i] == '>' && --depth <= 0) { ++i; break; }
+                }
+            }
+            continue;
+        }
+        return word;
+    }
+    return {};
+}
+
+bool control_word(std::string_view word) {
+    static const std::set<std::string, std::less<>> words{"if", "else", "for", "foreach", "while", "do", "switch",
+        "catch", "try", "finally", "return", "case", "default", "lock", "using", "synchronized", "match", "loop",
+        "unsafe", "select", "defer", "go", "with", "fixed", "checked", "unchecked"};
+    return words.count(word) != 0;
+}
+
+bool type_word(std::string_view word) {
+    static const std::set<std::string, std::less<>> words{"class", "struct", "union", "enum", "interface", "impl",
+        "trait", "record", "object", "protocol", "extension", "mod"};
+    return words.count(word) != 0;
+}
+
+// Lines [first, last] (1-based) of the block enclosing byte `offset`, or nullopt.
+std::optional<std::pair<uint64_t, uint64_t>> enclosing_block(std::string_view text, const std::vector<size_t>& line_starts,
+                                                             BlockSyntax syntax, const std::vector<BraceBlock>& blocks,
+                                                             size_t offset, uint64_t* header_last = nullptr) {
+    const auto line_of = [&](size_t at) {
+        return static_cast<uint64_t>(std::upper_bound(line_starts.begin(), line_starts.end(), at) - line_starts.begin());
+    };
+    if (syntax == BlockSyntax::braces) {
+        const BraceBlock* function = nullptr;
+        const BraceBlock* type = nullptr;
+        for (const auto& block : blocks) {
+            if (!(block.open < offset && offset <= block.close) && !(block.header <= offset && offset <= block.open))
+                continue;
+            const std::string_view header = text.substr(block.header, block.open - block.header);
+            const std::string_view word = header_word(header);
+            if (word == "namespace" || word == "extern" || control_word(word)) continue;
+            if (type_word(word)) {
+                if (!type || block.open > type->open) type = &block;  // innermost type
+                continue;
+            }
+            if (header.find('(') != std::string_view::npos && (!function || block.open < function->open))
+                function = &block;  // outermost function
+        }
+        const BraceBlock* chosen = function ? function : type;
+        if (!chosen) return std::nullopt;
+        size_t start = chosen->header;
+        while (start < chosen->open && std::isspace(static_cast<unsigned char>(text[start]))) ++start;
+        if (header_last) *header_last = line_of(chosen->open);
+        return std::make_pair(line_of(start), line_of(chosen->close));
+    }
+    if (syntax != BlockSyntax::indent) return std::nullopt;
+    const uint64_t lines = line_starts.size();
+    const auto line_text = [&](uint64_t line) {
+        const size_t begin = line_starts[line - 1];
+        const size_t end = line < lines ? line_starts[line] : text.size();
+        return text.substr(begin, end - begin);
+    };
+    const auto indent = [&](std::string_view s, bool& blank) {
+        size_t i = 0;
+        while (i < s.size() && (s[i] == ' ' || s[i] == '\t')) ++i;
+        blank = i == s.size() || s[i] == '\n' || s[i] == '\r' || s[i] == '#';
+        return i;
+    };
+    const auto keyword = [](std::string_view s, size_t at) {
+        const std::string_view rest = s.substr(at);
+        return rest.rfind("def ", 0) == 0 || rest.rfind("async def ", 0) == 0 ? 1 : rest.rfind("class ", 0) == 0 ? 2 : 0;
+    };
+    const uint64_t hit = line_of(offset);
+    bool blank = false;
+    size_t limit = indent(line_text(hit), blank) + 1;  // the hit line itself may be the def
+    uint64_t def_line = 0, class_line = 0;
+    size_t def_indent = 0, class_indent = 0;
+    for (uint64_t line = hit; line >= 1; --line) {
+        const std::string_view s = line_text(line);
+        const size_t at = indent(s, blank);
+        if (blank || at >= limit) continue;
+        limit = at;
+        const int kind = keyword(s, at);
+        if (kind == 1) { def_line = line; def_indent = at; }                           // ends at the outermost def
+        else if (kind == 2 && !class_line) { class_line = line; class_indent = at; }  // innermost class
+        if (at == 0) break;
+    }
+    if (!def_line && !class_line) return std::nullopt;
+    uint64_t first = def_line ? def_line : class_line;
+    if (header_last) *header_last = first;
+    const size_t base = def_line ? def_indent : class_indent;
+    while (first > 1) {  // decorators
+        const std::string_view s = line_text(first - 1);
+        const size_t at = indent(s, blank);
+        if (at != base || at >= s.size() || s[at] != '@') break;
+        --first;
+    }
+    uint64_t last = def_line ? def_line : class_line;
+    for (uint64_t line = last + 1; line <= lines; ++line) {
+        const std::string_view s = line_text(line);
+        const size_t at = indent(s, blank);
+        if (blank) continue;
+        if (at <= base) break;
+        last = line;
+    }
+    return std::make_pair(first, last);
+}
+
+// first_line is the line number of text[0]; lines before min_line are never printed (a chunked scan printed them
+// already), and lines up to context_through are printed as context still owed by an earlier chunk's match.
+// first_printed/last_printed, when given, receive the first and last line numbers printed (0 for none).
+std::string render_lines(const Request& r, const std::string& display, std::string_view text, std::vector<Event> events,
+                         uint64_t first_line = 1, uint64_t min_line = 1, uint64_t* first_printed = nullptr,
+                         uint64_t* last_printed = nullptr, uint64_t context_through = 0) {
+    std::sort(events.begin(), events.end(), [](const Event& a, const Event& b) { return a.from < b.from; });
+    struct Hit { uint64_t line; size_t focus; };
+    std::vector<Hit> hits;
+    size_t cursor = 0;
+    uint64_t line = first_line;
+    for (const auto& event : events) {
+        const size_t from = static_cast<size_t>(std::min<uint64_t>(event.from, text.size()));
+        for (;;) {
+            size_t newline = text.find('\n', cursor);
+            if (newline == std::string_view::npos || newline >= from) break;
+            ++line;
+            cursor = newline + 1;
+        }
+        if (hits.empty() || hits.back().line != line) hits.push_back({line, from});
+        if (r.multiline && event.to > event.from + 1) {
+            // Like rg -U: every line a match spans is a matched line.
+            const size_t last = static_cast<size_t>(std::min<uint64_t>(event.to - 1, text.size()));
+            size_t at = from;
+            uint64_t spanned = line;
+            for (;;) {
+                size_t newline = text.find('\n', at);
+                if (newline == std::string_view::npos || newline >= last) break;
+                at = newline + 1;
+                hits.push_back({++spanned, at});
+            }
+        }
+    }
+    if (r.multiline) {
+        std::stable_sort(hits.begin(), hits.end(), [](const Hit& a, const Hit& b) { return a.line < b.line; });
+        hits.erase(std::unique(hits.begin(), hits.end(), [](const Hit& a, const Hit& b) { return a.line == b.line; }),
+                   hits.end());
+    }
+    struct Range { uint64_t first, last; };
+    std::vector<Range> ranges;
+    const BlockSyntax syntax = r.block ? block_syntax(display) : BlockSyntax::none;
+    std::vector<size_t> line_starts;
+    std::vector<BraceBlock> blocks;
+    if (syntax != BlockSyntax::none) {
+        line_starts.push_back(0);
+        for (size_t i = 0; i < text.size(); ++i)
+            if (text[i] == '\n') line_starts.push_back(i + 1);
+        if (syntax == BlockSyntax::braces) {
+            const bool rust = display.size() >= 3 && display.compare(display.size() - 3, 3, ".rs") == 0;
+            blocks = brace_blocks(text, rust);
+        }
+    }
+    std::vector<Range> wanted;
+    for (const auto& hit : hits) {
+        if (syntax != BlockSyntax::none) {
+            uint64_t header_last = 0;
+            const auto block = enclosing_block(text, line_starts, syntax, blocks, hit.focus, &header_last);
+            if (block && block->second - block->first < r.max_block_lines) {
+                wanted.push_back({block->first, block->second});
+                continue;
+            }
+            if (block) {
+                const uint64_t before = r.context_explicit ? r.before_lines : 3;
+                const uint64_t after = r.context_explicit ? r.after_lines : 3;
+                wanted.push_back({block->first, header_last});
+                wanted.push_back({std::max(hit.line > before ? hit.line - before : 1,
+                                          std::max(block->first, std::max(first_line, min_line))),
+                                  std::min(block->second, hit.line + after)});
+                continue;
+            }
+        }
+        wanted.push_back({std::max(hit.line > r.before_lines ? hit.line - r.before_lines : 1, std::max(first_line, min_line)),
+                          hit.line + r.after_lines});
+    }
+    if (context_through) wanted.push_back({std::max(first_line, min_line), context_through});
+    std::erase_if(wanted, [](const Range& range) { return range.first > range.last; });
+    // Blocks can start before an earlier hit's range, so ranges are ordered before merging.
+    std::sort(wanted.begin(), wanted.end(), [](const Range& a, const Range& b) { return a.first < b.first; });
+    for (const auto& range : wanted) {
+        if (!ranges.empty() && range.first <= ranges.back().last + 1) ranges.back().last = std::max(ranges.back().last, range.last);
+        else ranges.push_back(range);
+    }
+    const std::string path = painted(r, display);
+    std::vector<std::pair<size_t, size_t>> spans;
+    if (r.color) {
+        for (const auto& event : events)
+            if (event.to > event.from) spans.emplace_back(static_cast<size_t>(event.from), static_cast<size_t>(event.to));
+        std::sort(spans.begin(), spans.end());
+    }
+    std::string out;
+    size_t pos = 0, hit_index = 0;
+    uint64_t number = first_line;
+    bool exhausted = false;
+    if (first_printed) *first_printed = 0;
+    if (last_printed) *last_printed = 0;
+    for (size_t group = 0; group < ranges.size() && !exhausted; ++group) {
+        while (!exhausted && number < ranges[group].first) {
+            size_t newline = text.find('\n', pos);
+            if (newline == std::string_view::npos) exhausted = true;
+            else { pos = newline + 1; ++number; }
+        }
+        if (exhausted || pos >= text.size()) break;
+        // Like rg, groups are separated only when context lines were requested.
+        if (group && (r.before_lines || r.after_lines || r.block)) out += "--\n";
+        while (!exhausted && pos < text.size() && number <= ranges[group].last) {
+            size_t newline = text.find('\n', pos);
+            size_t end = newline == std::string_view::npos ? text.size() : newline;
+            size_t shown_end = end;
+            while (shown_end > pos && text[shown_end - 1] == '\r') --shown_end;
+            while (hit_index < hits.size() && hits[hit_index].line < number) ++hit_index;
+            const bool matched = hit_index < hits.size() && hits[hit_index].line == number;
+            const char separator = matched ? ':' : '-';
+            out += path;
+            out.push_back(separator);
+            if (r.line) {
+                if (r.color) out += color_line;
+                out += std::to_string(number);
+                if (r.color) out += color_reset;
+                out.push_back(separator);
+            }
+            append_display_line(out, text, pos, shown_end, matched ? hits[hit_index].focus : pos, r.max_line_bytes,
+                                r.color ? &spans : nullptr);
+            out.push_back('\n');
+            if (first_printed && !*first_printed) *first_printed = number;
+            if (last_printed) *last_printed = number;
+            if (newline == std::string_view::npos) exhausted = true;
+            else { pos = newline + 1; ++number; }
+        }
+    }
+    return out;
+}
+
+// PERF: one SSE2 pass (baseline x64) finds NUL bytes and any byte >= 0x80, so pure-ASCII text, the common
+// case for source code, needs neither UTF-8 validation nor decoding.
+struct ByteScan {
+    bool nul = false, non_ascii = false;
+};
+ByteScan scan_bytes(std::string_view s) {
+    const char* p = s.data();
+    const size_t n = s.size();
+    const __m128i zero = _mm_setzero_si128();
+    int high = 0, nul = 0;
+    size_t i = 0;
+    for (; i + 16 <= n; i += 16) {
+        const __m128i v = _mm_loadu_si128(reinterpret_cast<const __m128i*>(p + i));
+        high |= _mm_movemask_epi8(v);
+        nul |= _mm_movemask_epi8(_mm_cmpeq_epi8(v, zero));
+    }
+    for (; i < n; ++i) {
+        const auto c = static_cast<unsigned char>(p[i]);
+        high |= c & 0x80;
+        nul |= c == 0;
+    }
+    return {nul != 0, high != 0};
+}
+
+// The text Hyperscan scans: the raw read buffer itself (zero-copy) or a decoded copy, with offsets mapped back
+// to the file either way.
+struct TextView {
+    std::string_view text;
+    const DecodedText* decoded = nullptr; // null on the zero-copy path
+    uint32_t bom = 0;
+    uint64_t raw_offset(uint64_t at, bool end) const { return decoded ? decoded->raw_offset(at, end) : bom + at; }
+};
+
+#if defined(SHGREP_PCRE2)
+// Runs the PCRE2 fallback over one file and feeds matches to the collector in end-offset order, as Hyperscan
+// would. The full subject is always passed with a start offset, so lookbehind still sees text before the starting
+// point. Whole-word filtering happens before the search moves on, so a rejected match never hides a later valid one.
+// PERF: one pattern feeds the collector as it matches, so memory stays flat. Several patterns are merged in
+//   order; each keeps only as many matches (lines, for lines and count output) as the collector can still take.
+// CONTRACT: cancellation and the deadline are checked between matches; the caller sees them and stops.
+void pcre_scan(const Database& db, Worker& w, std::string_view text, Collector& c, bool files_only, const Control& control) {
+    if (!w.pcre_match) {
+        // Keep the worker empty if any allocation fails, so another file can retry safely.
+        PcreMatchData match(pcre2_match_data_create(1, nullptr));
+        PcreMatchContext context(pcre2_match_context_create(nullptr));
+        // PERF: the default 32 KiB JIT stack fails on deep patterns; let it grow up to 8 MiB per worker.
+        PcreJitStack stack(pcre2_jit_stack_create(32 * 1024, 8 * 1024 * 1024, nullptr));
+        if (!match || !context || !stack) throw std::runtime_error("PCRE2 allocation failed");
+        pcre2_jit_stack_assign(context.get(), nullptr, stack.get());
+        w.pcre_stack = std::move(stack);
+        w.pcre_context = std::move(context);
+        w.pcre_match = std::move(match); // Publish readiness only after the complete state is owned.
+    }
+    pcre2_set_callout(w.pcre_context.get(), [](pcre2_callout_block*, void* raw) -> int {
+        const auto& request = *static_cast<const Control*>(raw);
+        return request.stop.load() || request.interrupted() ? PCRE2_ERROR_CALLOUT : 0;
+    }, const_cast<Control*>(&control));
+    const auto subject = reinterpret_cast<PCRE2_SPTR>(text.data());
+    const PCRE2_SIZE length = text.size();
+    const bool first_per_line = c.per_line || c.count_only;
+    const bool direct = db.pcre.size() == 1;
+    // Count output never stops early; the others need at most one more than the collector accepts, to see "full".
+    const size_t cap = files_only ? 1 : c.count_only ? SIZE_MAX : static_cast<size_t>(std::min(c.max_per_file, c.remaining)) + 1;
+    auto next_char = [&](size_t at) {
+        ++at;
+        while (at < length && (static_cast<unsigned char>(text[at]) & 0xc0) == 0x80) ++at;
+        return at;
+    };
+    std::vector<Event> events;
+    size_t steps = 0;
+    for (size_t id = 0; id < db.pcre.size(); ++id) {
+        if (control.interrupted() || control.stop.load()) return;
+        size_t kept = 0;
+        for (PCRE2_SIZE offset = 0; offset <= length && kept < cap;) {
+            if ((++steps & 255) == 0 && (control.interrupted() || control.stop.load())) return;
+            // CONTRACT: text reaching here is valid UTF-8 (validated or decoded), so UTF checks are skipped.
+            const int rc = db.pcre_jit[id]
+                ? pcre2_jit_match(db.pcre[id].get(), subject, length, offset, 0, w.pcre_match.get(), w.pcre_context.get())
+                : pcre2_match(db.pcre[id].get(), subject, length, offset, PCRE2_NO_UTF_CHECK, w.pcre_match.get(), w.pcre_context.get());
+            if (control.stop.load() && !control.interrupted()) return;
+            if (rc == PCRE2_ERROR_NOMATCH) break;
+            if (rc < 0) {
+                c.pcre_limit = true;
+                break;
+            }
+            const PCRE2_SIZE* ovector = pcre2_get_ovector_pointer(w.pcre_match.get());
+            const PCRE2_SIZE from = std::min(ovector[0], ovector[1]), to = ovector[1];
+            if (c.word && ((from > 0 && Collector::word_byte(text[from - 1])) || (to < length && Collector::word_byte(text[to])))) {
+                offset = next_char(from);
+                continue;
+            }
+            ++kept;
+            if (direct) {
+                if (Collector::callback(static_cast<unsigned>(id), from, to, 0, &c)) return;
+            } else events.push_back({static_cast<unsigned>(id), from, to});
+            if (first_per_line) {
+                const size_t newline = text.find('\n', from);
+                if (newline == std::string_view::npos) break;
+                offset = newline + 1;
+            } else if (to > offset) {
+                offset = to;
+            } else {
+                offset = next_char(to);  // empty match: step over one UTF-8 character
+            }
+        }
+    }
+    std::sort(events.begin(), events.end(), [](const Event& a, const Event& b) {
+        return a.to != b.to ? a.to < b.to : a.from < b.from;
+    });
+    for (const Event& event : events)
+        if (Collector::callback(event.id, event.from, event.to, 0, &c)) break;
+}
+#endif
+
+// Releases one text file's memory charge and any oversized worker buffer when its scan ends.
+struct TextReservation {
+    MemoryBudget& memory;
+    Worker& worker;
+    uint64_t bytes = 0;
+    ~TextReservation() {
+        worker.trim_raw();
+        if (bytes) memory.release(bytes);
+    }
+};
+
+// A whole text file read into the worker's raw buffer. counted is false when the file still has to be added to
+// files_scanned/bytes_scanned once it is known not to be binary.
+struct TextBytes {
+    const char* raw;
+    size_t size;
+    bool utf16;
+    bool counted;
+};
+
+// The measured path: file_size comes from the open handle. A NUL in the first block marks the file binary
+// before the rest is read. Returns nullopt when the file was skipped or failed; counters and file_state are set.
+std::optional<TextBytes> read_measured_text(const ScanShared& s, Worker& w, HANDLE h, uint64_t file_size,
+                                            const std::string& display, std::string& file_state,
+                                            TextReservation& reservation) {
+    const Request& r = s.r;
+    Outcome& out = s.out;
+    w.chunk();
+    if (file_size > r.max_file_bytes) {
+        auto binary = probe_binary(h, file_size);
+        if (!binary) ++out.errors;
+        else if (*binary) ++out.skipped_binary;
+        else {
+            ++out.skipped_size;
+            std::lock_guard lock(out.mutex);
+            if (out.skipped_files.size() < 3)
+                out.skipped_files.emplace_back(Json::Object{{"path", display}, {"reason", "text_file_size_limit"},
+                                                            {"size_bytes", file_size}});
+        }
+        return std::nullopt;
+    }
+    // PERF: like rg/tgrep, a NUL in the first block marks the file binary before the rest is read.
+    // UTF-16 text starts with a BOM and legitimately contains NUL bytes.
+    const DWORD head_want = static_cast<DWORD>(std::min<uint64_t>(file_size, binary_probe_bytes));
+    DWORD head = 0;
+    if (head_want && (!ReadFile(h, w.buffer.data(), head_want, &head, nullptr) || head == 0)) {
+        ++out.errors;
+        return std::nullopt;
+    }
+    const bool utf16 = head >= 2 &&
+        ((static_cast<unsigned char>(w.buffer[0]) == 0xff && static_cast<unsigned char>(w.buffer[1]) == 0xfe) ||
+         (static_cast<unsigned char>(w.buffer[0]) == 0xfe && static_cast<unsigned char>(w.buffer[1]) == 0xff));
+    if (!utf16 && std::find(w.buffer.begin(), w.buffer.begin() + head, '\0') != w.buffer.begin() + head) {
+        ++out.skipped_binary;
+        return std::nullopt;
+    }
+    // UTF-16 is charged its exact decode bound up front (see decoded_text_bytes); UTF-8 that turns out damaged grows
+    // its charge in scan_text before decoding.
+    const uint64_t charge = file_size < small_text_bytes ? 0
+        : utf16 ? file_size + (file_size / 2 + 1) * (3 + sizeof(std::pair<uint32_t, uint32_t>)) : file_size * 3;
+    if (charge && !s.memory.acquire(charge, s.control)) {
+        if (const char* why = s.control.interrupted()) file_state = why;
+        return std::nullopt;
+    }
+    reservation.bytes = charge;
+
+    const auto size = static_cast<size_t>(file_size);
+    char* raw = w.raw_buffer(size);
+    std::copy(w.buffer.data(), w.buffer.data() + head, raw);
+    size_t read = head;
+    bool read_failed = false;
+    while (read < size) {
+        if (const char* why = s.control.interrupted()) { file_state = why; break; }
+        DWORD got = 0;
+        DWORD want = static_cast<DWORD>(std::min<size_t>(w.buffer.size(), size - read));
+        if (!ReadFile(h, raw + read, want, &got, nullptr) || got == 0) {
+            read_failed = true;
+            break;
+        }
+        read += got;
+    }
+    ++out.files;
+    out.bytes += read;
+    LARGE_INTEGER current_size{};
+    if (file_state == "complete" && (!GetFileSizeEx(h, &current_size) ||
+        static_cast<uint64_t>(current_size.QuadPart) != file_size)) read_failed = true;
+    if (read_failed) { ++out.errors; return std::nullopt; }
+    if (file_state != "complete") return std::nullopt;
+    return TextBytes{raw, read, utf16, true};
+}
+
+// CONTRACT: file_size is the directory listing's size for files up to binary_probe_bytes and the handle's
+// measured size otherwise.
+std::optional<TextBytes> read_text(const ScanShared& s, Worker& w, HANDLE h, uint64_t file_size,
+                                   const std::string& display, std::string& file_state, TextReservation& reservation) {
+    if (file_size <= binary_probe_bytes && file_size <= s.r.max_file_bytes) {
+        // PERF: small files, the bulk of a source tree, take one ReadFile straight into the scan buffer with room
+        // for one byte more than listed: no head copy and no size queries. The NUL check is scan_bytes's
+        // whole-file pass in scan_text.
+        // CONTRACT: a short ReadFile on a disk file means EOF, so the bytes read are the file's current contents
+        // even if it shrank since listing. A full read means it grew; it is re-measured and read from the start.
+        const DWORD room = static_cast<DWORD>(file_size) + 1;
+        DWORD got = 0;
+        char* raw = w.raw_buffer(room);
+        if (!ReadFile(h, raw, room, &got, nullptr)) {
+            ++s.out.errors;
+            return std::nullopt;
+        }
+        if (got < room) return TextBytes{raw, got, got >= 2 && w.head_is_utf16(), false};
+        LARGE_INTEGER size{}, start{};
+        if (!GetFileSizeEx(h, &size) || size.QuadPart < 0 || !SetFilePointerEx(h, start, nullptr, FILE_BEGIN)) {
+            ++s.out.errors;
+            return std::nullopt;
+        }
+        file_size = static_cast<uint64_t>(size.QuadPart);
+    }
+    return read_measured_text(s, w, h, file_size, display, file_state, reservation);
+}
+
+// Scans one decoded text into collect with the request's engine; shared by whole-file and chunked scans.
+// Returns why the request interrupted the scan ("timeout" or "cancelled"), leaving collect incomplete, or nullptr.
+// CONTRACT: callers record it as the file's state, as the readers do, so the file is dropped and every file finished
+//   before it keeps its results in the request's timeout summary.
+const char* run_text_scan(const ScanShared& s, Worker& w, std::string_view text, Collector& collect,
+                          bool stop_at_first, bool line_slice = false) {
+    // An empty file has no physical lines; an empty slice still represents a real blank line.
+    if (!line_slice && text.empty()) return nullptr;
+    if (!line_slice && !s.r.multiline && !s.r.line_local) {
+        for (size_t begin = 0; begin < text.size();) {
+            if (const char* why = s.control.interrupted()) return why;
+            if (s.control.stop.load()) return nullptr;
+            const size_t newline = text.find('\n', begin);
+            const size_t end = newline == std::string_view::npos ? text.size() : newline;
+            const uint32_t taken = static_cast<uint32_t>(collect.events.size());
+            Collector line{{}, 0, collect.max_per_file - std::min(collect.max_per_file, taken),
+                                  collect.remaining - std::min(collect.remaining, taken)};
+            line.count_only = collect.count_only;
+            line.word = collect.word;
+            line.text = text.substr(begin, end - begin);
+            line.som = collect.som;
+            line.lengths = collect.lengths;
+            line.per_line = collect.per_line;
+            if (!collect.pattern_lines.empty()) {
+                line.pattern_lines.assign(collect.pattern_lines.size(), 0);
+                line.pattern_line_end.assign(collect.pattern_lines.size(), 0);
+            }
+            if (const char* why = run_text_scan(s, w, line.text, line, stop_at_first, true)) return why;
+            collect.found += line.found;
+            if (collect.count_only) {
+                collect.lines += line.found != 0;
+                for (size_t id = 0; id < collect.pattern_lines.size(); ++id)
+                    collect.pattern_lines[id] += line.pattern_lines[id] != 0;
+            }
+            for (auto event : line.events) {
+                event.from += begin;
+                event.to += begin;
+                collect.events.push_back(event);
+            }
+            collect.full |= line.full;
+            if (collect.full || (stop_at_first && line.found)) return nullptr;
+            if (newline == std::string_view::npos) break;
+            begin = newline + 1;
+        }
+        return nullptr;
+    }
+#if defined(SHGREP_PCRE2)
+    if (!s.database->pcre.empty()) {
+        pcre_scan(*s.database, w, text, collect, stop_at_first, s.control);
+        if (const char* why = s.control.interrupted()) return why;
+        if (collect.pcre_limit)
+            throw std::runtime_error("PCRE2 could not completely search a file; no complete search result is available");
+        return nullptr;
+    }
+#else
+    (void)stop_at_first;
+#endif
+    // CONTRACT: an engine that fails reported nothing, so Hyperscan rescans the text into the same collector.
+    const TextEngine* engine = s.database->engine.get();
+    if (!engine || engine->scan(text, w.engine_scratch.get(), Collector::callback, &collect) == ScanStatus::failed) {
+        if (engine) ++s.out.engine_fallbacks;
+        hs_error_t rc = hs_scan(s.database->db.get(), text.data(), static_cast<unsigned>(text.size()), 0,
+                                w.scratch.get(), Collector::callback, &collect);
+        if (rc != HS_SUCCESS && rc != HS_SCAN_TERMINATED) throw std::runtime_error("Hyperscan text scan failed");
+    }
+    return nullptr;
+}
+
+bool scan_large_text(const ScanShared& s, Worker& w, HANDLE h, uint64_t file_size, const std::string& display,
+                     uint32_t remaining, std::string& file_state, std::vector<Candidate>& items);
+
+void scan_text(const ScanShared& s, Worker& w, HANDLE h, uint64_t file_size, const std::string& display,
+               uint32_t remaining, std::string& file_state, std::vector<Candidate>& items) {
+    // Requests that are not line_local (multiline, invert, block, patterns that see past a line) read whole files.
+    if (file_size > chunked_text_bytes && file_size <= s.r.max_file_bytes && s.r.line_local &&
+        scan_large_text(s, w, h, file_size, display, remaining, file_state, items)) return;
+    const Request& r = s.r;
+    Outcome& out = s.out;
+    TextReservation reservation{s.memory, w};
+    PhaseTimer read_timer(phase(w.profile, &WorkerProfile::read));
+    const auto contents = read_text(s, w, h, file_size, display, file_state, reservation);
+    if (!contents) return;
+    const char* raw = contents->raw;
+    const size_t read = contents->size;
+    const bool utf16 = contents->utf16;
+    read_timer.stop();
+    PhaseTimer scan_timer(phase(w.profile, &WorkerProfile::scan));
+
+    // PERF: zero-copy path. BOM-less or UTF-8-BOM text that is pure ASCII or valid UTF-8 is exactly what
+    // decode_text would produce, so Hyperscan scans the read buffer in place. UTF-16 and invalid UTF-8 are
+    // decoded into a copy as before.
+    const std::string_view file_bytes(raw, read);
+    std::optional<DecodedText> decoded;
+    TextView view;
+    bool zero_copy = false;
+    if (!utf16) {
+        const uint32_t bom = read >= 3 && static_cast<unsigned char>(raw[0]) == 0xef &&
+                                     static_cast<unsigned char>(raw[1]) == 0xbb &&
+                                     static_cast<unsigned char>(raw[2]) == 0xbf ? 3u : 0u;
+        const std::string_view body = file_bytes.substr(bom);
+        const ByteScan scanned = scan_bytes(body);
+        if (scanned.nul) { ++out.skipped_binary; return; }
+        if (!scanned.non_ascii || valid_utf8(body)) {
+            view.text = body;
+            view.bom = bom;
+            zero_copy = true;
+        }
+    }
+    if (!zero_copy) {
+        // SAFETY: charge the raw bytes plus the decoder's exact text and offset-map reservations before allocating.
+        if (read >= small_text_bytes &&
+            !s.memory.grow_or_wait(reservation.bytes, read + decoded_text_bytes(file_bytes), s.control)) {
+            if (const char* why = s.control.interrupted()) file_state = why;
+            return;
+        }
+        decoded.emplace(decode_text(file_bytes));
+        if (decoded->text.find('\0') != std::string::npos) { ++out.skipped_binary; return; }
+        view.text = decoded->text;
+        view.decoded = &*decoded;
+    }
+    if (!contents->counted) {
+        ++out.files;
+        out.bytes += read;
+    }
+
+    const bool without = r.output == "files_without_match";
+    const bool files_only = r.output == "files" || without, count_only = r.output == "count";
+    // CONTRACT: invert needs every matching line of the file, so it collects without per-file or result caps;
+    // the reported (non-matching) lines are capped afterwards. Memory stays bounded by the file's line count.
+    const bool collect_all = r.invert;
+    constexpr uint32_t unlimited = std::numeric_limits<uint32_t>::max();
+    // PERF: files output stops each file at its first match.
+    Collector collect{{}, 0, collect_all ? unlimited : files_only ? 1u : r.max_per_file, collect_all ? unlimited : remaining};
+    collect.count_only = count_only && !collect_all;
+    collect.word = r.word;
+    collect.union_spans = r.invert;
+    collect.text = view.text;
+    collect.som = s.database->som;
+    collect.lengths = s.database->lengths.empty() ? nullptr : &s.database->lengths;
+    if (collect.count_only && r.patterns.size() > 1) {
+        collect.pattern_lines.assign(r.patterns.size(), 0);
+        collect.pattern_line_end.assign(r.patterns.size(), 0);
+    }
+    // PERF: capped; reserving max_per_file (up to 10,000) events allocated hundreds of KB per scanned file.
+    if (!collect.count_only) collect.events.reserve(std::min({collect.max_per_file, collect.remaining, 64u}));
+    // PERF: the decoded file is one contiguous buffer, so block mode applies: no stream state, and end-anchored
+    // patterns are resolved in the same call.
+    collect.per_line = r.output == "lines" || collect_all;
+    collect.ordered_lines = r.line_local;
+    if (const char* why = run_text_scan(s, w, view.text, collect, files_only && !collect_all)) {
+        file_state = why;
+        return;
+    }
+    if (collect.full && !files_only) out.per_file_limited.store(true);
+    out.found += collect.found;
+
+    if (r.invert) {
+        // rg -v: report the lines no pattern matched.
+        const uint32_t keep = r.output == "lines" ? std::min(r.max_per_file, remaining) : 0;
+        InvertedLines inverted = invert_lines(view.text, std::move(collect.events), keep, r.multiline);
+        if (!inverted.count) return;
+        if (files_only) add_text_candidate(items, display, painted(r, display) + "\n", 1);
+        else if (count_only) add_text_candidate(items, display, painted(r, display) + ":" + std::to_string(inverted.count) + "\n", 1);
+        else {
+            if (inverted.count > inverted.events.size()) out.per_file_limited.store(true);
+            add_text_candidate(items, display, render_lines(r, display, view.text, inverted.events),
+                               static_cast<uint32_t>(inverted.events.size()));
+        }
+        return;
+    }
+    if (files_only) {
+        if (without ? collect.found == 0 : collect.found != 0) add_text_candidate(items, display, painted(r, display) + "\n", 1);
+        return;
+    }
+    if (count_only) {
+        if (collect.lines) add_text_candidate(items, display, count_line(painted(r, display), collect), 1);
+        return;
+    }
+    if (r.output == "lines") {
+        if (!collect.events.empty())
+            add_text_candidate(items, display, render_lines(r, display, view.text, collect.events),
+                               static_cast<uint32_t>(collect.events.size()));
+        return;
+    }
+
+    std::vector<uint64_t> line_numbers(collect.events.size(), 1);
+    if (r.line) {
+        std::vector<size_t> order(collect.events.size());
+        for (size_t i = 0; i < order.size(); ++i) order[i] = i;
+        std::sort(order.begin(), order.end(), [&](size_t a, size_t b) {
+            return collect.events[a].from < collect.events[b].from;
+        });
+        size_t cursor = 0;
+        uint64_t line_number = 1;
+        for (size_t i : order) {
+            size_t target = static_cast<size_t>(std::min<uint64_t>(collect.events[i].from, view.text.size()));
+            line_number += std::count(view.text.begin() + cursor, view.text.begin() + target, '\n');
+            cursor = target;
+            line_numbers[i] = line_number;
+        }
+    }
+    for (size_t index = 0; index < collect.events.size(); ++index) {
+        if (const char* why = s.control.interrupted()) { file_state = why; break; }
+        const auto& event = collect.events[index];
+        if (event.from > event.to || event.to > view.text.size()) {
+            ++out.errors;
+            continue;
+        }
+        size_t start = static_cast<size_t>(event.from > r.context_before ? event.from - r.context_before : 0);
+        size_t end = static_cast<size_t>(std::min<uint64_t>(view.text.size(), event.to + r.context_after));
+        while (start < event.from && start < view.text.size() &&
+               (static_cast<unsigned char>(view.text[start]) & 0xc0) == 0x80) ++start;
+        while (end < view.text.size() &&
+               (static_cast<unsigned char>(view.text[end]) & 0xc0) == 0x80) ++end;
+        uint64_t from = view.raw_offset(event.from, false);
+        uint64_t to = view.raw_offset(event.to, true);
+        Json::Object item{{"pattern_id", static_cast<int64_t>(event.id)},
+            {"path", display}, {"byte_start", from},
+            {"byte_end", to}, {"binary", false},
+            {"context", std::string(view.text.substr(start, end - start))},
+            {"context_start", view.raw_offset(start, false)},
+            {"context_match_start", event.from - start},
+            {"context_match_end", event.to - start},
+            {"context_truncated", false}};
+        if (r.line) item.emplace("line", line_numbers[index]);
+        Json candidate(std::move(item));
+        const size_t bytes = Json::escaped_size(candidate.dump()) + 1;
+        items.push_back({std::move(candidate), bytes});
+    }
+}
+
+// PERF: a text file above whole_text_bytes is read in chunks of about large_chunk_bytes that end at a line break,
+//   so memory stays flat however large the file is (a single line longer than a chunk is still held whole).
+// CONTRACT: only line_local requests come here: no match can cross a line break or see past its line, so each chunk
+//   is scanned on its own and nothing is lost. Each chunk but the last is scanned without its final line break, so
+//   $ and ^$ cannot match at a cut. Context lines and bytes come from the neighbouring chunks, line numbers and
+//   byte offsets continue across chunks, and the output equals a whole-file scan's. The file is read up to the size
+//   it had when it was opened, so a log that is still being appended to is searched as of that moment. Returns
+//   false, with the file rewound, for UTF-16, which only the whole-file path decodes.
+bool scan_large_text(const ScanShared& s, Worker& w, HANDLE h, uint64_t file_size, const std::string& display,
+                     uint32_t remaining, std::string& file_state, std::vector<Candidate>& items) {
+    const Request& r = s.r;
+    Outcome& out = s.out;
+    constexpr size_t lookahead = 1u << 20;  // read past each chunk for after-context lines and bytes
+    const uint64_t charge = static_cast<uint64_t>(large_chunk_bytes + 2 * lookahead) * 6;
+    if (!s.memory.acquire(charge, s.control)) {
+        if (const char* why = s.control.interrupted()) file_state = why;
+        return true;
+    }
+    struct Release {
+        MemoryBudget& memory;
+        uint64_t bytes;
+        ~Release() { memory.release(bytes); }
+    } release{s.memory, charge};
+    auto account = [&](uint64_t bytes) {
+        if (!s.memory.grow(release.bytes, bytes))
+            throw std::runtime_error("large-file line/context exceeds the available search memory budget; no complete result is available");
+    };
+
+    std::string pending;        // raw bytes read but not yet scanned, starting at a line start
+    uint64_t pending_raw = 0;   // file offset of pending[0]
+    std::string prefix;         // raw lines just before pending, kept for before-context
+    uint64_t prefix_line = 1;   // line number of prefix[0], or of pending[0] when prefix is empty
+    uint64_t read_total = 0;
+    bool read_failed = false;
+    auto fill = [&](size_t wanted) {
+        while (pending.size() < wanted && read_total < file_size) {
+            if (const char* why = s.control.interrupted()) {
+                file_state = why;
+                read_failed = true;
+                return;
+            }
+            const size_t old = pending.size();
+            const size_t want = static_cast<size_t>(std::min<uint64_t>(lookahead, file_size - read_total));
+            account((static_cast<uint64_t>(old) + want + prefix.size()) * 6);
+            pending.resize(old + want);
+            DWORD got = 0;
+            const bool ok = ReadFile(h, pending.data() + old, static_cast<DWORD>(want), &got, nullptr) != 0;
+            pending.resize(old + got);
+            read_total += got;
+            if (!ok || got == 0) { read_failed = true; return; }  // unreadable, or shorter than when opened
+        }
+    };
+    fill(static_cast<size_t>(binary_probe_bytes));
+    if (read_failed) { ++out.errors; return true; }
+    const auto byte = [&](size_t i) { return static_cast<unsigned char>(pending[i]); };
+    if (pending.size() >= 2 && ((byte(0) == 0xff && byte(1) == 0xfe) || (byte(0) == 0xfe && byte(1) == 0xff))) {
+        LARGE_INTEGER start{};
+        if (!SetFilePointerEx(h, start, nullptr, FILE_BEGIN)) { ++out.errors; return true; }
+        return false;
+    }
+    // PERF: like the whole-file read, a NUL in the first block marks the file binary before the rest is read.
+    if (pending.find('\0') != std::string::npos) { ++out.skipped_binary; return true; }
+    if (pending.size() >= 3 && byte(0) == 0xef && byte(1) == 0xbb && byte(2) == 0xbf) {
+        pending.erase(0, 3);
+        pending_raw = 3;
+    }
+
+    const bool without = r.output == "files_without_match";
+    const bool files_only = r.output == "files" || without, count_only = r.output == "count";
+    const bool json = r.output == "json";
+    uint64_t found = 0;
+    Collector totals{{}, 0, 0, 0};  // count output: summed matching lines
+    if (count_only && r.patterns.size() > 1) totals.pattern_lines.assign(r.patterns.size(), 0);
+    uint32_t per_file_left = files_only ? 1u : r.max_per_file, remaining_left = remaining;
+    std::string rendered;
+    uint64_t printed_through = 0, owed_through = 0;  // lines output: last line printed, last line of owed context
+    uint32_t units = 0, published_units = 0;
+    bool limited = false;
+    std::vector<Candidate> results;
+    const size_t keep_lines = r.before_lines;
+    const size_t keep_bytes = json ? r.context_before : 0;
+
+    while (!pending.empty() || read_total < file_size) {
+        if (const char* why = s.control.interrupted()) { file_state = why; return true; }
+        fill(large_chunk_bytes + lookahead);
+        if (read_failed) { ++out.errors; return true; }
+        if (pending.empty()) break;
+        // The core ends at the last line break within the chunk; a longer line is read until it ends.
+        size_t core = pending.size();
+        if (read_total < file_size || core > large_chunk_bytes) {
+            size_t cut = pending.rfind('\n', std::min(pending.size(), large_chunk_bytes) - 1);
+            while (cut == std::string::npos) {
+                const size_t searched = pending.size();
+                cut = pending.find('\n', std::min(pending.size(), large_chunk_bytes));
+                if (cut != std::string::npos || read_total >= file_size) break;
+                fill(searched + lookahead);
+                if (read_failed) { ++out.errors; return true; }
+            }
+            core = cut == std::string::npos ? pending.size() : cut + 1;
+        }
+        fill(core + lookahead);
+        if (read_failed) { ++out.errors; return true; }
+        // After-context: after_lines more lines and, for json, context_after bytes beyond the core.
+        size_t suffix_end = core;
+        for (size_t k = 0; k < r.after_lines && suffix_end < pending.size(); ++k) {
+            const size_t newline = pending.find('\n', suffix_end);
+            suffix_end = newline == std::string::npos ? pending.size() : newline + 1;
+        }
+        if (json) suffix_end = std::max(suffix_end, std::min(pending.size(), core + r.context_after + 4));
+        while (suffix_end > core && suffix_end < pending.size() && (byte(suffix_end) & 0xc0) == 0x80) --suffix_end;
+
+        std::string chunk;
+        chunk.reserve(prefix.size() + suffix_end);
+        chunk.append(prefix);
+        chunk.append(pending, 0, suffix_end);
+        const size_t raw_core_begin = prefix.size(), raw_core_end = prefix.size() + core;
+        const uint64_t chunk_raw = pending_raw - prefix.size();
+        const ByteScan scanned = scan_bytes(std::string_view(chunk).substr(raw_core_begin, core));
+        if (scanned.nul) { ++out.skipped_binary; return true; }
+        // Invalid UTF-8 is repaired per chunk. COMPAT: a leading line break keeps decode_text from reading bytes
+        // FF FE or FE FF at a chunk start as a UTF-16 byte order mark; it is dropped again from every offset.
+        std::optional<DecodedText> decoded;
+        std::string_view text = chunk;
+        size_t core_begin = raw_core_begin, core_end = raw_core_end;
+        if (!valid_utf8(chunk)) {
+            // Repaired text and offset tables coexist with raw buffers and temporary decoders.
+            account((static_cast<uint64_t>(pending.size()) + prefix.size()) * 32);
+            auto repaired = [](std::string_view raw) { return decode_text("\n" + std::string(raw)); };
+            decoded.emplace(repaired(chunk));
+            text = std::string_view(decoded->text).substr(1);
+            core_begin = repaired(std::string_view(chunk).substr(0, raw_core_begin)).text.size() - 1;
+            core_end = core_begin + repaired(std::string_view(chunk).substr(raw_core_begin, core)).text.size() - 1;
+        }
+        auto raw_at = [&](uint64_t at, bool end) -> uint64_t {
+            return chunk_raw + (decoded ? decoded->raw_offset(at + 1, end) - 1 : at);
+        };
+        const bool final_chunk = read_total >= file_size && core == pending.size();
+        std::string_view core_text = text.substr(core_begin, core_end - core_begin);
+        if (!final_chunk && core_text.ends_with('\n')) core_text.remove_suffix(1);
+
+        Collector collect{{}, 0, per_file_left, remaining_left};
+        collect.count_only = count_only;
+        collect.word = r.word;
+        collect.text = core_text;
+        collect.som = s.database->som;
+        collect.lengths = s.database->lengths.empty() ? nullptr : &s.database->lengths;
+        if (count_only && r.patterns.size() > 1) {
+            collect.pattern_lines.assign(r.patterns.size(), 0);
+            collect.pattern_line_end.assign(r.patterns.size(), 0);
+        }
+        if (!count_only) collect.events.reserve(std::min({per_file_left, remaining_left, 64u}));
+        collect.per_line = r.output == "lines";
+        if (const char* why = run_text_scan(s, w, core_text, collect, files_only)) {
+            file_state = why;
+            return true;
+        }
+        found += collect.found;
+        if (collect.full && !files_only) limited = true;
+        if (count_only) {
+            totals.lines += collect.lines;
+            for (size_t id = 0; id < totals.pattern_lines.size(); ++id) totals.pattern_lines[id] += collect.pattern_lines[id];
+        } else if (r.output == "lines" && (!collect.events.empty() || owed_through > printed_through)) {
+            // CONTRACT: a chunk prints only its own lines. After-context that runs into the next chunk is owed to it,
+            //   so a line there is printed once, as a match if it is one.
+            for (auto& event : collect.events) { event.from += core_begin; event.to += core_begin; }
+            uint64_t first = 0, last = 0;
+            std::string part = render_lines(r, display, text.substr(0, core_end), collect.events, prefix_line,
+                                            printed_through + 1, &first, &last, owed_through);
+            if (!part.empty()) {
+                // Like rg, separate groups that do not touch, across chunks as within one.
+                if ((printed_through || !rendered.empty()) && (r.before_lines || r.after_lines) && first > printed_through + 1)
+                    rendered += "--\n";
+                rendered += part;
+                printed_through = last;
+            }
+            if (!collect.events.empty() && r.after_lines) {
+                uint64_t latest = 0;
+                for (const auto& event : collect.events) latest = std::max(latest, event.from);
+                const uint64_t hit_line = prefix_line + static_cast<uint64_t>(
+                    std::count(text.begin(), text.begin() + static_cast<ptrdiff_t>(latest), '\n'));
+                owed_through = std::max(owed_through, hit_line + r.after_lines);
+            }
+        } else if (json) {
+            std::vector<size_t> order(collect.events.size());
+            for (size_t i = 0; i < order.size(); ++i) order[i] = i;
+            std::sort(order.begin(), order.end(), [&](size_t a, size_t b) { return collect.events[a].from < collect.events[b].from; });
+            size_t cursor = 0;
+            uint64_t line_number = prefix_line;
+            for (size_t index : order) {
+                const Event& event = collect.events[index];
+                const uint64_t from_at = event.from + core_begin, to_at = event.to + core_begin;
+                if (from_at > to_at || to_at > text.size()) { ++out.errors; continue; }
+                line_number += std::count(text.begin() + static_cast<ptrdiff_t>(cursor), text.begin() + static_cast<ptrdiff_t>(from_at), '\n');
+                cursor = static_cast<size_t>(from_at);
+                size_t start = static_cast<size_t>(from_at > r.context_before ? from_at - r.context_before : 0);
+                size_t end = static_cast<size_t>(std::min<uint64_t>(text.size(), to_at + r.context_after));
+                while (start < from_at && start < text.size() && (static_cast<unsigned char>(text[start]) & 0xc0) == 0x80) ++start;
+                while (end < text.size() && (static_cast<unsigned char>(text[end]) & 0xc0) == 0x80) ++end;
+                Json::Object item{{"pattern_id", static_cast<int64_t>(event.id)}, {"path", display},
+                    {"byte_start", raw_at(from_at, false)}, {"byte_end", raw_at(to_at, true)}, {"binary", false},
+                    {"context", std::string(text.substr(start, end - start))},
+                    {"context_start", raw_at(start, false)},
+                    {"context_match_start", from_at - start}, {"context_match_end", to_at - start},
+                    {"context_truncated", false}};
+                if (r.line) item.emplace("line", line_number);
+                Json candidate(std::move(item));
+                const size_t bytes = Json::escaped_size(candidate.dump()) + 1;
+                results.push_back({std::move(candidate), bytes});
+            }
+        }
+        if (!count_only && !files_only) {
+            const auto taken = static_cast<uint32_t>(std::min<size_t>(collect.events.size(), per_file_left));
+            units += taken;
+            per_file_left -= taken;
+            remaining_left -= std::min(taken, remaining_left);
+        }
+        // Issue #57: publish finished output in batches, so one dense file never holds all of it; publishing also
+        // moves large text to the request's spill file. Batches of one file arrive in order. COMPAT: a NUL found in a
+        // later chunk then marks the file binary after earlier batches were published, as rg keeps matches printed
+        // before it meets a NUL.
+        if (r.output == "lines" && rendered.size() >= large_batch_bytes) {
+            std::vector<Candidate> batch;
+            add_text_candidate(batch, display, std::move(rendered), units - published_units);
+            rendered.clear();
+            published_units = units;
+            publish(r, out, s.control, batch, s.content_budget);
+        } else if (json && results.size() >= 4096) {
+            publish(r, out, s.control, results, s.content_budget);
+            results.clear();
+        }
+        const bool done = (files_only && found) || limited || per_file_left == 0 || remaining_left == 0 ||
+                          s.control.stop.load();
+        // The core's last lines (and, for json, bytes) become the next chunk's before-context.
+        size_t start = raw_core_end;
+        for (size_t kept = 0; start > 0 && (kept < keep_lines || raw_core_end - start < keep_bytes); ++kept) {
+            const size_t newline = start >= 2 ? std::string_view(chunk).rfind('\n', start - 2) : std::string_view::npos;
+            start = newline == std::string_view::npos ? 0 : newline + 1;
+        }
+        prefix_line += static_cast<uint64_t>(std::count(chunk.begin(), chunk.begin() + static_cast<ptrdiff_t>(start), '\n'));
+        prefix.assign(chunk, start, raw_core_end - start);
+        pending.erase(0, core);
+        pending_raw += core;
+        if (done) break;
+    }
+    ++out.files;
+    out.bytes += read_total;
+    out.found += found;
+    if (limited) out.per_file_limited.store(true);
+    const std::string path = painted(r, display);
+    if (files_only) {
+        if (without ? found == 0 : found != 0) add_text_candidate(items, display, path + "\n", 1);
+    } else if (count_only) {
+        if (totals.lines) add_text_candidate(items, display, count_line(path, totals), 1);
+    } else if (r.output == "lines") {
+        if (!rendered.empty()) add_text_candidate(items, display, std::move(rendered), units - published_units);
+    } else {
+        for (auto& item : results) items.push_back(std::move(item));
+    }
+    return true;
+}
+
+void scan_binary(const ScanShared& s, Worker& w, HANDLE h, uint64_t file_size, const std::string& display,
+                 uint32_t remaining, std::string& file_state, std::vector<Candidate>& items) {
+    const Request& r = s.r;
+    Outcome& out = s.out;
+    w.chunk();
+    const bool files_only = r.output == "files", count_only = r.output == "count";
+    Collector collect{{}, 0, files_only ? 1u : r.max_per_file, remaining};
+    collect.count_only = count_only;
+    collect.som = s.database->som;
+    collect.lengths = s.database->lengths.empty() ? nullptr : &s.database->lengths;
+    if (count_only && r.patterns.size() > 1) {
+        collect.pattern_lines.assign(r.patterns.size(), 0);
+        collect.pattern_line_end.assign(r.patterns.size(), 0);
+    }
+    // PERF: capped like scan_text; reserving max_per_file events allocated up to 10,000 per scanned file.
+    if (!count_only) collect.events.reserve(std::min({collect.max_per_file, collect.remaining, 64u}));
+    // PERF: an engine with a bounded match length scans the stream as chunks that overlap by its longest match
+    // less one byte, instead of Hyperscan stream state. Literals have no end-of-data matches.
+    // CONTRACT: if the engine fails, the file is rescanned from its start with Hyperscan into a fresh collector.
+    const TextEngine* engine = s.database->engine.get();
+    if (engine && (engine->max_match_bytes() == 0 || engine->max_match_bytes() > w.buffer.size() / 2)) engine = nullptr;
+    const size_t overlap = engine ? engine->max_match_bytes() - 1 : 0;
+    const Collector initial = collect;
+    hs_stream_t* stream = nullptr;
+    auto open_stream = [&] {
+        if (hs_open_stream(s.database->db.get(), 0, &stream) != HS_SUCCESS) throw std::runtime_error("Hyperscan stream allocation failed");
+    };
+    if (!engine) open_stream();
+    uint64_t consumed = 0;
+    size_t carry = 0;  // bytes at the front of w.buffer repeated from the previous chunk
+    bool read_failed = false;
+    while (consumed < file_size) {
+        if (const char* why = s.control.interrupted()) { file_state = why; break; }
+        DWORD want = static_cast<DWORD>(std::min<uint64_t>(w.buffer.size() - carry, file_size - consumed));
+        DWORD got = 0;
+        if (!ReadFile(h, w.buffer.data() + carry, want, &got, nullptr) || !got) { read_failed = true; break; }
+        bool stopped = false;
+        if (engine) {
+            const size_t length = carry + got;
+            const ScanStatus status = engine->scan_chunk(std::string_view(w.buffer.data(), length), carry, consumed - carry,
+                                                         w.engine_scratch.get(), Collector::callback, &collect);
+            if (status == ScanStatus::failed) {
+                ++out.engine_fallbacks;
+                engine = nullptr;
+                collect = initial;
+                consumed = 0;
+                carry = 0;
+                LARGE_INTEGER start{};
+                if (!SetFilePointerEx(h, start, nullptr, FILE_BEGIN)) { read_failed = true; break; }
+                open_stream();
+                continue;
+            }
+            stopped = status == ScanStatus::stopped;
+            const size_t keep = std::min(overlap, length);
+            std::memmove(w.buffer.data(), w.buffer.data() + (length - keep), keep);
+            carry = keep;
+        } else {
+            hs_error_t rc = hs_scan_stream(stream, w.buffer.data(), got, 0, w.scratch.get(), Collector::callback, &collect);
+            if (rc != HS_SUCCESS && rc != HS_SCAN_TERMINATED) {
+                hs_close_stream(stream, w.scratch.get(), nullptr, nullptr);
+                throw std::runtime_error("Hyperscan scan failed");
+            }
+            stopped = rc == HS_SCAN_TERMINATED;
+        }
+        consumed += got;
+        if (collect.full || stopped) {
+            if (!files_only) out.per_file_limited.store(true);
+            break;
+        }
+    }
+    // EOD callbacks are needed for anchored expressions on a complete scan.
+    if (stream && file_state == "complete" && !read_failed && !collect.full) {
+        hs_error_t rc = hs_close_stream(stream, w.scratch.get(), Collector::callback, &collect);
+        if (rc != HS_SUCCESS && rc != HS_SCAN_TERMINATED) throw std::runtime_error("Hyperscan stream close failed");
+        if (collect.full && !files_only) out.per_file_limited.store(true);
+    } else if (stream) hs_close_stream(stream, w.scratch.get(), nullptr, nullptr);
+    ++out.files;
+    out.bytes += consumed;
+    out.found += collect.found;
+    if (read_failed) {
+        ++out.errors;
+        throw std::runtime_error("byte search could not completely read a file; no complete search result is available");
+    }
+    if (file_state != "complete") return;
+    if (files_only) {
+        if (collect.found) add_text_candidate(items, display, painted(r, display) + "\n", 1);
+        return;
+    }
+    if (count_only) {
+        if (collect.lines) add_text_candidate(items, display, count_line(painted(r, display), collect), 1);
+        return;
+    }
+    std::vector<uint64_t> line_numbers;
+    if (r.line) {
+        auto lines = lines_for(h, collect.events, w.buffer, s.control.cancelled, s.control.deadline, file_state);
+        if (!lines) { ++out.errors; return; }
+        line_numbers = std::move(*lines);
+    }
+    for (size_t index = 0; index < collect.events.size(); ++index) {
+        if (file_state != "complete") break;
+        if (const char* why = s.control.interrupted()) { file_state = why; break; }
+        const auto& event = collect.events[index];
+        uint64_t from = event.from, to = event.to;
+        uint64_t window_start = from > r.context_before ? from - r.context_before : 0;
+        uint64_t window_end = std::min<uint64_t>(file_size, to + r.context_after);
+        const auto window = read_window(h, window_start, window_end, [&] {
+            if (const char* why = s.control.interrupted()) { file_state = why; return true; }
+            return false;
+        });
+        if (!window) { ++out.errors; items.clear(); return; }
+        const std::string& context_bytes = *window;
+        bool binary_context = r.binary || context_bytes.find('\0') != std::string::npos || !valid_utf8(context_bytes);
+        Json::Object item{{"pattern_id", static_cast<int64_t>(event.id)}, {"path", display},
+                          {"byte_start", from}, {"byte_end", to}, {"binary", binary_context},
+                          {binary_context ? "context_hex" : "context", binary_context ? hex(context_bytes) : context_bytes},
+                          {"context_start", window_start}, {"context_match_start", from - window_start},
+                          {"context_match_end", to - window_start}, {"context_truncated", false}};
+        // The same window with printable ASCII kept and every other byte shown as '.', so strings in binaries
+        // are readable without decoding the hex.
+        if (binary_context) {
+            std::string readable(context_bytes.size(), '.');
+            for (size_t i = 0; i < context_bytes.size(); ++i) {
+                const auto c = static_cast<unsigned char>(context_bytes[i]);
+                if (c >= 0x20 && c < 0x7f) readable[i] = static_cast<char>(c);
+            }
+            item.emplace("context_text", std::move(readable));
+        }
+        if (r.line) item.emplace("line", line_numbers[index]);
+        Json candidate(std::move(item));
+        const size_t bytes = Json::escaped_size(candidate.dump()) + 1;
+        items.push_back({std::move(candidate), bytes});
+    }
+}
+
+// PERF: CloseHandle on a searched file measured ~35 us, mostly filter-driver cleanup. Workers close inline: the
+// close then scales with them, while one background closer serialized every close and held a 12-worker search
+// at its 4-worker time (34.9 ms inline vs 56.1 ms deferred, median of 21 runs, 2026-10-09).
+// SHGREP_DEFER_CLOSE=1 hands handles to the background thread instead, for A/B measurement; past max_pending
+// queued handles a worker closes its own.
+// CONTRACT: only read-only, share-all handles are deferred, so a pending close never blocks another writer,
+// rename or delete.
+class Closer {
+public:
+    // Null when disabled or when the thread could not start. Never destroyed: process exit closes what is left.
+    static Closer* get() {
+        static Closer* const closer = []() -> Closer* {
+            if (!env_on(L"SHGREP_DEFER_CLOSE")) return nullptr;
+            auto* made = new (std::nothrow) Closer();
+            if (made && !made->start()) {
+                delete made;
+                made = nullptr;
+            }
+            return made;
+        }();
+        return closer;
+    }
+
+    void close(Handle h) {
+        bool wake = false;
+        {
+            std::lock_guard lock(mutex_);
+            if (pending_.size() < max_pending) {
+                wake = pending_.empty();
+                pending_.push_back(std::move(h));
+            }
+        }
+        if (wake) ready_.notify_one();
+        // A full queue leaves ownership in h, so it closes synchronously here.
+    }
+
+    // Handles queued but not yet taken by the thread; the profile reports it at response time.
+    uint64_t pending() {
+        std::lock_guard lock(mutex_);
+        return pending_.size();
+    }
+
+private:
+    static constexpr size_t max_pending = 16384;
+
+    bool start() {
+        try {
+            pending_.reserve(1024);
+            std::thread([this] { loop(); }).detach();
+            return true;
+        } catch (...) {
+            return false;
+        }
+    }
+
+    void loop() {
+        std::vector<Handle> batch;
+        for (;;) {
+            {
+                std::unique_lock lock(mutex_);
+                ready_.wait(lock, [&] { return !pending_.empty(); });
+                batch.swap(pending_);
+            }
+            batch.clear();
+        }
+    }
+
+    std::mutex mutex_;
+    std::condition_variable ready_;
+    std::vector<Handle> pending_;  // guarded by mutex_
+};
+
+void scan_file(const ScanShared& s, Worker& w, HANDLE directory, std::wstring_view name, const std::wstring& full_path,
+               uint64_t listed_size) {
+    const Request& r = s.r;
+    Outcome& out = s.out;
+    std::string display;
+    std::wstring normalized;
+    std::wstring_view shown(full_path);
+    if (!s.relative_prefixes.empty()) {
+        normalized = full_path;
+        std::replace(normalized.begin(), normalized.end(), L'/', L'\\');
+        for (const auto& prefix : s.relative_prefixes) {
+            if (normalized.size() >= prefix.size() &&
+                CompareStringOrdinal(normalized.data(), static_cast<int>(prefix.size()),
+                                     prefix.data(), static_cast<int>(prefix.size()), TRUE) == CSTR_EQUAL) {
+                shown = std::wstring_view(normalized).substr(prefix.size());
+                break;
+            }
+        }
+    }
+    if (!try_utf8(shown, display)) { ++out.errors; return; }
+    std::vector<Candidate> items;
+    if (r.file_only) {
+        // CONTRACT: find_files reads no file content; the directory-level root check bounds every name.
+        ++out.files;
+        ++out.found;
+        if (r.output == "json") items.push_back({Json(Json::Object{{"path", std::move(display)}}), 0});
+        else add_text_candidate(items, display, painted(r, display) + "\n", 1);
+        publish(r, out, s.control, items, s.content_budget);
+        return;
+    }
+    const size_t returned = std::min<size_t>(out.returned.load(), r.max_results);
+    const uint32_t remaining = r.max_results - static_cast<uint32_t>(returned);
+    if (remaining == 0) return;
+    bool denied = false;
+    PhaseTimer open_timer(phase(w.profile, &WorkerProfile::file_open));
+    NTSTATUS status = 0;
+    Handle h(open_relative(directory, name, false, denied, &status));
+    if (!h) {
+        constexpr NTSTATUS name_not_found = static_cast<NTSTATUS>(0xC0000034L);  // STATUS_OBJECT_NAME_NOT_FOUND
+        constexpr NTSTATUS path_not_found = static_cast<NTSTATUS>(0xC000003AL);  // STATUS_OBJECT_PATH_NOT_FOUND
+        if (w.index_snapshot && (status == name_not_found || status == path_not_found)) ++out.index_missing;
+        else ++out.errors;
+        return;
+    }
+    // PERF: small text files are sized from the listing; read_text re-measures any that grew since.
+    uint64_t file_size = listed_size;
+    if (r.binary || listed_size > binary_probe_bytes) {
+        LARGE_INTEGER size{};
+        if (!GetFileSizeEx(h.h, &size) || size.QuadPart < 0) { ++out.errors; return; }
+        file_size = static_cast<uint64_t>(size.QuadPart);
+    }
+    open_timer.stop();
+    if (w.profile) ++w.profile->files_opened;
+    std::string file_state = "complete";
+    if (!r.binary) scan_text(s, w, h.h, file_size, display, remaining, file_state, items);
+    else scan_binary(s, w, h.h, file_size, display, remaining, file_state, items);
+    {
+        PhaseTimer close_timer(phase(w.profile, &WorkerProfile::close));
+        if (Closer* closer = Closer::get()) closer->close(std::move(h));
+        else h.close();
+    }
+    if (file_state != "complete") {
+        finish(out, s.control, file_state.c_str());
+        return;
+    }
+    publish(r, out, s.control, items, s.content_budget);
+}
+
+std::string grouped_number(uint64_t number) {
+    std::string value = std::to_string(number);
+    for (size_t pos = value.size(); pos > 3; pos -= 3) value.insert(pos - 3, 1, ',');
+    return value;
+}
+
+struct Footer {
+    std::string state;
+    std::vector<std::string> roots;
+    uint64_t files = 0, errors = 0, skipped_size = 0, elapsed_ms = 0, returned = 0;
+    bool show_selection = false;
+    uint64_t seen = 0, filtered = 0, ignored = 0, hidden = 0, pruned = 0, reparse = 0;
+};
+
+// CONTRACT: text output stays silent on a complete search with results, like grep. Otherwise one or two short
+// lines say why the list is empty or may be incomplete, so an agent does not mistake it for a full answer.
+std::string render_footer(const Request& r, const Footer& f, const Json::Array& skipped) {
+    std::string out;
+    const bool per_file_units = r.file_only || r.output == "files" || r.output == "files_without_match" ||
+                                r.output == "count";
+    if (f.returned == 0) {
+        out += r.file_only ? "No files matched." : "No matches.";
+        if (!r.file_only) out += " Scanned " + grouped_number(f.files) + " files in " + std::to_string(f.elapsed_ms) + " ms.";
+        out += " Roots:";
+        for (const auto& root : f.roots) out += " " + root;
+        out += '\n';
+        if (f.show_selection)
+            out += "Selection: " + grouped_number(f.seen) + " files seen, " + grouped_number(f.filtered) + " filtered, " +
+                   grouped_number(f.ignored) + " ignored, " + grouped_number(f.hidden) + " hidden, " +
+                   grouped_number(f.pruned) + " directories pruned, " + grouped_number(f.reparse) +
+                   " reparse points skipped.\n";
+    }
+    for (const auto& entry : skipped) {
+        const auto& item = entry.object();
+        out += "Skipped oversized text file: " + item.at("path").string() + " (" +
+               grouped_number(static_cast<uint64_t>(item.at("size_bytes").integer())) +
+               " bytes; text search did not inspect it).\n";
+    }
+    if (f.state == "complete") return out;
+    out += "[status " + f.state + ": ";
+    if (f.state == "limit")
+        out += "stopped at max_results=" + std::to_string(r.max_results) + "; more " +
+               (per_file_units ? "files" : "matches") + " may exist. Narrow the search, raise max_results, or use max_results=0 for exhaustive results.]\n";
+    else if (f.state == "per_file_limit")
+        out += "some files have more than max_matches_per_file=" + std::to_string(r.max_per_file) +
+               " matches; only the first are shown.]\n";
+    else if (f.state == "output_limit")
+        out += "stopped at max_output_bytes=" + std::to_string(r.max_output) + "; more results may exist.]\n";
+    else if (f.state == "partial_files")
+        out += grouped_number(f.errors) + " files unreadable, " + grouped_number(f.skipped_size) +
+               " text files over max_file_bytes skipped.]\n";
+    else if (f.state == "timeout")
+        out += "timed out after " + std::to_string(r.timeout_ms) + " ms; results are partial.]\n";
+    else out += "results are partial.]\n";
+    return out;
+}
+
+HANDLE open_root_directory(const std::wstring& path) {
+    return CreateFileW(absolute_long_path(fs::path(path)).c_str(), FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES,
+                       FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+                       FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+}
+
+struct WalkRoot {
+    std::wstring path, final;
+    // SAFETY: the handle that was validated against the configured roots. Walking it, never reopening path, closes
+    //   the window in which a junction swapped in after validation could lead the walk outside the roots.
+    std::shared_ptr<Handle> handle;
+};
+
+struct DirectoryTask {
+    std::wstring path;
+    std::string relative;
+    std::shared_ptr<const IgnoreScope> ignore;
+    std::shared_ptr<Handle> handle;
+};
+
+struct WalkBuffers {
+    std::vector<uint64_t> listing = std::vector<uint64_t>(listing_buffer_bytes / sizeof(uint64_t));
+    std::vector<DirEntry> entries;
+    std::string name, relative;
+};
+
+// Selected files of one listed directory, opened relative to its handle; any worker may scan a batch.
+struct FileBatch {
+    std::shared_ptr<Handle> handle;
+    std::shared_ptr<const std::wstring> directory;
+    std::vector<DirEntry> files;
+};
+// PERF: at roughly 40 us of open/read/scan/close per file, 8 files (~0.3 ms) keep queue traffic negligible while
+// one large directory still spreads across idle workers.
+constexpr size_t file_batch_size = 8;
+
+// The default selection of a listed entry, shared by walks, index builds (which walk) and the live index, so an
+// indexed search and a walk agree on what exists. Links are never followed; dot-named and hidden entries are left out
+// unless a request asks for hidden ones. With binary_extension and ignored_path these are the whole rule.
+bool link_entry(DWORD attributes) { return (attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0; }
+bool hidden_entry(std::string_view name, DWORD attributes) {
+    return (!name.empty() && name.front() == '.') || (attributes & FILE_ATTRIBUTE_HIDDEN) != 0;
+}
+
+// CONTRACT: `directory` is the open parent handle and `name` the listed name; open the file with open_relative.
+//   listed_write_time is the listing's last-write time (FILETIME ticks), 0 when the caller has no listing.
+using FileVisitor = std::function<void(unsigned worker, HANDLE directory, std::wstring_view name, const std::wstring& path,
+                                       uint64_t listed_size, uint64_t listed_write_time)>;
+
+// Where a walked entry stands relative to Request::scope.
+enum class ScopeMatch { outside, ancestor, target, inside };
+ScopeMatch scope_match(const Request& r, std::string_view relative, bool directory) {
+    const std::string_view scope = r.scope;
+    if (relative.size() == scope.size())
+        return directory != r.scope_file && equals_folded(relative, scope) ? ScopeMatch::target : ScopeMatch::outside;
+    if (relative.size() < scope.size())
+        return directory && scope[relative.size()] == '/' && equals_folded(scope.substr(0, relative.size()), relative)
+                   ? ScopeMatch::ancestor : ScopeMatch::outside;
+    return !r.scope_file && relative[scope.size()] == '/' && equals_folded(relative.substr(0, scope.size()), scope)
+               ? ScopeMatch::inside : ScopeMatch::outside;
+}
+
+// Lists one directory: subdirectories to visit go to children, files that pass every filter go to files.
+void visit_directory(const Request& r, const DirectoryTask& task, WalkBuffers& b, std::vector<DirectoryTask>& children,
+                     std::vector<DirEntry>& files, Control& control, Outcome& out, WorkerProfile* p) {
+    PhaseTimer list_timer(phase(p, &WorkerProfile::list));
+    if (!list_directory(task.handle->h, b.listing, b.entries)) ++out.errors;
+
+    std::shared_ptr<const IgnoreScope> scope = task.ignore;
+    if (!r.no_ignore) {
+        bool gitignore = false, dotignore = false, git_dir = false;
+        for (const auto& entry : b.entries) note_rule_file(entry.name, entry.attributes, gitignore, dotignore, git_dir);
+        if (gitignore || dotignore || git_dir) {
+            auto next = std::make_shared<IgnoreScope>();
+            next->parent = task.ignore;
+            read_ignore_rules(task.path, task.relative, gitignore, dotignore, next->rules, task.handle->h, git_dir);
+            if (!next->rules.empty()) scope = std::move(next);
+        }
+    }
+
+    list_timer.stop();
+    for (auto& entry : b.entries) {
+        if (control.stop.load()) return;
+        if (const char* why = control.interrupted()) { finish(out, control, why); return; }
+        const bool is_directory = (entry.attributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+        // Junctions and symlinks are reparse points; they are never followed.
+        const bool link = link_entry(entry.attributes);
+        const bool regular = !is_directory && !link;
+        if (!try_utf8(entry.name, b.name) || b.name.empty()) { ++out.errors; continue; }
+        if (regular) ++out.regular_seen;
+        if (regular && !name_prefilter(r, b.name)) { ++out.files_filtered; continue; }
+        b.relative.assign(task.relative);
+        if (!b.relative.empty()) b.relative.push_back('/');
+        b.relative.append(b.name);
+        // The folders leading to a scoped path, and the path itself, are entered whatever hidden or ignore say.
+        bool named = false;
+        if (!r.scope.empty()) {
+            const ScopeMatch match = scope_match(r, b.relative, is_directory);
+            if (match == ScopeMatch::outside) {
+                if (is_directory) ++out.directories_pruned;
+                else ++out.files_filtered;
+                continue;
+            }
+            named = match != ScopeMatch::inside;
+        }
+        const bool passes = path_passes(r, b.relative, b.name, is_directory);
+        if (regular && !passes) { ++out.files_filtered; continue; }
+        if (link) {
+            ++out.reparse_skipped;
+            if (is_directory) ++out.directories_pruned;
+            continue;
+        }
+        if (is_directory && !r.excluded_directories.empty() && same_name(entry.name, cache_directory_name)) {
+            const std::wstring path = join_path(task.path, entry.name);
+            if (std::any_of(r.excluded_directories.begin(), r.excluded_directories.end(),
+                            [&](const std::wstring& excluded) { return same_name(path, excluded.c_str()); })) {
+                ++out.directories_pruned;
+                continue;
+            }
+        }
+        const bool visible = r.hidden || !hidden_entry(b.name, entry.attributes);
+        if (!visible && !named) {
+            if (is_directory) ++out.directories_pruned;
+            else ++out.files_hidden;
+            continue;
+        }
+        if (!named && !r.no_ignore && ignored_path(scope.get(), b.relative, is_directory)) {
+            if (is_directory) ++out.directories_pruned;
+            else ++out.files_ignored;
+            continue;
+        }
+        if (is_directory) {
+            if (!passes) { ++out.directories_pruned; continue; }
+            bool denied = false;
+            PhaseTimer open_timer(phase(p, &WorkerProfile::dir_open));
+            HANDLE child = open_relative(task.handle->h, entry.name, true, denied);
+            open_timer.stop();
+            if (child == INVALID_HANDLE_VALUE) {
+                // CONTRACT: access-denied subdirectories are skipped without an error, matching skip_permission_denied.
+                if (!denied) ++out.errors;
+                continue;
+            }
+            children.push_back({join_path(task.path, entry.name), b.relative, scope, std::make_shared<Handle>(child)});
+            continue;
+        }
+        if (!r.file_only && !r.binary) {
+            // PERF: skip text-search files that cannot match without paying for the open; binary extensions are
+            // listed in binary_extension.
+            // CONTRACT: a listed size of 0 is not trusted; NTFS directory entries can lag a file still open for
+            // writing, and read_text reads to EOF whatever the listing says.
+            if (!r.sniff_all && !named && binary_extension(b.name)) { ++out.skipped_binary; continue; }
+        }
+        files.push_back(std::move(entry));
+    }
+}
+
+// A fixed set of threads that runs one job on all of them at once.
+// PERF: walk threads are created once and parked between requests; creating 12 threads per request delayed the
+// last worker's start by 3-4 ms.
+class Crew {
+public:
+    explicit Crew(unsigned size) : size_(size) {
+        threads_.reserve(size - 1);
+        try {
+            for (unsigned i = 1; i < size; ++i) threads_.emplace_back([this, i] { loop(i); });
+        } catch (...) {
+            stop();
+            throw;
+        }
+    }
+    ~Crew() { stop(); }
+    Crew(const Crew&) = delete;
+    Crew& operator=(const Crew&) = delete;
+    unsigned size() const { return size_; }
+
+    // Runs job(i) for every i in [0, size) concurrently, the caller as 0, and returns once all have returned.
+    void run(const std::function<void(unsigned)>& job) {
+        {
+            std::lock_guard lock(mutex_);
+            job_ = &job;
+            remaining_ = size_ - 1;
+            failure_ = nullptr;
+            ++generation_;
+        }
+        wake_.notify_all();
+        std::exception_ptr own;
+        try { job(0); } catch (...) { own = std::current_exception(); }
+        std::unique_lock lock(mutex_);
+        done_.wait(lock, [&] { return remaining_ == 0; });
+        job_ = nullptr;
+        if (own) std::rethrow_exception(own);
+        if (failure_) std::rethrow_exception(failure_);
+    }
+
+private:
+    void loop(unsigned index) {
+        uint64_t seen = 0;
+        for (;;) {
+            const std::function<void(unsigned)>* job = nullptr;
+            {
+                std::unique_lock lock(mutex_);
+                wake_.wait(lock, [&] { return quit_ || generation_ != seen; });
+                if (quit_) return;
+                seen = generation_;
+                job = job_;
+            }
+            std::exception_ptr error;
+            try { (*job)(index); } catch (...) { error = std::current_exception(); }
+            std::lock_guard lock(mutex_);
+            if (error && !failure_) failure_ = error;
+            if (--remaining_ == 0) done_.notify_one();
+        }
+    }
+    void stop() {
+        {
+            std::lock_guard lock(mutex_);
+            quit_ = true;
+        }
+        wake_.notify_all();
+        for (auto& thread : threads_) thread.join();
+    }
+
+    const unsigned size_;
+    std::mutex mutex_;
+    std::condition_variable wake_, done_;
+    const std::function<void(unsigned)>* job_ = nullptr;  // guarded by mutex_
+    uint64_t generation_ = 0;                              // guarded by mutex_
+    unsigned remaining_ = 0;                               // guarded by mutex_
+    bool quit_ = false;                                    // guarded by mutex_
+    std::exception_ptr failure_;                           // guarded by mutex_
+    std::vector<std::thread> threads_;
+};
+
+// CONTRACT: a request takes a whole crew, so concurrent requests still each get their own full pool; at most one
+// crew per concurrently running request is ever parked.
+// COMPAT: parked crews are leaked at exit on purpose; ExitProcess ends their threads, while joining threads during
+// static destruction is unsafe on Windows.
+std::mutex& crew_mutex() {
+    static auto* mutex = new std::mutex;
+    return *mutex;
+}
+std::vector<std::unique_ptr<Crew>>& parked_crews() {
+    static auto* crews = new std::vector<std::unique_ptr<Crew>>;
+    return *crews;
+}
+std::unique_ptr<Crew> take_crew(unsigned size) {
+    {
+        std::lock_guard lock(crew_mutex());
+        auto& parked = parked_crews();
+        for (auto it = parked.begin(); it != parked.end(); ++it) {
+            if ((*it)->size() != size) continue;
+            auto crew = std::move(*it);
+            parked.erase(it);
+            return crew;
+        }
+    }
+    return std::make_unique<Crew>(size);
+}
+void park_crew(std::unique_ptr<Crew> crew) {
+    std::lock_guard lock(crew_mutex());
+    parked_crews().push_back(std::move(crew));
+}
+
+// PERF: files above this listed size get a batch of their own that workers take first, so a multi-MB file starts
+// early instead of becoming the walk's tail (a 2.5 MB file measured 9 ms under full load).
+constexpr uint64_t large_file_bytes = 256 * 1024;
+// PERF: workers list directories ahead of scanning while fewer files than this are queued, so large files are
+// found early; the cap bounds queued file entries (and the directory handles they keep open) on huge trees.
+// A paired A/B against scanning batches first measured 3-4% less walk time.
+constexpr size_t listing_ahead_files = 16384;
+
+// PERF: a bounded pool lists directories in parallel. Each listing's files are cut into batches that any worker
+// may scan, so one large directory no longer runs on the single worker that listed it; measured as ~15% idle
+// worker time before batching.
+// CONTRACT: workers take large-file batches first, then directories while fewer than listing_ahead_files files are
+// queued, then small-file batches. All stacks are LIFO, so the directory frontier (each entry holding one open
+// handle) stays near depth-first size rather than the tree's full width.
+// CONTRACT: profiles is null or holds worker_count slots, one per walk thread index.
+void walk(const Request& r, const std::vector<WalkRoot>& roots, unsigned worker_count, Control& control,
+          Outcome& out, const FileVisitor& on_file, WorkerProfile* profiles) {
+    std::mutex mutex;
+    std::condition_variable ready;
+    std::vector<DirectoryTask> pending;
+    std::vector<FileBatch> large, batches;
+    size_t queued_files = 0;  // files in batches
+    size_t active = 0;        // workers listing a directory, which may add work
+    for (const auto& root : roots) {
+        auto handle = root.handle ? root.handle : std::make_shared<Handle>(open_root_directory(root.path));
+        if (!*handle) { ++out.errors; continue; }
+        pending.push_back({root.path, {}, nullptr, std::move(handle)});
+    }
+    auto scan_batch = [&](unsigned index, const FileBatch& batch, WorkerProfile* p) {
+        try {
+            PhaseTimer busy_timer(phase(p, &WorkerProfile::busy));
+            for (const auto& entry : batch.files) {
+                if (control.stop.load()) return;
+                if (const char* why = control.interrupted()) { finish(out, control, why); return; }
+                const int64_t file_started = p ? ticks() : 0;
+                on_file(index, batch.handle->h, entry.name, join_path(*batch.directory, entry.name), entry.size,
+                        entry.write_time);
+                if (p) {
+                    const int64_t spent = ticks() - file_started;
+                    p->file_total += spent;
+                    p->slowest_file = std::max(p->slowest_file, spent);
+                }
+            }
+        } catch (...) {
+            fail(out, control, std::current_exception());
+        }
+    };
+    auto run = [&](unsigned index) {
+        WorkerProfile* p = profiles ? &profiles[index] : nullptr;
+        if (p && !p->started) p->started = ticks();
+        struct Finish {
+            WorkerProfile* p;
+            ~Finish() { if (p) p->finished = ticks(); }
+        } finish_mark{p};
+        PhaseTimer wall_timer(phase(p, &WorkerProfile::wall));
+        WalkBuffers buffers;
+        std::vector<DirectoryTask> children;
+        std::vector<DirEntry> files, small;
+        std::vector<FileBatch> made_large, made;
+        for (;;) {
+            std::optional<FileBatch> batch;
+            DirectoryTask task;
+            {
+                std::unique_lock lock(mutex);
+                while (large.empty() && batches.empty() && pending.empty() && active != 0 && !control.stop.load())
+                    ready.wait_for(lock, std::chrono::milliseconds(20));
+                if ((large.empty() && batches.empty() && pending.empty()) || control.stop.load()) {
+                    ready.notify_all();
+                    return;
+                }
+                if (!large.empty()) {
+                    batch = std::move(large.back());
+                    large.pop_back();
+                } else if (!batches.empty() && (pending.empty() || queued_files >= listing_ahead_files)) {
+                    batch = std::move(batches.back());
+                    batches.pop_back();
+                    queued_files -= batch->files.size();
+                } else {
+                    task = std::move(pending.back());
+                    pending.pop_back();
+                    ++active;
+                }
+            }
+            if (batch) {
+                scan_batch(index, *batch, p);
+                continue;
+            }
+            children.clear();
+            files.clear();
+            small.clear();
+            made_large.clear();
+            made.clear();
+            try {
+                PhaseTimer busy_timer(phase(p, &WorkerProfile::busy));
+                visit_directory(r, task, buffers, children, files, control, out, p);
+                if (!files.empty()) {
+                    auto directory = std::make_shared<const std::wstring>(task.path);
+                    for (auto& file : files) {
+                        if (file.size > large_file_bytes) made_large.push_back({task.handle, directory, {std::move(file)}});
+                        else small.push_back(std::move(file));
+                    }
+                    for (size_t start = 0; start < small.size(); start += file_batch_size) {
+                        const auto first = small.begin() + static_cast<ptrdiff_t>(start);
+                        const auto last = small.begin() + static_cast<ptrdiff_t>(std::min(small.size(), start + file_batch_size));
+                        made.push_back({task.handle, directory,
+                                        std::vector<DirEntry>(std::make_move_iterator(first), std::make_move_iterator(last))});
+                    }
+                }
+            } catch (...) {
+                fail(out, control, std::current_exception());
+                made_large.clear();
+                made.clear();
+                small.clear();
+            }
+            {
+                std::lock_guard lock(mutex);
+                for (auto& child : children) pending.push_back(std::move(child));
+                for (auto& one : made_large) large.push_back(std::move(one));
+                for (auto& some : made) batches.push_back(std::move(some));
+                queued_files += small.size();
+                --active;
+            }
+            ready.notify_all();
+        }
+    };
+    auto crew = take_crew(worker_count);
+    crew->run(run);
+    park_crew(std::move(crew));
+}
+
+// CONTRACT: *_us values are worker time summed over all workers, except last_start, first_finish and last_finish
+// (wall-clock offsets from the walk's start) and slowest_file (one file's duration).
+Json::Object profile_json(const std::vector<WorkerProfile>& profiles, int64_t walk_started) {
+    auto us = ticks_to_us;
+    WorkerProfile sum;
+    int64_t busy_min = INT64_MAX, busy_max = 0;
+    int64_t start_last = 0, finish_first = INT64_MAX, finish_last = 0, slowest = 0;
+    for (const auto& p : profiles) {
+        start_last = std::max(start_last, p.started - walk_started);
+        finish_first = std::min(finish_first, p.finished - walk_started);
+        finish_last = std::max(finish_last, p.finished - walk_started);
+        slowest = std::max(slowest, p.slowest_file);
+    }
+    for (const auto& p : profiles) {
+        sum.wall += p.wall;
+        sum.busy += p.busy;
+        sum.list += p.list;
+        sum.dir_open += p.dir_open;
+        sum.file_total += p.file_total;
+        sum.file_open += p.file_open;
+        sum.read += p.read;
+        sum.scan += p.scan;
+        sum.close += p.close;
+        sum.files_opened += p.files_opened;
+        busy_min = std::min(busy_min, p.busy);
+        busy_max = std::max(busy_max, p.busy);
+    }
+    const int64_t accounted = sum.file_open + sum.read + sum.scan + sum.close;
+    return {{"workers", static_cast<uint64_t>(profiles.size())}, {"files_opened", sum.files_opened},
+            {"wall_us", us(sum.wall)}, {"busy_us", us(sum.busy)}, {"idle_us", us(sum.wall - sum.busy)},
+            {"busy_min_us", us(busy_min)}, {"busy_max_us", us(busy_max)},
+            {"list_us", us(sum.list)}, {"dir_open_us", us(sum.dir_open)},
+            {"file_open_us", us(sum.file_open)}, {"read_us", us(sum.read)}, {"scan_us", us(sum.scan)},
+            {"close_us", us(sum.close)}, {"file_other_us", us(sum.file_total - accounted)},
+            {"last_start_us", us(start_last)}, {"first_finish_us", us(finish_first)},
+            {"last_finish_us", us(finish_last)}, {"slowest_file_us", us(slowest)}};
+}
+}
+
+// ---- Optional snapshot trigram index ------------------------------------------------------------------------------
+// Owner-approved (2026-10-09): an opt-in index like tgrep's. `shgrep index` writes one file per configured root to
+// the workspace's .shgrep\index directory. A search with index: true does not walk an indexed root: it plans each
+// pattern into an AND/OR query of literal trigrams, takes the candidate paths from the index, and opens only those,
+// below the root one component at a time and never through a link.
+// CONTRACT: a snapshot, consulted only when the request asks. Files added since the build are not searched, files
+// deleted since are counted, not reported as errors, and a file edited since can be missed; every indexed result
+// names the build time. Case-insensitive lookups skip every trigram holding a byte that Unicode case folding can pair
+// with other bytes (index_unfoldable), so a match relying on such folding is never filtered out. Searches without the
+// flag never touch any of this.
+namespace {
+
+constexpr char index_magic[8] = {'S', 'H', 'G', 'I', 'D', 'X', '3', '\0'};
+constexpr uint32_t dense_trigram = 0xffffffffu;  // IndexTrigram::count of a trigram held by most files
+constexpr uint32_t unindexed_file = 1;           // IndexFile::flags: contents unknown, always a candidate
+constexpr size_t index_segment = 1u << 20;       // trigram positions sorted per batch while indexing a file
+constexpr size_t index_sort_budget = 64u << 20;  // bytes of postings held in memory before spilling a sorted run
+
+// On-disk layout, little-endian: header, root path, file table, names, postings, trigram table.
+struct IndexHeader {
+    char magic[8];
+    uint64_t built;  // FILETIME, UTC
+    uint32_t files, trigrams;
+    uint64_t root, root_size;  // UTF-8 final path of the indexed root
+    uint64_t file_table, names, names_size, trigram_table, postings, postings_size;
+};
+struct IndexFile {
+    uint32_t name, name_size;  // in the names blob: the '/'-separated path below the root
+    uint64_t size;             // bytes when indexed
+    uint64_t write_time;       // FILETIME of the last write when indexed
+    uint32_t flags, reserved;
+};
+struct IndexTrigram {
+    uint32_t key, count;  // sorted by key; count is dense_trigram for a trigram that constrains nothing
+    uint64_t offset;      // in postings: count entries of (varint file id delta, location mask, next-byte mask)
+};
+// PERF: like tgrep's postings, two Bloom-style bytes per (trigram, file) let a lookup demand that consecutive
+// trigrams of a literal sit at consecutive offsets (bit = offset % 8) and are followed by the literal's next byte
+// (bit = folded byte % 8), so the index behaves almost like one of 4-grams.
+struct IndexPosting {
+    uint32_t id;
+    uint8_t loc, next;
+};
+
+uint32_t index_fold(char c) {
+    const auto b = static_cast<unsigned char>(c);
+    return b >= 'A' && b <= 'Z' ? b + 32u : b;
+}
+
+// Under Unicode simple case folding (PCRE2_CASELESS with PCRE2_UCP) a caseless pattern byte can match bytes that
+// index_fold does not equate with it: any non-ASCII byte, and k and s, which also match U+212A KELVIN SIGN and U+017F
+// LONG S. Index trigrams cannot vouch for such a byte in a caseless lookup.
+bool index_unfoldable(char c) {
+    const auto b = static_cast<unsigned char>(c);
+    return b >= 0x80 || b == 'k' || b == 'K' || b == 's' || b == 'S';
+}
+
+bool index_widen(std::string_view s, std::wstring& out) {
+    out.clear();
+    if (s.empty()) return true;
+    const int size = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, s.data(), static_cast<int>(s.size()), nullptr, 0);
+    if (size <= 0) return false;
+    out.resize(static_cast<size_t>(size));
+    return MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, s.data(), static_cast<int>(s.size()), out.data(), size) == size;
+}
+
+// '/'-separated UTF-8 path of `path` below the walk root path `root`, as visit_directory builds relative paths.
+bool index_relative(const std::wstring& path, const std::wstring& root, std::string& out) {
+    size_t skip = root.size();
+    if (path.size() <= skip) return false;
+    if (path[skip] == L'\\' || path[skip] == L'/') ++skip;
+    if (!try_utf8(std::wstring_view(path).substr(skip), out)) return false;
+    std::replace(out.begin(), out.end(), '\\', '/');
+    return true;
+}
+
+// The index file of the root whose final path is `root_final`, under the first configured root's .shgrep directory
+// (which walks never enter). Empty when that root is unavailable.
+std::wstring index_file_path(const SearchContext& context, const std::wstring& root_final) {
+    if (context.allowed_roots.empty()) return {};
+    Handle h(CreateFileW(absolute_long_path(context.allowed_roots.front()).c_str(), FILE_READ_ATTRIBUTES,
+                         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+                         FILE_FLAG_BACKUP_SEMANTICS, nullptr));
+    if (!h) return {};
+    std::wstring workspace;
+    try { workspace = final_path(h.h); } catch (const std::runtime_error&) { return {}; }
+    uint64_t hash = 1469598103934665603ull;  // FNV-1a; the root path inside the file settles collisions
+    for (wchar_t c : root_final) {
+        hash ^= static_cast<uint16_t>(std::towlower(c));
+        hash *= 1099511628211ull;
+    }
+    wchar_t name[32] = {};
+    swprintf_s(name, L"%016llx.idx", static_cast<unsigned long long>(hash));
+    return join_path(join_path(join_path(workspace, cache_directory_name), L"index"), name);
+}
+
+std::string utc_text(uint64_t filetime) {
+    FILETIME ft{static_cast<DWORD>(filetime), static_cast<DWORD>(filetime >> 32)};
+    SYSTEMTIME st{};
+    if (!FileTimeToSystemTime(&ft, &st)) return "unknown time";
+    char text[32] = {};
+    std::snprintf(text, sizeof(text), "%04u-%02u-%02u %02u:%02u UTC", st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute);
+    return text;
+}
+
+// The distinct folded trigrams of one file with their masks, packed as key << 16 | loc << 8 | next and sorted.
+// PERF: positions are sorted in segments of index_segment and merged, so a large file needs O(segment) scratch.
+struct TrigramSet {
+    std::vector<uint32_t> occurrences;  // key << 7 | (offset % 8) << 4 | has-next << 3 | next % 8
+    std::vector<uint64_t> grams, segment, merged;
+    void collect(std::string_view text) {
+        grams.clear();
+        if (text.size() < 3) return;
+        for (size_t first = 0; first + 2 < text.size(); first += index_segment) {
+            const size_t last = std::min(text.size() - 2, first + index_segment);
+            occurrences.clear();
+            uint32_t key = index_fold(text[first]) << 8 | index_fold(text[first + 1]);
+            for (size_t start = first; start < last; ++start) {
+                key = (key << 8 | index_fold(text[start + 2])) & 0xffffffu;
+                const uint32_t next = start + 3 < text.size() ? 8u | (index_fold(text[start + 3]) & 7u) : 0u;
+                occurrences.push_back(key << 7 | static_cast<uint32_t>(start & 7) << 4 | next);
+            }
+            std::sort(occurrences.begin(), occurrences.end());
+            segment.clear();
+            for (size_t i = 0; i < occurrences.size();) {
+                const uint32_t k = occurrences[i] >> 7;
+                uint32_t loc = 0, next = 0;
+                for (; i < occurrences.size() && occurrences[i] >> 7 == k; ++i) {
+                    loc |= 1u << ((occurrences[i] >> 4) & 7);
+                    if (occurrences[i] & 8) next |= 1u << (occurrences[i] & 7);
+                }
+                segment.push_back(uint64_t{k} << 16 | loc << 8 | next);
+            }
+            if (grams.empty()) {
+                grams.swap(segment);
+                continue;
+            }
+            merged.clear();
+            size_t a = 0, b = 0;
+            while (a < grams.size() || b < segment.size()) {
+                if (b == segment.size() || (a < grams.size() && grams[a] >> 16 < segment[b] >> 16)) merged.push_back(grams[a++]);
+                else if (a == grams.size() || segment[b] >> 16 < grams[a] >> 16) merged.push_back(segment[b++]);
+                else merged.push_back(grams[a++] | segment[b++]);
+            }
+            grams.swap(merged);
+        }
+    }
+};
+
+enum class IndexRead { text, binary, unreadable };
+
+// Reads a file the way scan_text sees it: binary for files search skips as binary, unreadable for read failures and
+// files over max_bytes; for text, `text` is the scanned text, pointing into `raw` or `decoded`.
+IndexRead index_text(HANDLE h, uint64_t max_bytes, std::string& raw, std::optional<DecodedText>& decoded,
+                     std::string_view& text, uint64_t& size, uint64_t& write_time) {
+    FILE_BASIC_INFO basic{};
+    if (GetFileInformationByHandleEx(h, FileBasicInfo, &basic, sizeof(basic)))
+        write_time = static_cast<uint64_t>(basic.LastWriteTime.QuadPart);
+    LARGE_INTEGER length{};
+    if (!GetFileSizeEx(h, &length) || length.QuadPart < 0) return IndexRead::unreadable;
+    size = static_cast<uint64_t>(length.QuadPart);
+    if (size > max_bytes) return IndexRead::unreadable;
+    raw.resize(static_cast<size_t>(size));
+    size_t read = 0;
+    while (read < raw.size()) {
+        DWORD got = 0;
+        const auto want = static_cast<DWORD>(std::min<size_t>(raw.size() - read, 1u << 20));
+        if (!ReadFile(h, raw.data() + read, want, &got, nullptr) || got == 0) return IndexRead::unreadable;
+        read += got;
+    }
+    const auto byte = [&](size_t i) { return static_cast<unsigned char>(raw[i]); };
+    const bool utf16 = raw.size() >= 2 && ((byte(0) == 0xff && byte(1) == 0xfe) || (byte(0) == 0xfe && byte(1) == 0xff));
+    if (!utf16) {
+        const size_t bom = raw.size() >= 3 && byte(0) == 0xef && byte(1) == 0xbb && byte(2) == 0xbf ? 3 : 0;
+        const std::string_view body = std::string_view(raw).substr(bom);
+        const ByteScan scanned = scan_bytes(body);
+        if (scanned.nul) return IndexRead::binary;
+        if (!scanned.non_ascii || valid_utf8(body)) {
+            text = body;
+            return IndexRead::text;
+        }
+    }
+    decoded.emplace(decode_text(raw));
+    if (decoded->text.find('\0') != std::string::npos) return IndexRead::binary;
+    text = decoded->text;
+    return IndexRead::text;
+}
+
+void put_varint(std::string& out, uint32_t value) {
+    while (value >= 0x80) {
+        out.push_back(static_cast<char>(value | 0x80));
+        value >>= 7;
+    }
+    out.push_back(static_cast<char>(value));
+}
+
+template <class T>
+void put_raw(std::string& out, const T& value) {
+    out.append(reinterpret_cast<const char*>(&value), sizeof(T));
+}
+
+void pad8(std::string& out) {
+    while (out.size() % 8) out.push_back('\0');
+}
+
+struct SpillPosting {
+    uint32_t key, id;
+    uint16_t masks;  // location mask << 8 | next-byte mask
+    uint16_t unused;
+};
+static_assert(sizeof(SpillPosting) == 12, "spill runs are raw arrays of SpillPosting");
+
+bool spill_less(const SpillPosting& a, const SpillPosting& b) {
+    return a.key != b.key ? a.key < b.key : a.id < b.id;
+}
+
+// External merge sort of (trigram, file) postings, as tgrep's bootstrap builder does: each producer fills a bounded
+// buffer, sorts it and spills it to a run file when full, and merge() streams a k-way merge of the runs.
+// PERF: peak memory is the budget plus the merge's read buffers and the largest posting list, whatever the tree's
+// size; a tree that fits the budget never touches disk.
+class PostingSorter {
+public:
+    // `directory`: the index folder (ensure_index_directory), where runs spill and write_index_file publishes.
+    PostingSorter(Handle directory, size_t budget_bytes, unsigned producers)
+        : directory_(std::move(directory)),
+          per_producer_(std::max<size_t>(budget_bytes / sizeof(SpillPosting) / std::max(producers, 1u), 1u << 16)),
+          buffers_(std::max(producers, 1u)) {}
+    // Run files are deleted when their handles close.
+    ~PostingSorter() = default;
+    HANDLE directory() const { return directory_.h; }
+    PostingSorter(const PostingSorter&) = delete;
+    PostingSorter& operator=(const PostingSorter&) = delete;
+
+    // CONTRACT: each producer index is used by one thread at a time.
+    void add(unsigned producer, uint32_t key, uint32_t id, uint16_t masks) {
+        auto& buffer = buffers_[producer];
+        buffer.push_back({key, id, masks, 0});
+        if (buffer.size() >= per_producer_) spill(buffer);
+    }
+    void add_file(unsigned producer, uint32_t id, const std::vector<uint64_t>& grams) {
+        for (uint64_t gram : grams) add(producer, static_cast<uint32_t>(gram >> 16), id, static_cast<uint16_t>(gram));
+    }
+    // Calls on_key once per trigram in key order with its postings in id order. Single use.
+    void merge(const std::function<void(uint32_t key, const std::vector<SpillPosting>&)>& on_key) {
+        struct Run {
+            std::vector<SpillPosting> memory;  // an unspilled buffer, or the read-ahead of a run file
+            size_t at = 0;
+            Handle file;
+            bool more = false;  // the file has unread postings
+        };
+        std::vector<Run> runs;
+        for (auto& buffer : buffers_) {
+            if (buffer.empty()) continue;
+            std::sort(buffer.begin(), buffer.end(), spill_less);
+            Run run;
+            run.memory.swap(buffer);
+            runs.push_back(std::move(run));
+        }
+        const size_t read_ahead = std::max<size_t>(4096, (64u << 20) / sizeof(SpillPosting) / std::max<size_t>(runs_.size(), 1));
+        const auto refill = [&](Run& run) {
+            run.memory.resize(read_ahead);
+            run.at = 0;
+            size_t filled = 0;
+            while (filled < read_ahead) {
+                DWORD got = 0;
+                const auto want = static_cast<DWORD>(std::min<size_t>((read_ahead - filled) * sizeof(SpillPosting), 1u << 24));
+                if (!ReadFile(run.file.h, reinterpret_cast<char*>(run.memory.data() + filled), want, &got, nullptr))
+                    throw std::runtime_error("cannot read an index sort run");
+                if (got == 0) break;
+                if (got % sizeof(SpillPosting)) throw std::runtime_error("truncated index sort run");
+                filled += got / sizeof(SpillPosting);
+            }
+            run.memory.resize(filled);
+            run.more = filled == read_ahead;
+        };
+        for (auto& file : runs_) {
+            Run run;
+            run.file = std::move(file);
+            const LARGE_INTEGER start{};
+            if (!SetFilePointerEx(run.file.h, start, nullptr, FILE_BEGIN)) throw std::runtime_error("cannot read an index sort run");
+            refill(run);
+            if (!run.memory.empty()) runs.push_back(std::move(run));
+        }
+        const auto later = [&](size_t a, size_t b) {
+            return spill_less(runs[b].memory[runs[b].at], runs[a].memory[runs[a].at]);
+        };
+        std::vector<size_t> heap;
+        for (size_t i = 0; i < runs.size(); ++i) heap.push_back(i);
+        std::make_heap(heap.begin(), heap.end(), later);
+        std::vector<SpillPosting> list;
+        uint32_t key = 0;
+        while (!heap.empty()) {
+            std::pop_heap(heap.begin(), heap.end(), later);
+            const size_t index = heap.back();
+            Run& run = runs[index];
+            const SpillPosting posting = run.memory[run.at++];
+            if (!list.empty() && posting.key != key) {
+                on_key(key, list);
+                list.clear();
+            }
+            key = posting.key;
+            if (list.empty() || list.back().id != posting.id) list.push_back(posting);
+            if (run.at == run.memory.size() && run.more) refill(run);
+            if (run.at < run.memory.size()) std::push_heap(heap.begin(), heap.end(), later);
+            else heap.pop_back();
+        }
+        if (!list.empty()) on_key(key, list);
+    }
+
+private:
+    void spill(std::vector<SpillPosting>& buffer) {
+        std::sort(buffer.begin(), buffer.end(), spill_less);
+        // Process-wide: the sorters of several roots spill into the same index folder at once.
+        static std::atomic<uint64_t> serial{0};
+        const std::wstring name = L"sort-" + std::to_wstring(GetCurrentProcessId()) + L"-" +
+                                  std::to_wstring(serial.fetch_add(1)) + L".tmp";
+        // Deleted when the handle closes: by merge(), by the destructor, or by the throw below.
+        Handle file;
+        if (!create_metadata_file(directory_.h, name, FILE_GENERIC_READ | FILE_GENERIC_WRITE, true, file))
+            throw std::runtime_error("cannot create an index sort run");
+        const char* data = reinterpret_cast<const char*>(buffer.data());
+        size_t left = buffer.size() * sizeof(SpillPosting);
+        while (left) {
+            DWORD put = 0;
+            const auto want = static_cast<DWORD>(std::min<size_t>(left, 1u << 24));
+            if (!WriteFile(file.h, data, want, &put, nullptr) || put == 0)
+                throw std::runtime_error("cannot write an index sort run (disk full?)");
+            data += put;
+            left -= put;
+        }
+        {
+            std::lock_guard lock(runs_mutex_);
+            runs_.push_back(std::move(file));
+        }
+        buffer.clear();
+    }
+
+    Handle directory_;
+    size_t per_producer_;
+    std::vector<std::vector<SpillPosting>> buffers_;
+    std::mutex runs_mutex_;
+    std::vector<Handle> runs_;
+};
+
+struct IndexEntry {
+    std::string path;
+    uint64_t size = 0, write_time = 0;
+    uint32_t flags = 0;
+};
+
+// Buffered sequential writer for one index file.
+class IndexWriter {
+public:
+    // Creates `name` in the open index folder `directory`.
+    IndexWriter(HANDLE directory, const std::wstring& name) {
+        if (!create_metadata_file(directory, name, FILE_GENERIC_WRITE, false, file_))
+            throw std::runtime_error("cannot create the index file");
+    }
+    uint64_t position() const { return position_; }
+    HANDLE handle() const { return file_.h; }
+    // Deletes the file once its handle closes.
+    void discard() {
+        FILE_DISPOSITION_INFO info{TRUE};
+        SetFileInformationByHandle(file_.h, FileDispositionInfo, &info, sizeof(info));
+    }
+    void write(const void* data, size_t size) {
+        buffer_.append(static_cast<const char*>(data), size);
+        position_ += size;
+        if (buffer_.size() >= (4u << 20)) flush();
+    }
+    void pad8() {
+        static constexpr char zeros[8] = {};
+        if (position_ % 8) write(zeros, static_cast<size_t>(8 - position_ % 8));
+    }
+    void flush() {
+        write_all(buffer_.data(), buffer_.size());
+        buffer_.clear();
+    }
+    void rewrite_header(const IndexHeader& header) {
+        flush();
+        LARGE_INTEGER start{};
+        if (!SetFilePointerEx(file_.h, start, nullptr, FILE_BEGIN)) throw std::runtime_error("cannot write the index file");
+        write_all(reinterpret_cast<const char*>(&header), sizeof(header));
+    }
+    // Makes the written bytes durable before the file is published by rename, as stage_write does for edits.
+    void sync() {
+        flush();
+        if (!FlushFileBuffers(file_.h)) throw std::runtime_error("cannot flush the index file");
+    }
+
+private:
+    void write_all(const char* data, size_t size) {
+        while (size) {
+            DWORD put = 0;
+            const auto want = static_cast<DWORD>(std::min<size_t>(size, 1u << 24));
+            if (!WriteFile(file_.h, data, want, &put, nullptr) || put == 0)
+                throw std::runtime_error("cannot write the index file (disk full?)");
+            data += put;
+            size -= put;
+        }
+    }
+    Handle file_;
+    std::string buffer_;
+    uint64_t position_ = 0;
+};
+
+// The workspace folder (with a trailing separator, so a drive root stays a folder) and the file name of the index
+// file `file` (index_file_path: <workspace>\.shgrep\index\<name>).
+std::wstring index_workspace(const std::wstring& file) {
+    const size_t name_at = file.rfind(L'\\');
+    const size_t index_at = file.rfind(L'\\', name_at - 1);
+    return file.substr(0, file.rfind(L'\\', index_at - 1) + 1);
+}
+std::wstring index_name(const std::wstring& file) { return file.substr(file.rfind(L'\\') + 1); }
+
+// The index folder of the index file `file`, created (with a self-ignoring .shgrep) when missing and reached only
+// through handles (open_metadata_directory), so a junction at .shgrep or index never redirects the index's writes.
+Handle ensure_index_directory(const std::wstring& file) {
+    Handle dir = open_metadata_directory(index_workspace(file), {cache_directory_name, L"index"}, true);
+    if (!dir)
+        throw std::runtime_error("cannot open the index folder " + utf8(file.substr(0, file.rfind(L'\\'))) +
+                                 "; it cannot be created, or .shgrep or index is a link or junction, which shgrep "
+                                 "never follows");
+    return dir;
+}
+
+// Opens the index file `file` for reading through the same handles; invalid when it or its folder is missing.
+Handle open_index_file(const std::wstring& file) {
+    const Handle dir = open_metadata_directory(index_workspace(file), {cache_directory_name, L"index"}, false);
+    Handle out;
+    if (dir) open_metadata_entry(dir.h, index_name(file), FILE_GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE, out);
+    return out;
+}
+
+// Writes the index of `files` (file id = position) with the sorter's postings and publishes it at `target`.
+// `dense` trigrams are kept as dense whatever their postings say: a merge cannot recover postings a predecessor
+// never stored. Returns the index's size in bytes.
+// COMPAT: a search may hold the current index mapped. Windows refuses to replace a mapped file but lets it be renamed
+// (readers open it with FILE_SHARE_DELETE), so the predecessor moves aside and is deleted once nothing maps it.
+uint64_t write_index_file(const std::wstring& target, const std::string& root_final, const std::vector<IndexEntry>& files,
+                          PostingSorter& sorter, const std::unordered_set<uint32_t>& dense) {
+    // The sorter's folder: every write below goes through its handle (open_metadata_directory).
+    const HANDLE dir = sorter.directory();
+    const std::wstring name = index_name(target);
+    IndexWriter out(dir, name + L"." + std::to_wstring(GetCurrentProcessId()) + L".tmp");
+    uint64_t total = 0;
+    try {
+        IndexHeader header{};
+        std::memcpy(header.magic, index_magic, sizeof(index_magic));
+        FILETIME now{};
+        GetSystemTimeAsFileTime(&now);
+        header.built = static_cast<uint64_t>(now.dwHighDateTime) << 32 | now.dwLowDateTime;
+        header.files = static_cast<uint32_t>(files.size());
+        out.write(&header, sizeof(header));
+        header.root = out.position();
+        header.root_size = root_final.size();
+        out.write(root_final.data(), root_final.size());
+        out.pad8();
+        header.file_table = out.position();
+        uint64_t names = 0;
+        for (const auto& f : files) {
+            if (names + f.path.size() > 0xffffffffu) throw std::runtime_error("tree has too many paths to index");
+            const IndexFile entry{static_cast<uint32_t>(names), static_cast<uint32_t>(f.path.size()), f.size, f.write_time,
+                                  f.flags, 0};
+            out.write(&entry, sizeof(entry));
+            names += f.path.size();
+        }
+        header.names = out.position();
+        header.names_size = names;
+        for (const auto& f : files) out.write(f.path.data(), f.path.size());
+        out.pad8();
+        header.postings = out.position();
+        const auto file_count = static_cast<uint32_t>(files.size());
+        std::vector<IndexTrigram> table;
+        std::string encoded;
+        sorter.merge([&](uint32_t key, const std::vector<SpillPosting>& list) {
+            // A trigram held by more than half of the files rules out too little to pay for its postings.
+            if (dense.count(key) || (file_count >= 16 && list.size() > file_count / 2)) {
+                table.push_back({key, dense_trigram, 0});
+                return;
+            }
+            table.push_back({key, static_cast<uint32_t>(list.size()), out.position() - header.postings});
+            encoded.clear();
+            uint32_t previous = 0;
+            for (const SpillPosting& posting : list) {
+                put_varint(encoded, posting.id - previous);
+                encoded.push_back(static_cast<char>(posting.masks >> 8));
+                encoded.push_back(static_cast<char>(posting.masks & 0xff));
+                previous = posting.id;
+            }
+            out.write(encoded.data(), encoded.size());
+        });
+        header.postings_size = out.position() - header.postings;
+        // Dense trigrams whose files all changed have no postings left but must stay unconstraining.
+        bool added = false;
+        for (uint32_t key : dense) {
+            const auto it = std::lower_bound(table.begin(), table.end(), key,
+                                             [](const IndexTrigram& t, uint32_t k) { return t.key < k; });
+            if (it != table.end() && it->key == key) continue;
+            table.push_back({key, dense_trigram, 0});
+            added = true;
+        }
+        if (added) std::sort(table.begin(), table.end(), [](const IndexTrigram& a, const IndexTrigram& b) { return a.key < b.key; });
+        out.pad8();
+        header.trigram_table = out.position();
+        header.trigrams = static_cast<uint32_t>(table.size());
+        out.write(table.data(), table.size() * sizeof(IndexTrigram));
+        total = out.position();
+        out.rewrite_header(header);
+        out.sync();
+    } catch (...) {
+        out.discard();
+        throw;
+    }
+    if (!rename_metadata_entry(out.handle(), dir, name, true)) {
+        const std::wstring aside = name + L".old." + std::to_wstring(GetCurrentProcessId()) + L"." +
+                                   std::to_wstring(GetTickCount64());
+        Handle current;
+        if (!open_metadata_entry(dir, name, DELETE | FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                 current) ||
+            !rename_metadata_entry(current.h, dir, aside, false) || !rename_metadata_entry(out.handle(), dir, name, true)) {
+            out.discard();
+            throw std::runtime_error("cannot publish the index file");
+        }
+    }
+    // Earlier generations that no search maps any more; a mapped one refuses deletion and waits for a later pass.
+    const std::wstring old = name + L".old.";
+    std::vector<uint64_t> listing(8192);
+    std::vector<DirEntry> entries;
+    if (list_directory(dir, listing, entries))
+        for (const DirEntry& entry : entries)
+            if (entry.name.size() > old.size() &&
+                CompareStringOrdinal(entry.name.data(), static_cast<int>(old.size()), old.data(),
+                                     static_cast<int>(old.size()), TRUE) == CSTR_EQUAL)
+                delete_metadata_entry(dir, entry.name);
+    return total;
+}
+
+struct TreeIndex {
+    std::vector<IndexEntry> files;
+    uint64_t bytes = 0, unreadable = 0;
+};
+
+// Thrown when a live index build passes index_max_files(); the live index then stays off instead of retrying.
+struct IndexTooLarge : std::runtime_error {
+    using std::runtime_error::runtime_error;
+};
+
+// SHGREP_INDEX_MAX_FILES caps how many files the live index build may take; 0 lifts the cap. Default 500000, which
+// fits large monorepos but stops a build that has wandered into a whole disk or user folder.
+uint64_t index_max_files() {
+    constexpr uint64_t fallback = 500000;
+    wchar_t value[20] = {};
+    const DWORD length = GetEnvironmentVariableW(L"SHGREP_INDEX_MAX_FILES", value, 20);
+    if (length == 0 || length >= 20) return fallback;
+    uint64_t n = 0;
+    for (DWORD i = 0; i < length; ++i) {
+        if (value[i] < L'0' || value[i] > L'9') return fallback;
+        n = n * 10 + static_cast<uint64_t>(value[i] - L'0');
+    }
+    return n;
+}
+
+// Walks `root` with search's default selection (.gitignore/.ignore honored, hidden files and binary extensions
+// skipped) and feeds every text file's trigrams to `sorter`; file ids are positions in the result. Binary files are
+// kept without trigrams, so indexed searches skip them as plain searches do; unreadable files are always-candidates.
+// A nonzero max_files stops the walk once that many files are taken and throws IndexTooLarge.
+TreeIndex index_tree(const SearchContext& context, const WalkRoot& root, PostingSorter& sorter, unsigned worker_count,
+                     const std::shared_ptr<std::atomic_bool>& cancelled, uint64_t max_files = 0) {
+    Request r = parse_request("find_files", Json(Json::Object{}), context);
+    r.excluded_directories.push_back(join_path(root.path, cache_directory_name));
+    Control control{cancelled, Clock::now() + std::chrono::hours(24)};
+    Outcome out;
+    struct TreeWorker {
+        TrigramSet trigrams;
+        std::string raw;
+        std::vector<std::pair<uint32_t, IndexEntry>> files;
+    };
+    std::vector<std::unique_ptr<TreeWorker>> workers;
+    for (unsigned i = 0; i < worker_count; ++i) workers.push_back(std::make_unique<TreeWorker>());
+    std::atomic<uint32_t> next_id{0};
+    std::atomic<uint64_t> unreadable{0};
+    std::atomic_bool too_many{false};
+    walk(r, {root}, worker_count, control, out,
+         [&](unsigned index, HANDLE directory, std::wstring_view name, const std::wstring& path, uint64_t listed, uint64_t) {
+             TreeWorker& w = *workers[index];
+             std::string name_utf8;
+             if (!try_utf8(name, name_utf8) || binary_extension(name_utf8)) return;
+             if (max_files && next_id.load() >= max_files) {
+                 too_many = true;
+                 control.stop.store(true);
+                 return;
+             }
+             IndexEntry entry;
+             if (!index_relative(path, root.path, entry.path)) { ++out.errors; return; }
+             entry.size = listed;
+             bool denied = false;
+             Handle h(open_relative(directory, name, false, denied));
+             std::optional<DecodedText> decoded;
+             std::string_view contents;
+             const IndexRead kind = h ? index_text(h.h, std::min<uint64_t>(r.max_file_bytes, whole_text_bytes), w.raw, decoded, contents, entry.size,
+                                                   entry.write_time)
+                                      : IndexRead::unreadable;
+             const uint32_t id = next_id.fetch_add(1);
+             if (kind == IndexRead::unreadable) {
+                 entry.flags = unindexed_file;
+                 ++unreadable;
+             } else if (kind == IndexRead::text) {
+                 w.trigrams.collect(contents);
+                 sorter.add_file(index, id, w.trigrams.grams);
+                 out.bytes += entry.size;
+             }
+             // The buffer is no longer read; do not keep the largest file's size for the rest of the build.
+             if (w.raw.capacity() > retained_text_capacity) std::string().swap(w.raw);
+             w.files.emplace_back(id, std::move(entry));
+         }, nullptr);
+    if (too_many)
+        throw IndexTooLarge("more than " + std::to_string(max_files) + " files (set SHGREP_INDEX_MAX_FILES to raise the limit, 0 for none)");
+    if (out.failure) std::rethrow_exception(out.failure);
+    if (const char* why = control.interrupted()) throw std::runtime_error(std::string("index build ") + why);
+    TreeIndex tree;
+    tree.files.resize(next_id.load());
+    for (auto& w : workers)
+        for (auto& [id, entry] : w->files) tree.files[id] = std::move(entry);
+    tree.bytes = out.bytes.load();
+    tree.unreadable = unreadable.load();
+    return tree;
+}
+
+unsigned index_workers() {
+    const DWORD processors = GetActiveProcessorCount(ALL_PROCESSOR_GROUPS);
+    return processors == 0 ? 1u : static_cast<unsigned>(processors);
+}
+
+// `shgrep index`: one snapshot per configured root.
+Json build_index(const SearchContext& context, const std::shared_ptr<std::atomic_bool>& cancelled) {
+    std::string text;
+    for (const auto& allowed : context.allowed_roots) {
+        const auto started = Clock::now();
+        Handle root(CreateFileW(absolute_long_path(allowed).c_str(), FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr));
+        if (!root) throw std::runtime_error("configured root unavailable: " + utf8(allowed.wstring()));
+        const WalkRoot walk_root{fs::absolute(allowed).lexically_normal().wstring(), final_path(root.h)};
+        std::string root_final;
+        if (!try_utf8(walk_root.final, root_final)) throw std::runtime_error("root path is not valid Unicode");
+        const std::wstring file = index_file_path(context, walk_root.final);
+        if (file.empty()) throw std::runtime_error("cannot locate the workspace .shgrep directory");
+        const unsigned workers = index_workers();
+        PostingSorter sorter(ensure_index_directory(file), index_sort_budget, workers);
+        const TreeIndex tree = index_tree(context, walk_root, sorter, workers, cancelled);
+        const uint64_t index_bytes = write_index_file(file, root_final, tree.files, sorter, {});
+        const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - started).count();
+        std::string file_utf8;
+        try_utf8(file, file_utf8);
+        text += "Indexed " + std::to_string(tree.files.size()) + " files (" + std::to_string(tree.bytes >> 20) +
+                " MiB of text) under " + utf8(walk_root.path) + " in " + std::to_string(ms) + " ms.\nIndex: " +
+                file_utf8 + " (" + std::to_string(index_bytes >> 10) + " KiB)";
+        if (tree.unreadable) text += "; " + std::to_string(tree.unreadable) + " unreadable files are always searched";
+        text += ".\n";
+    }
+    return Json::Object{{"text", std::move(text)}, {"summary", Json::Object{{"status", std::string("complete")}}}};
+}
+
+// One index file mapped read-only.
+class IndexView {
+public:
+    IndexView(const std::wstring& file, const std::wstring& root_final) {
+        file_ = open_index_file(file);
+        LARGE_INTEGER length{};
+        if (!file_ || !GetFileSizeEx(file_.h, &length) || length.QuadPart < static_cast<LONGLONG>(sizeof(IndexHeader)))
+            return;
+        const HANDLE section = CreateFileMappingW(file_.h, nullptr, PAGE_READONLY, 0, 0, nullptr);
+        if (!section) return;
+        section_ = Handle(section);
+        base_.reset(static_cast<const char*>(MapViewOfFile(section_.h, FILE_MAP_READ, 0, 0, 0)));
+        size_ = static_cast<uint64_t>(length.QuadPart);
+        if (!base_ || !validate(root_final)) unmap();
+    }
+    ~IndexView() = default;
+    IndexView(const IndexView&) = delete;
+    IndexView& operator=(const IndexView&) = delete;
+    explicit operator bool() const { return base_ != nullptr; }
+
+    uint32_t files() const { return header_.files; }
+    uint64_t built() const { return header_.built; }
+    std::string_view path(uint32_t id) const {
+        const IndexFile& f = file_table()[id];
+        return std::string_view(base_.get() + header_.names + f.name, f.name_size);
+    }
+    uint64_t file_size(uint32_t id) const { return file_table()[id].size; }
+    uint64_t write_time(uint32_t id) const { return file_table()[id].write_time; }
+    uint32_t flags(uint32_t id) const { return file_table()[id].flags; }
+    uint32_t trigram_count() const { return header_.trigrams; }
+    const IndexTrigram& trigram_at(uint32_t i) const { return trigram_table()[i]; }
+    const IndexTrigram* trigram(uint32_t key) const {
+        const IndexTrigram* first = trigram_table();
+        const IndexTrigram* last = first + header_.trigrams;
+        const IndexTrigram* it = std::lower_bound(first, last, key, [](const IndexTrigram& t, uint32_t k) { return t.key < k; });
+        return it != last && it->key == key ? it : nullptr;
+    }
+    // False when the list is dense or malformed.
+    bool postings(const IndexTrigram& t, std::vector<IndexPosting>& out) const {
+        out.clear();
+        if (t.count == dense_trigram || t.offset > header_.postings_size) return false;
+        const auto* p = reinterpret_cast<const unsigned char*>(base_.get() + header_.postings + t.offset);
+        const auto* end = reinterpret_cast<const unsigned char*>(base_.get() + header_.postings + header_.postings_size);
+        out.reserve(t.count);
+        uint32_t id = 0;
+        for (uint32_t i = 0; i < t.count; ++i) {
+            uint32_t delta = 0;
+            for (int shift = 0;; shift += 7) {
+                if (p == end || shift > 28) return false;
+                const unsigned char b = *p++;
+                delta |= static_cast<uint32_t>(b & 0x7f) << shift;
+                if (!(b & 0x80)) break;
+            }
+            if (end - p < 2) return false;
+            id += delta;
+            if (id >= header_.files || (i && delta == 0)) return false;
+            out.push_back({id, p[0], p[1]});
+            p += 2;
+        }
+        return true;
+    }
+
+private:
+    const IndexFile* file_table() const { return reinterpret_cast<const IndexFile*>(base_.get() + header_.file_table); }
+    const IndexTrigram* trigram_table() const { return reinterpret_cast<const IndexTrigram*>(base_.get() + header_.trigram_table); }
+    bool fits(uint64_t offset, uint64_t bytes) const { return offset <= size_ && bytes <= size_ - offset; }
+    bool validate(const std::wstring& root_final) {
+        std::memcpy(&header_, base_.get(), sizeof(header_));
+        if (std::memcmp(header_.magic, index_magic, sizeof(index_magic)) != 0) return false;
+        if (!fits(header_.root, header_.root_size) || !fits(header_.names, header_.names_size) ||
+            !fits(header_.postings, header_.postings_size) || header_.file_table % 8 || header_.trigram_table % 8 ||
+            !fits(header_.file_table, uint64_t{header_.files} * sizeof(IndexFile)) ||
+            !fits(header_.trigram_table, uint64_t{header_.trigrams} * sizeof(IndexTrigram)))
+            return false;
+        std::string expected;
+        if (!try_utf8(root_final, expected) ||
+            std::string_view(base_.get() + header_.root, static_cast<size_t>(header_.root_size)) != expected)
+            return false;
+        for (uint32_t i = 0; i < header_.files; ++i) {
+            const IndexFile& f = file_table()[i];
+            if (uint64_t{f.name} + f.name_size > header_.names_size) return false;
+            const std::string_view name(base_.get() + header_.names + f.name, f.name_size);
+            if (name.empty() || !valid_utf8(name) || name.find_first_of("\\:") != std::string_view::npos ||
+                name.find('\0') != std::string_view::npos) return false;
+            for (size_t start = 0;;) {
+                const size_t slash = name.find('/', start);
+                const auto part = name.substr(start, slash == std::string_view::npos ? slash : slash - start);
+                if (part.empty() || part == "." || part == "..") return false;
+                if (slash == std::string_view::npos) break;
+                start = slash + 1;
+            }
+        }
+        // SAFETY: postings() reserves `count` entries, so a list must fit the bytes it claims: an entry takes at least 3
+        //   (a varint id delta and two masks) and ids rise below `files`. trigram() binary-searches, so keys must rise.
+        //   A malformed table rejects the whole index, and searches walk.
+        for (uint32_t i = 0; i < header_.trigrams; ++i) {
+            const IndexTrigram& t = trigram_table()[i];
+            if (i && t.key <= trigram_table()[i - 1].key) return false;
+            if (t.count == dense_trigram) continue;
+            if (t.count > header_.files || t.offset > header_.postings_size ||
+                uint64_t{t.count} * 3 > header_.postings_size - t.offset)
+                return false;
+        }
+        return true;
+    }
+    void unmap() {
+        base_.reset();
+        section_.close();
+    }
+
+    struct ViewDeleter {
+        void operator()(const char* value) const noexcept { UnmapViewOfFile(value); }
+    };
+    // Reverse destruction keeps the section and file alive until the view is unmapped.
+    Handle file_, section_;
+    std::unique_ptr<const char, ViewDeleter> base_;
+    uint64_t size_ = 0;
+    IndexHeader header_{};
+};
+
+// A conservative trigram query: every match of the pattern satisfies the node. all constrains nothing; literal
+// requires its text; and/or combine children.
+struct QueryNode {
+    enum Kind : uint8_t { all, literal, and_, or_ } kind = all;
+    std::string text;
+    std::vector<QueryNode> children;
+};
+
+// Plans a PCRE-syntax regex into a QueryNode. Anything not understood becomes `all` for its part, so the plan can
+// only be weaker than the regex, never stronger: a literal run ends at classes, '.', anchors, escapes that are not
+// literal characters, and quantifiers, and a quantified character keeps only what every repetition count implies.
+class QueryPlanner {
+public:
+    explicit QueryPlanner(std::string_view pattern) : p_(pattern) {}
+    QueryNode plan() {
+        QueryNode node = alternation();
+        // Unparsed text (a stray ')') or (?x), where whitespace and comments are not literal, plans to nothing.
+        if (failed_ || extended_ || pos_ != p_.size()) return {};
+        return node;
+    }
+    bool insensitive() const { return insensitive_; }
+
+private:
+    struct Atom {
+        bool is_char = false;  // one literal code point, in `chars`
+        std::string chars;
+        QueryNode node;
+    };
+    struct Quant {
+        uint32_t min = 1, max = 1;  // max 0: unbounded
+    };
+
+    QueryNode alternation() {
+        std::vector<QueryNode> branches;
+        branches.push_back(concat());
+        while (!failed_ && pos_ < p_.size() && p_[pos_] == '|') {
+            ++pos_;
+            branches.push_back(concat());
+        }
+        if (branches.size() == 1) return std::move(branches.front());
+        QueryNode node;
+        node.kind = QueryNode::or_;
+        node.children = std::move(branches);
+        return node;
+    }
+
+    QueryNode concat() {
+        QueryNode node;
+        node.kind = QueryNode::and_;
+        std::string run;
+        const auto flush = [&] {
+            if (run.empty()) return;
+            QueryNode literal;
+            literal.kind = QueryNode::literal;
+            literal.text = std::move(run);
+            node.children.push_back(std::move(literal));
+            run.clear();
+        };
+        while (!failed_ && pos_ < p_.size() && p_[pos_] != '|' && p_[pos_] != ')') {
+            Atom a = atom();
+            if (failed_) break;
+            const Quant q = quantifier();
+            if (failed_) break;
+            if (a.is_char) {
+                if (q.min == 0) { flush(); continue; }
+                run += a.chars;
+                // Repeated: a run cannot cross the repeats, but whatever follows still follows this character.
+                if (q.max != 1) {
+                    flush();
+                    run = a.chars;
+                }
+                continue;
+            }
+            flush();
+            if (q.min >= 1 && a.node.kind != QueryNode::all) node.children.push_back(std::move(a.node));
+        }
+        flush();
+        return node;
+    }
+
+    void skip_until(char close) {
+        const size_t end = p_.find(close, pos_);
+        if (end == std::string_view::npos) failed_ = true;
+        else pos_ = end + 1;
+    }
+
+    Atom atom() {
+        Atom a;
+        const char c = p_[pos_];
+        if (c == '(') {
+            ++pos_;
+            bool consuming = true;
+            if (pos_ < p_.size() && p_[pos_] == '?') {
+                if (++pos_ >= p_.size()) { failed_ = true; return a; }
+                const char k = p_[pos_];
+                if (k == ':' || k == '>' || k == '|') {
+                    ++pos_;
+                } else if (k == '=' || k == '!') {
+                    ++pos_;
+                    consuming = false;  // lookahead
+                } else if (k == '<' && pos_ + 1 < p_.size() && (p_[pos_ + 1] == '=' || p_[pos_ + 1] == '!')) {
+                    pos_ += 2;
+                    consuming = false;  // lookbehind
+                } else if (k == '<' || k == '\'') {
+                    ++pos_;
+                    skip_until(k == '<' ? '>' : '\'');  // named group
+                } else if (k == 'P' && pos_ + 1 < p_.size() && p_[pos_ + 1] == '<') {
+                    pos_ += 2;
+                    skip_until('>');
+                } else {
+                    // Inline options: (?i), (?i:...), (?-s) and so on.
+                    while (pos_ < p_.size() && (std::isalpha(static_cast<unsigned char>(p_[pos_])) || p_[pos_] == '-')) {
+                        if (p_[pos_] == 'i') insensitive_ = true;
+                        if (p_[pos_] == 'x') extended_ = true;
+                        ++pos_;
+                    }
+                    if (pos_ < p_.size() && p_[pos_] == ')') {
+                        ++pos_;
+                        return a;  // options only: matches nothing by itself
+                    }
+                    if (pos_ < p_.size() && p_[pos_] == ':') ++pos_;
+                    else { failed_ = true; return a; }
+                }
+                if (failed_) return a;
+            }
+            QueryNode inner = alternation();
+            if (failed_ || pos_ >= p_.size() || p_[pos_] != ')') { failed_ = true; return a; }
+            ++pos_;
+            if (consuming) a.node = std::move(inner);
+            return a;
+        }
+        if (c == '[') {
+            ++pos_;
+            if (pos_ < p_.size() && p_[pos_] == '^') ++pos_;
+            if (pos_ < p_.size() && p_[pos_] == ']') ++pos_;
+            while (pos_ < p_.size() && p_[pos_] != ']') {
+                if (p_[pos_] == '\\') pos_ += 2;
+                else if (p_[pos_] == '[' && pos_ + 1 < p_.size() && p_[pos_ + 1] == ':') {
+                    const size_t end = p_.find(":]", pos_ + 2);
+                    if (end == std::string_view::npos) { failed_ = true; return a; }
+                    pos_ = end + 2;
+                } else {
+                    ++pos_;
+                }
+            }
+            if (pos_ >= p_.size()) { failed_ = true; return a; }
+            ++pos_;
+            return a;
+        }
+        if (c == '.' || c == '^' || c == '$') {
+            ++pos_;
+            return a;
+        }
+        if (c == '*' || c == '+' || c == '?' || c == '{') {
+            failed_ = true;  // a quantifier with nothing to repeat, or a '{' that is not one
+            return a;
+        }
+        if (c == '\\') return escape();
+        return literal_char(a);
+    }
+
+    Atom& literal_char(Atom& a) {
+        const auto lead = static_cast<unsigned char>(p_[pos_]);
+        const size_t length = lead < 0x80 ? 1 : lead >= 0xf0 ? 4 : lead >= 0xe0 ? 3 : 2;
+        if (pos_ + length > p_.size()) { failed_ = true; return a; }
+        a.is_char = true;
+        a.chars.assign(p_.substr(pos_, length));
+        pos_ += length;
+        return a;
+    }
+
+    Atom escape() {
+        Atom a;
+        if (++pos_ >= p_.size()) { failed_ = true; return a; }
+        const char e = p_[pos_];
+        const auto single = [&](char value) {
+            ++pos_;
+            a.is_char = true;
+            a.chars.assign(1, value);
+            return a;
+        };
+        switch (e) {
+        case 't': return single('\t');
+        case 'n': return single('\n');
+        case 'r': return single('\r');
+        case 'f': return single('\f');
+        case 'e': return single('\x1b');
+        case 'a': return single('\a');
+        case 'x': {
+            ++pos_;
+            if (pos_ < p_.size() && p_[pos_] == '{') { skip_until('}'); return a; }
+            uint32_t value = 0;
+            size_t digits = 0;
+            while (digits < 2 && pos_ < p_.size() && std::isxdigit(static_cast<unsigned char>(p_[pos_]))) {
+                const char d = static_cast<char>(std::tolower(static_cast<unsigned char>(p_[pos_])));
+                value = value * 16 + static_cast<uint32_t>(d <= '9' ? d - '0' : d - 'a' + 10);
+                ++pos_;
+                ++digits;
+            }
+            if (digits && value && value < 0x80) {
+                a.is_char = true;
+                a.chars.assign(1, static_cast<char>(value));
+            }
+            return a;
+        }
+        case 'Q': {
+            ++pos_;
+            const size_t end = p_.find("\\E", pos_);
+            const size_t stop = end == std::string_view::npos ? p_.size() : end;
+            if (stop > pos_) {
+                a.node.kind = QueryNode::literal;
+                a.node.text.assign(p_.substr(pos_, stop - pos_));
+            }
+            pos_ = end == std::string_view::npos ? p_.size() : end + 2;
+            return a;
+        }
+        case 'p': case 'P': case 'o': case 'N':
+            ++pos_;
+            if (pos_ < p_.size() && p_[pos_] == '{') skip_until('}');
+            else if ((e == 'p' || e == 'P') && pos_ < p_.size()) ++pos_;
+            return a;
+        case 'k': case 'g':
+            ++pos_;
+            if (pos_ < p_.size() && (p_[pos_] == '<' || p_[pos_] == '{' || p_[pos_] == '\'')) {
+                skip_until(p_[pos_] == '<' ? '>' : p_[pos_] == '{' ? '}' : '\'');
+            } else {
+                if (pos_ < p_.size() && p_[pos_] == '-') ++pos_;
+                while (pos_ < p_.size() && std::isdigit(static_cast<unsigned char>(p_[pos_]))) ++pos_;
+            }
+            return a;
+        case 'c':
+            pos_ += 2;
+            if (pos_ > p_.size()) failed_ = true;
+            return a;
+        default:
+            break;
+        }
+        if (std::isdigit(static_cast<unsigned char>(e))) {
+            while (pos_ < p_.size() && std::isdigit(static_cast<unsigned char>(p_[pos_]))) ++pos_;  // backreference or octal
+            return a;
+        }
+        if (std::isalpha(static_cast<unsigned char>(e))) {
+            ++pos_;  // \d \w \s \b \B \A \z \Z \G \h \v \R \X \K \E ...: a class or an assertion
+            return a;
+        }
+        return literal_char(a);  // escaped punctuation, or any escaped non-ASCII character, is itself
+    }
+
+    Quant quantifier() {
+        Quant q;
+        if (pos_ >= p_.size()) return q;
+        const char c = p_[pos_];
+        if (c == '*') q = {0, 0};
+        else if (c == '+') q = {1, 0};
+        else if (c == '?') q = {0, 1};
+        else if (c == '{') {
+            size_t at = pos_ + 1;
+            const auto number = [&](uint32_t& value) {
+                const size_t first = at;
+                value = 0;
+                while (at < p_.size() && std::isdigit(static_cast<unsigned char>(p_[at])) && at - first < 9)
+                    value = value * 10 + static_cast<uint32_t>(p_[at++] - '0');
+                return at > first;
+            };
+            uint32_t low = 0, high = 0;
+            if (!number(low)) return q;  // not a quantifier: the next atom fails the plan
+            high = low;
+            if (at < p_.size() && p_[at] == ',') {
+                ++at;
+                if (!number(high)) high = 0;
+            }
+            if (at >= p_.size() || p_[at] != '}') return q;
+            q = {low, high};
+            pos_ = at;
+        } else {
+            return q;
+        }
+        ++pos_;
+        if (pos_ < p_.size() && (p_[pos_] == '?' || p_[pos_] == '+')) ++pos_;  // lazy or possessive
+        return q;
+    }
+
+    std::string_view p_;
+    size_t pos_ = 0;
+    bool failed_ = false, extended_ = false, insensitive_ = false;
+};
+
+using IdSet = std::optional<std::vector<uint32_t>>;  // nullopt: every indexed file
+
+// Files that held every non-dense trigram of `text`, consecutive trigrams at consecutive offsets per their location
+// masks, each followed by the literal's next byte per its next-byte mask.
+IdSet literal_candidates(const IndexView& index, std::string_view text, bool insensitive) {
+    struct Gram {
+        size_t offset;
+        int next;  // the folded byte after the trigram in the literal, % 8; -1 when unknown
+        const IndexTrigram* entry;
+        size_t uncertain;  // loose bytes before offset
+    };
+    const auto loose = [&](size_t i) { return insensitive && index_unfoldable(text[i]); };
+    std::vector<Gram> grams;
+    size_t uncertain = 0;
+    for (size_t i = 0; i + 3 <= text.size(); ++i) {
+        if (i && loose(i - 1)) ++uncertain;
+        // Unicode case folding can match other bytes than such a trigram holds.
+        if (loose(i) || loose(i + 1) || loose(i + 2)) continue;
+        const uint32_t key = index_fold(text[i]) << 16 | index_fold(text[i + 1]) << 8 | index_fold(text[i + 2]);
+        const IndexTrigram* entry = index.trigram(key);
+        if (!entry) return std::vector<uint32_t>{};  // no indexed file held it
+        if (entry->count == dense_trigram) continue;
+        const bool next_known = i + 3 < text.size() && !loose(i + 3);
+        grams.push_back({i, next_known ? static_cast<int>(index_fold(text[i + 3]) & 7) : -1, entry, uncertain});
+    }
+    if (grams.empty()) return std::nullopt;
+    std::vector<std::vector<IndexPosting>> lists(grams.size());
+    size_t driver = 0;
+    for (size_t k = 0; k < grams.size(); ++k) {
+        if (!index.postings(*grams[k].entry, lists[k])) return std::nullopt;
+        if (lists[k].size() < lists[driver].size()) driver = k;
+    }
+    std::vector<size_t> cursor(grams.size(), 0);
+    std::vector<const IndexPosting*> found(grams.size(), nullptr);
+    std::vector<uint32_t> out;
+    for (const IndexPosting& candidate : lists[driver]) {
+        bool present = true, exhausted = false;
+        for (size_t k = 0; k < grams.size() && present; ++k) {
+            if (k == driver) { found[k] = &candidate; continue; }
+            const auto& list = lists[k];
+            size_t& c = cursor[k];
+            while (c < list.size() && list[c].id < candidate.id) ++c;
+            if (c == list.size()) exhausted = true;
+            if (c == list.size() || list[c].id != candidate.id) present = false;
+            else found[k] = &list[c];
+        }
+        if (exhausted) break;
+        if (!present) continue;
+        bool fits = true;
+        for (size_t k = 0; k < grams.size() && fits; ++k)
+            if (grams[k].next >= 0 && !(found[k]->next & (1u << grams[k].next))) fits = false;
+        for (size_t k = 1; k < grams.size() && fits; ++k) {
+            // A loose byte between the two can match a character of another width (k: U+212A takes 3 bytes), so
+            // their distance in the file is unknown.
+            if (grams[k].uncertain != grams[k - 1].uncertain) continue;
+            const auto shift = static_cast<unsigned>((grams[k].offset - grams[k - 1].offset) & 7);
+            const unsigned loc = found[k - 1]->loc;
+            const auto rotated = static_cast<uint8_t>(loc << shift | loc >> ((8 - shift) & 7));
+            if (!(rotated & found[k]->loc)) fits = false;
+        }
+        if (fits) out.push_back(candidate.id);
+    }
+    return out;
+}
+
+IdSet evaluate_query(const IndexView& index, const QueryNode& node, bool insensitive) {
+    switch (node.kind) {
+    case QueryNode::all:
+        return std::nullopt;
+    case QueryNode::literal:
+        return literal_candidates(index, node.text, insensitive);
+    case QueryNode::and_: {
+        IdSet result;
+        std::vector<uint32_t> merged;
+        for (const auto& child : node.children) {
+            IdSet ids = evaluate_query(index, child, insensitive);
+            if (!ids) continue;
+            if (!result) result = std::move(ids);
+            else {
+                merged.clear();
+                std::set_intersection(result->begin(), result->end(), ids->begin(), ids->end(), std::back_inserter(merged));
+                result->swap(merged);
+            }
+            if (result->empty()) break;
+        }
+        return result;
+    }
+    case QueryNode::or_: {
+        std::vector<uint32_t> result, merged;
+        for (const auto& child : node.children) {
+            IdSet ids = evaluate_query(index, child, insensitive);
+            if (!ids) return std::nullopt;
+            merged.clear();
+            std::set_union(result.begin(), result.end(), ids->begin(), ids->end(), std::back_inserter(merged));
+            result.swap(merged);
+        }
+        return result;
+    }
+    }
+    return std::nullopt;
+}
+
+struct PatternPlan {
+    QueryNode node;
+    bool insensitive = false;
+};
+
+std::vector<PatternPlan> plan_patterns(const Request& r) {
+    std::vector<PatternPlan> plans;
+    for (const auto& pattern : r.patterns) {
+        PatternPlan plan;
+        plan.insensitive = r.insensitive;
+        if (r.mode == "regex") {
+            QueryPlanner planner(pattern);
+            plan.node = planner.plan();
+            plan.insensitive = plan.insensitive || planner.insensitive();
+        } else {
+            plan.node.kind = QueryNode::literal;
+            plan.node.text = pattern;
+        }
+        plans.push_back(std::move(plan));
+    }
+    return plans;
+}
+
+// Files of `index` that may hold a match of some pattern, plus its always-candidates; nullopt when some pattern
+// plans to nothing the index can look up.
+IdSet base_candidates(const IndexView& index, const std::vector<PatternPlan>& plans) {
+    std::vector<uint32_t> result, merged;
+    for (const auto& plan : plans) {
+        IdSet ids = evaluate_query(index, plan.node, plan.insensitive);
+        if (!ids) return std::nullopt;
+        merged.clear();
+        std::set_union(result.begin(), result.end(), ids->begin(), ids->end(), std::back_inserter(merged));
+        result.swap(merged);
+    }
+    std::vector<uint32_t> always;
+    for (uint32_t id = 0; id < index.files(); ++id)
+        if (index.flags(id) & unindexed_file) always.push_back(id);
+    merged.clear();
+    std::set_union(result.begin(), result.end(), always.begin(), always.end(), std::back_inserter(merged));
+    return merged;
+}
+
+// literal_candidates for one file whose trigrams are known exactly (a live-index overlay entry).
+bool literal_in_grams(const std::vector<uint64_t>& grams, std::string_view text, bool insensitive) {
+    struct Gram {
+        size_t offset;
+        int next;
+        unsigned loc, follow;
+        size_t uncertain;  // loose bytes before offset
+    };
+    const auto loose = [&](size_t i) { return insensitive && index_unfoldable(text[i]); };
+    std::vector<Gram> found;
+    size_t uncertain = 0;
+    for (size_t i = 0; i + 3 <= text.size(); ++i) {
+        if (i && loose(i - 1)) ++uncertain;
+        if (loose(i) || loose(i + 1) || loose(i + 2)) continue;
+        const uint64_t key = index_fold(text[i]) << 16 | index_fold(text[i + 1]) << 8 | index_fold(text[i + 2]);
+        const auto it = std::lower_bound(grams.begin(), grams.end(), key, [](uint64_t g, uint64_t k) { return (g >> 16) < k; });
+        if (it == grams.end() || (*it >> 16) != key) return false;
+        const bool next_known = i + 3 < text.size() && !loose(i + 3);
+        found.push_back({i, next_known ? static_cast<int>(index_fold(text[i + 3]) & 7) : -1,
+                         static_cast<unsigned>((*it >> 8) & 0xff), static_cast<unsigned>(*it & 0xff), uncertain});
+    }
+    for (size_t k = 0; k < found.size(); ++k)
+        if (found[k].next >= 0 && !(found[k].follow & (1u << found[k].next))) return false;
+    for (size_t k = 1; k < found.size(); ++k) {
+        if (found[k].uncertain != found[k - 1].uncertain) continue;  // as in literal_candidates
+        const auto shift = static_cast<unsigned>((found[k].offset - found[k - 1].offset) & 7);
+        const unsigned loc = found[k - 1].loc;
+        if (!(static_cast<uint8_t>(loc << shift | loc >> ((8 - shift) & 7)) & found[k].loc)) return false;
+    }
+    return true;
+}
+
+bool node_in_grams(const std::vector<uint64_t>& grams, const QueryNode& node, bool insensitive) {
+    switch (node.kind) {
+    case QueryNode::all:
+        return true;
+    case QueryNode::literal:
+        return literal_in_grams(grams, node.text, insensitive);
+    case QueryNode::and_:
+        for (const auto& child : node.children)
+            if (!node_in_grams(grams, child, insensitive)) return false;
+        return true;
+    case QueryNode::or_:
+        for (const auto& child : node.children)
+            if (node_in_grams(grams, child, insensitive)) return true;
+        return false;
+    }
+    return true;
+}
+
+bool file_may_match(const std::vector<uint64_t>& grams, const std::vector<PatternPlan>& plans) {
+    for (const auto& plan : plans)
+        if (node_in_grams(grams, plan.node, plan.insensitive)) return true;
+    return false;
+}
+
+struct IndexCandidate {
+    std::string path;  // '/'-separated, below the root
+    uint64_t size;
+};
+
+struct IndexUse {
+    std::wstring root;  // walk root path, as file paths start
+    std::vector<IndexCandidate> candidates;  // sorted by path, so consecutive candidates share directories
+    uint64_t indexed_files = 0;
+};
+
+// The candidate's directories and name pass the request's filters, as visit_directory would have applied them.
+bool index_path_passes(const Request& r, std::string_view relative, std::string_view name) {
+    thread_local std::string prefix, part;
+    size_t start = 0;
+    for (size_t slash = relative.find('/'); slash != std::string_view::npos; slash = relative.find('/', slash + 1)) {
+        prefix.assign(relative.substr(0, slash));
+        part.assign(relative.substr(start, slash - start));
+        if (!path_passes(r, prefix, part, true)) return false;
+        start = slash + 1;
+    }
+    part.assign(name);
+    prefix.assign(relative);
+    return name_prefilter(r, part) && path_passes(r, prefix, part, false);
+}
+
+// One worker's open directory chain below an indexed root, reused while candidates stay in the same directory.
+// SAFETY: each component is opened by name relative to its parent's handle with FILE_OPEN_REPARSE_POINT, as the
+// walk does, so a junction or symlink below the root is opened as itself and nothing below it resolves.
+struct DirCursor {
+    NTSTATUS last_status = 0;
+    std::vector<std::string> parts;
+    std::vector<Handle> handles;  // handles[i] is the directory parts[0..i]
+    std::wstring wide;
+    HANDLE open(HANDLE root, std::string_view directory) {
+        size_t depth = 0, start = 0;
+        bool matching = true;
+        while (!directory.empty() && start <= directory.size()) {
+            size_t slash = directory.find('/', start);
+            if (slash == std::string_view::npos) slash = directory.size();
+            const std::string_view part = directory.substr(start, slash - start);
+            start = slash + 1;
+            if (matching && depth < parts.size() && parts[depth] == part) {
+                ++depth;
+                continue;
+            }
+            if (matching) {
+                parts.resize(depth);
+                handles.resize(depth);
+                matching = false;
+            }
+            const HANDLE parent = handles.empty() ? root : handles.back().h;
+            bool denied = false;
+            if (!index_widen(part, wide)) {
+                last_status = static_cast<NTSTATUS>(0xC0000033L);
+                return INVALID_HANDLE_VALUE;
+            }
+            Handle child(open_relative(parent, wide, true, denied, &last_status));
+            if (!child) return INVALID_HANDLE_VALUE;
+            parts.emplace_back(part);
+            handles.push_back(std::move(child));
+            ++depth;
+        }
+        if (matching) {
+            parts.resize(depth);
+            handles.resize(depth);
+        }
+        return handles.empty() ? root : handles.back().h;
+    }
+};
+
+// Scans one indexed root's candidates instead of walking it.
+void scan_index(const Request& r, const IndexUse& use, unsigned worker_count, Control& control, Outcome& out,
+                const FileVisitor& on_file) {
+    Handle root(open_root_directory(use.root));
+    if (!root) { ++out.errors; return; }
+    std::atomic<size_t> next{0};
+    constexpr size_t chunk = 16;  // consecutive candidates share directories, so a worker takes them in runs
+    auto run = [&](unsigned worker) {
+        DirCursor cursor;
+        std::wstring relative, full;
+        for (;;) {
+            if (control.stop.load()) return;
+            if (const char* why = control.interrupted()) { finish(out, control, why); return; }
+            const size_t first = next.fetch_add(chunk);
+            if (first >= use.candidates.size()) return;
+            const size_t last = std::min(first + chunk, use.candidates.size());
+            for (size_t i = first; i < last && !control.stop.load(); ++i) {
+                const std::string_view path = use.candidates[i].path;
+                const size_t slash = path.rfind('/');
+                const std::string_view directory = slash == std::string_view::npos ? std::string_view() : path.substr(0, slash);
+                const std::string_view name = slash == std::string_view::npos ? path : path.substr(slash + 1);
+                ++out.regular_seen;
+                if (!index_path_passes(r, path, name)) { ++out.files_filtered; continue; }
+                const HANDLE dir = cursor.open(root.h, directory);
+                if (dir == INVALID_HANDLE_VALUE) { ++out.index_missing; continue; }
+                if (!index_widen(path, relative)) { ++out.errors; continue; }
+                std::replace(relative.begin(), relative.end(), L'/', L'\\');
+                full = join_path(use.root, relative);
+                const size_t cut = relative.rfind(L'\\');
+                const std::wstring_view wide_name = cut == std::wstring::npos ? std::wstring_view(relative)
+                                                                               : std::wstring_view(relative).substr(cut + 1);
+                try {
+                    on_file(worker, dir, wide_name, full, use.candidates[i].size, 0);
+                } catch (...) {
+                    fail(out, control, std::current_exception());
+                    return;
+                }
+            }
+        }
+    };
+    auto crew = take_crew(worker_count);
+    crew->run(run);
+    park_crew(std::move(crew));
+}
+
+// Opens a file or directory below `parent` by its single name without following a link, with its basic and
+// standard information. `access` FILE_READ_ATTRIBUTES | SYNCHRONIZE only reads attributes, which no sharing mode
+// refuses.
+HANDLE open_entry(HANDLE parent, std::wstring_view name, FILE_BASIC_INFO& basic, FILE_STANDARD_INFO& standard,
+                  NTSTATUS& status, ACCESS_MASK access = FILE_GENERIC_READ) {
+    constexpr ULONG file_open = 0x00000001;           // FILE_OPEN
+    constexpr ULONG synchronous_io = 0x00000020;      // FILE_SYNCHRONOUS_IO_NONALERT
+    constexpr ULONG open_reparse_point = 0x00200000;  // FILE_OPEN_REPARSE_POINT
+    UNICODE_STRING object_name;
+    object_name.Buffer = const_cast<PWSTR>(name.data());
+    object_name.Length = object_name.MaximumLength = static_cast<USHORT>(name.size() * sizeof(wchar_t));
+    OBJECT_ATTRIBUTES attributes{};
+    attributes.Length = sizeof(attributes);
+    attributes.RootDirectory = parent;
+    attributes.ObjectName = &object_name;
+    IO_STATUS_BLOCK io{};
+    HANDLE handle = nullptr;
+    status = NtCreateFile(&handle, access, &attributes, &io, nullptr, 0,
+                          FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, file_open,
+                          synchronous_io | open_reparse_point, nullptr, 0);
+    if (status < 0) return INVALID_HANDLE_VALUE;
+    if (!GetFileInformationByHandleEx(handle, FileBasicInfo, &basic, sizeof(basic)) ||
+        !GetFileInformationByHandleEx(handle, FileStandardInfo, &standard, sizeof(standard))) {
+        CloseHandle(handle);
+        return INVALID_HANDLE_VALUE;
+    }
+    return handle;
+}
+
+// One overlay entry of a live index: a file changed or removed since the base index was written.
+struct OverlayFile {
+    uint64_t size = 0, write_time = 0, seq = 0;
+    uint32_t flags = 0;
+    bool removed = false;
+    std::vector<uint64_t> grams;  // TrigramSet::grams
+};
+
+// Owner-approved (2026-10-09): the MCP server's live index for one root (`--live-index`), like tgrep serve.
+// A watcher thread drains ReadDirectoryChangesW into a set of changed paths; an applier thread builds or loads the
+// base index, reconciles it with the tree once, then re-indexes changed paths into an in-memory overlay; a merge
+// thread folds a large overlay into a new base file in the background.
+// CONTRACT: catch_up() returns only once every change Windows has reported is applied, so a search sees every edit
+// completed before it started. Writes to a file that is still open may not be reported until it is closed. Buffer
+// overflow, a changed .gitignore/.ignore and server start trigger a full reconciliation (size and last-write time
+// against the tree), during which searches fall back to walking. Candidates are always read from disk; no file
+// contents are cached.
+class LiveIndex {
+public:
+    LiveIndex(SearchContext context, WalkRoot root, std::wstring file, std::string root_final)
+        : context_(std::move(context)), root_(std::move(root)), file_(std::move(file)), root_final_(std::move(root_final)) {}
+
+    void start() {
+        cookie_directory(root_.path);  // created before the watch starts
+        root_handle_ = Handle(open_root_directory(root_.path));
+        watch_ = Handle(CreateFileW(long_path(root_.path).c_str(), FILE_LIST_DIRECTORY,
+                                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+                                    FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OVERLAPPED, nullptr));
+        event_ = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        if (!event_) {
+            std::lock_guard lock(watch_mutex_);
+            failed_ = true;
+            state_ = reason_ = "the watcher cannot be created";
+            return;
+        }
+        bool watching = false;
+        {
+            // The watch starts before the build, so nothing that changes during it is lost.
+            std::lock_guard lock(watch_mutex_);
+            watching = watching_ = root_handle_ && watch_ && issue_read();
+            if (!watching) {
+                failed_ = true;
+                state_ = reason_ = "the root cannot be watched";
+            }
+        }
+        // A root that cannot be watched yet is retried by the applier's recovery; searches walk meanwhile.
+        if (watching) std::thread([this] { watch_loop(); }).detach();
+        std::thread([this] { apply_loop(); }).detach();
+    }
+
+    const std::wstring& final_path_text() const { return root_.final; }
+
+    // The candidates for `r`, or nullopt with `why` when this index cannot serve it now.
+    // `trouble` is set when the index cannot serve because something is wrong (down, recovering, no sync cookie), not
+    // because it is still building or this request needs a walk.
+    std::optional<IndexUse> serve(const Request& r, const Control& control, std::string& why, bool& trouble) {
+        trouble = false;
+        if (!catch_up(control.deadline, why, trouble)) return std::nullopt;
+        const auto plans = plan_patterns(r);
+        // A path request searches the folder r.scope below this root.
+        const std::string_view scope = r.scope;
+        const auto below = [&](std::string_view path) {
+            return scope.empty() || (path.size() > scope.size() && path[scope.size()] == '/' &&
+                                     equals_folded(path.substr(0, scope.size()), scope));
+        };
+        std::shared_lock lock(data_);
+        if (!scope.empty()) {
+            bool held = false;
+            for (uint32_t id = 0; id < base_->files() && !held; ++id) held = !dead_[id] && below(base_->path(id));
+            for (auto it = overlay_.begin(); it != overlay_.end() && !held; ++it) held = !it->second.removed && below(it->first);
+            if (!held) {
+                why = "the index holds no file below " + r.scope;
+                return std::nullopt;
+            }
+        }
+        IdSet ids = base_candidates(*base_, plans);
+        if (!ids) {
+            why = "a pattern has no literal text of 3+ bytes to look up";
+            return std::nullopt;
+        }
+        IndexUse use{root_.path, {}, base_->files()};
+        for (uint32_t id : *ids)
+            if (!dead_[id] && below(base_->path(id))) use.candidates.push_back({std::string(base_->path(id)), base_->file_size(id)});
+        uint64_t overlay_files = 0;
+        for (const auto& [path, file] : overlay_) {
+            if (file.removed) continue;
+            ++overlay_files;
+            if (below(path) && ((file.flags & unindexed_file) || file_may_match(file.grams, plans)))
+                use.candidates.push_back({path, file.size});
+        }
+        use.indexed_files = base_->files() + overlay_files;
+        std::sort(use.candidates.begin(), use.candidates.end(),
+                  [](const IndexCandidate& a, const IndexCandidate& b) { return a.path < b.path; });
+        return use;
+    }
+
+private:
+    static constexpr DWORD watch_filter = FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_DIR_NAME |
+                                          FILE_NOTIFY_CHANGE_SIZE | FILE_NOTIFY_CHANGE_LAST_WRITE |
+                                          FILE_NOTIFY_CHANGE_ATTRIBUTES;
+    static constexpr size_t max_pending = 100000;  // more changed paths than this are cheaper to reconcile
+
+    // Waits, at most until the deadline and never more than 2 s, until the watcher has reported a fresh sync cookie
+    // and every change reported before it is applied, so the search sees every change made before it started,
+    // including this server's own edits. False, with `why`, while the index is building, reconciling or down, or when
+    // the cookie is not reported in time, so the search walks instead.
+    bool catch_up(Clock::time_point deadline, std::string& why, bool& trouble) {
+        const std::wstring cookie = sync_cookie_name();
+        std::string key;
+        try_utf8(cookie, key);
+        {
+            std::lock_guard lock(watch_mutex_);
+            if (off_) {  // turn_off logged why; searches just walk
+                why = state_;
+                trouble = false;
+                return false;
+            }
+            if (!ready_ || failed_ || rescanning_) {
+                why = state_;
+                trouble = failed_;
+                return false;
+            }
+            cookies_.emplace(key, false);
+        }
+        // Reopened per cookie, so a .shgrep deleted meanwhile (its root recreated, or the cache cleared) is made again.
+        const bool touched = touch_sync_cookie(cookie_directory(root_.path), cookie);
+        std::unique_lock lock(watch_mutex_);
+        bool current = false;
+        if (touched) {
+            deadline = std::min(deadline, Clock::now() + std::chrono::seconds(2));
+            current = watch_cv_.wait_until(lock, deadline, [&] {
+                          return failed_ || rescanning_ ||
+                                 (cookies_.at(key) && pending_.empty() && !rescan_ && !busy_);
+                      }) && !failed_ && !rescanning_;
+        }
+        cookies_.erase(key);
+        if (!current) {
+            why = !touched ? "the sync cookie cannot be created"
+                  : failed_ || rescanning_ ? state_
+                                           : "the watcher did not report the sync cookie in time";
+            trouble = !touched || failed_;
+        }
+        return current;
+    }
+
+    // CONTRACT: watch_mutex_ held.
+    bool issue_read() {
+        overlapped_ = OVERLAPPED{};
+        overlapped_.hEvent = event_;
+        ResetEvent(event_);
+        const auto read = [&] {
+            return ReadDirectoryChangesW(watch_.h, notify_.data(), static_cast<DWORD>(notify_.size() * sizeof(uint64_t)),
+                                         TRUE, watch_filter, nullptr, &overlapped_, nullptr) != 0;
+        };
+        if (read()) return true;
+        // COMPAT: over the network Windows refuses a change buffer above 64 KB; no read is pending, so it can shrink.
+        if (GetLastError() != ERROR_INVALID_PARAMETER || notify_.size() * sizeof(uint64_t) <= 64 * 1024) return false;
+        notify_.assign((64 * 1024) / sizeof(uint64_t), 0);
+        return read();
+    }
+
+    void watch_loop() {
+        for (;;) {
+            DWORD got = 0;
+            const bool ok = GetOverlappedResult(watch_.h, &overlapped_, &got, TRUE) != 0;
+            const DWORD error = ok ? 0 : GetLastError();
+            bool stopped = false;
+            {
+                std::lock_guard lock(watch_mutex_);
+                if (off_) {  // turn_off cancelled the read: stop for good, the index stays off
+                    watching_ = false;
+                    return;
+                }
+                if (!ok && error != ERROR_NOTIFY_ENUM_DIR) {
+                    stopped = true;
+                    reason_ = "the watcher stopped (root deleted or renamed?)";
+                } else {
+                    if (!ok || got == 0) rescan_ = true;  // the change buffer overflowed: some changes are unknown
+                    else parse(got);
+                    // CONTRACT: the watcher keeps watching while the index itself is failed, so a recovery's reconcile
+                    // plus the changes reported since cover everything.
+                    if (!issue_read()) {
+                        stopped = true;
+                        reason_ = "the watcher stopped";
+                    }
+                }
+                if (stopped) {
+                    // busy_ and rescanning_ stay the applier's: it returns to recovery once its batch ends.
+                    failed_ = true;
+                    watching_ = false;
+                    state_ = reason_;
+                }
+            }
+            watch_cv_.notify_all();
+            if (stopped) {
+                std::string why;
+                {
+                    std::lock_guard lock(watch_mutex_);
+                    why = reason_;
+                }
+                index_log(true, "index down: " + why + "; searches walk the workspace until it recovers");
+                return;
+            }
+        }
+    }
+
+    // CONTRACT: watch_mutex_ held.
+    void parse(DWORD bytes) {
+        const auto* at = reinterpret_cast<const unsigned char*>(notify_.data());
+        const auto* end = at + bytes;
+        std::string relative;
+        while (at + sizeof(FILE_NOTIFY_INFORMATION) <= end) {
+            const auto* info = reinterpret_cast<const FILE_NOTIFY_INFORMATION*>(at);
+            const std::wstring_view name(info->FileName, info->FileNameLength / sizeof(wchar_t));
+            if (try_utf8(name, relative) && !relative.empty()) {
+                std::replace(relative.begin(), relative.end(), '\\', '/');
+                const size_t slash = relative.rfind('/');
+                const std::string_view leaf = slash == std::string::npos ? std::string_view(relative)
+                                                                         : std::string_view(relative).substr(slash + 1);
+                // A sync cookie that catch_up waits for; like every other path below .shgrep it is never indexed.
+                if (relative.size() > 16 && equals_folded(std::string_view(relative).substr(0, 16), ".shgrep/cookies/"))
+                    if (const auto it = cookies_.find(std::string(leaf)); it != cookies_.end()) it->second = true;
+                // The index's own writes below .shgrep never change what is indexed.
+                const bool own = relative.size() >= 7 && equals_folded(std::string_view(relative).substr(0, 7), ".shgrep") &&
+                                 (relative.size() == 7 || relative[7] == '/');
+                if (!own) {
+                    constexpr std::string_view exclude = ".git/info/exclude";
+                    const bool git_exclude = relative.size() >= exclude.size() &&
+                                             equals_folded(std::string_view(relative).substr(relative.size() - exclude.size()), exclude) &&
+                                             (relative.size() == exclude.size() || relative[relative.size() - exclude.size() - 1] == '/');
+                    if (equals_folded(leaf, ".gitignore") || equals_folded(leaf, ".ignore") || equals_folded(leaf, ".shignore") ||
+                        git_exclude)
+                        rescan_ = true;
+                    pending_.insert(relative);
+                    if (pending_.size() > max_pending) {
+                        pending_.clear();
+                        rescan_ = true;
+                    }
+                }
+            }
+            if (info->NextEntryOffset == 0) break;
+            at += info->NextEntryOffset;
+        }
+    }
+
+    void apply_loop() {
+        std::chrono::seconds delay(1);
+        bool built = false;
+        bool recovering = false;  // a failure is being recovered; its end is logged
+        for (;;) {
+            bool down = false;
+            std::string why;
+            {
+                std::lock_guard lock(watch_mutex_);
+                down = failed_;
+                if (down) {
+                    state_ = "recovering after: " + reason_ + "; next try in " + std::to_string(delay.count()) + " s";
+                    why = reason_;
+                }
+            }
+            if (down) {
+                // Searches walk while the index is down; it comes back with the watcher first, then the build, then a
+                // full reconcile that catches up everything missed meanwhile.
+                recovering = true;
+                index_log(false, "index recovery: next try in " + std::to_string(delay.count()) + " s, after: " + why);
+                std::this_thread::sleep_for(delay);
+                delay = std::min(delay * 2, std::chrono::seconds(60));
+                if (!restart_watch()) continue;
+            }
+            bool fresh = false;
+            if (!built) {
+                try {
+                    fresh = load_or_build();
+                    built = true;
+                } catch (const IndexTooLarge& e) {
+                    turn_off(std::string("live index off: the workspace holds ") + e.what() +
+                             "; searches walk it instead. Run shgrep from a repo folder, or pass the repo as the first --root");
+                    return;
+                } catch (const std::exception& e) {
+                    fail(std::string("index build failed: ") + e.what());
+                    continue;
+                }
+            }
+            bool reconcile = false;
+            {
+                // An index written before the server started, or one that missed changes while it was down, can be
+                // stale: reconcile it with the tree once. One just built read the tree after the watch started, so
+                // the changes reported since cover it. Only a running watcher can vouch for the changes after that.
+                std::lock_guard lock(watch_mutex_);
+                if (!watching_) {
+                    failed_ = true;
+                    continue;
+                }
+                failed_ = false;
+                ready_ = true;
+                if (!fresh) rescan_ = true;
+                reconcile = rescan_;
+                state_ = rescan_ ? "the index is reconciling with the tree" : "ready";
+            }
+            if (recovering) index_log(false, "index recovered" + std::string(reconcile ? "; reconciling with the tree" : ""));
+            else if (!reconcile) index_log(false, "index ready; the file watcher keeps it current");
+            recovering = false;
+            watch_cv_.notify_all();
+            apply_changes(delay);
+        }
+    }
+
+    // Applies reported changes until the index or the watcher fails. CONTRACT: applier thread only.
+    void apply_changes(std::chrono::seconds& delay) {
+        for (;;) {
+            std::set<std::string> batch;
+            bool rescan = false;
+            {
+                std::unique_lock lock(watch_mutex_);
+                watch_cv_.wait(lock, [&] { return failed_ || rescan_ || !pending_.empty(); });
+                if (failed_) return;
+                rescan = rescan_;
+                rescan_ = false;
+                batch.swap(pending_);
+                busy_ = true;
+                if (rescan) {
+                    batch.clear();
+                    rescanning_ = true;
+                    state_ = "the index is reconciling with the tree";
+                }
+            }
+            const auto started = Clock::now();
+            try {
+                if (rescan) reconcile("");
+                else for (const auto& path : batch) apply_path(path);
+            } catch (const std::exception& e) {
+                fail(std::string("index update failed: ") + e.what());
+                return;  // Searches walk instead of trusting a partially updated index until the recovery reconciles it.
+            }
+            bool ready = false;
+            {
+                std::lock_guard lock(watch_mutex_);
+                busy_ = false;
+                rescanning_ = false;
+                if (!failed_) state_ = "ready";  // a watcher that stopped meanwhile keeps its reason
+                ready = !failed_;
+            }
+            if (rescan) {
+                const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - started).count();
+                index_log(false, "index reconciled with the tree in " + std::to_string(ms / 1000) + "." +
+                                     std::to_string(ms % 1000 / 100) + " s" + (ready ? "; ready" : ""));
+            }
+            watch_cv_.notify_all();
+            delay = std::chrono::seconds(1);
+            maybe_merge();
+        }
+    }
+
+    // Marks the index failed, so searches walk until the recovery reconciles it.
+    void fail(const std::string& reason) {
+        index_log(true, "index down: " + reason + "; searches walk the workspace until it recovers");
+        {
+            std::lock_guard lock(watch_mutex_);
+            failed_ = true;
+            busy_ = false;
+            rescanning_ = false;
+            state_ = reason_ = reason;
+        }
+        watch_cv_.notify_all();
+    }
+
+    // Ends the live index for good: no retry, the watcher stops, and searches walk the root. The reason goes to the
+    // index log; searches stay quiet about it unless a request names index: true.
+    void turn_off(const std::string& reason) {
+        index_log(true, reason);
+        {
+            std::lock_guard lock(watch_mutex_);
+            off_ = true;
+            ready_ = failed_ = busy_ = rescanning_ = rescan_ = false;
+            pending_.clear();
+            state_ = reason_ = reason;
+            // Under the lock, so watch_loop either sees off_ before it issues another read or has one pending here.
+            if (watching_) CancelIoEx(watch_.h, &overlapped_);
+        }
+        watch_cv_.notify_all();
+    }
+
+    // Reopens the root and, when the watcher stopped, the watch itself. The old watch thread has returned before
+    // watch_ and overlapped_ are reused. CONTRACT: applier thread only.
+    bool restart_watch() {
+        root_handle_ = Handle(open_root_directory(root_.path));
+        cursor_ = DirCursor{};
+        scopes_.clear();
+        bool watching = false;
+        {
+            std::lock_guard lock(watch_mutex_);
+            watching = watching_;
+        }
+        if (watching) {
+            if (root_handle_) return true;
+            std::lock_guard lock(watch_mutex_);
+            reason_ = "the root cannot be opened";
+            return false;
+        }
+        watch_ = Handle(CreateFileW(long_path(root_.path).c_str(), FILE_LIST_DIRECTORY,
+                                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+                                    FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OVERLAPPED, nullptr));
+        {
+            std::lock_guard lock(watch_mutex_);
+            if (!root_handle_ || !watch_ || !issue_read()) {
+                reason_ = "the root cannot be watched";
+                return false;
+            }
+            watching_ = true;
+        }
+        std::thread([this] { watch_loop(); }).detach();
+        return true;
+    }
+
+    // True when it built the index now (no usable file on disk).
+    bool load_or_build() {
+        const auto started = Clock::now();
+        auto base = std::make_shared<IndexView>(file_, root_.final);
+        const bool build = !*base;
+        if (build) {
+            const unsigned workers = index_workers();
+            index_log(false, "building the index with " + std::to_string(workers) + " threads; searches walk until it is ready");
+            PostingSorter sorter(ensure_index_directory(file_), index_sort_budget, workers);
+            const TreeIndex tree = index_tree(context_, root_, sorter, workers, std::make_shared<std::atomic_bool>(false),
+                                              index_max_files());
+            write_index_file(file_, root_final_, tree.files, sorter, {});
+            base = std::make_shared<IndexView>(file_, root_.final);
+            if (!*base) throw std::runtime_error("the new index cannot be read back");
+            const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - started).count();
+            index_log(false, "index built: " + std::to_string(tree.files.size()) + " files, " +
+                                 std::to_string(tree.bytes / (1024 * 1024)) + " MB of text" +
+                                 (tree.unreadable ? ", " + std::to_string(tree.unreadable) + " unreadable" : std::string()) +
+                                 ", in " + std::to_string(ms / 1000) + "." + std::to_string(ms % 1000 / 100) + " s");
+        } else {
+            index_log(false, "index loaded: " + std::to_string(base->files()) + " files, built " + utc_text(base->built()) +
+                                 "; checking it against the tree");
+        }
+        std::unique_lock lock(data_);
+        install(std::move(base));
+        return build;
+    }
+
+    // CONTRACT: data_ held exclusively.
+    void install(std::shared_ptr<IndexView> base) {
+        base_ = std::move(base);
+        ids_.clear();
+        ids_.reserve(base_->files());
+        for (uint32_t id = 0; id < base_->files(); ++id) ids_.emplace(base_->path(id), id);
+        dead_.assign(base_->files(), false);
+    }
+
+    // The handle and ignore scope (with its own rules) of a directory below the root, or false when it is gone, a
+    // link, hidden or ignored. CONTRACT: applier thread only.
+    bool directory(const std::string& relative, HANDLE& handle, std::shared_ptr<const IgnoreScope>& scope) {
+        handle = cursor_.open(root_handle_.h, relative);
+        if (handle == INVALID_HANDLE_VALUE) {
+            // A folder denied to this user is outside the selection, as visit_directory skips it.
+            if (cursor_.last_status == static_cast<NTSTATUS>(0xC0000034L) ||
+                cursor_.last_status == static_cast<NTSTATUS>(0xC000003AL) ||
+                cursor_.last_status == static_cast<NTSTATUS>(0xC0000103L) ||
+                cursor_.last_status == static_cast<NTSTATUS>(0xC0000022L)) return false;
+            throw std::runtime_error("cannot verify a live-index directory");
+        }
+        const auto with_rules = [&](std::shared_ptr<const IgnoreScope> parent, const std::string& dir) {
+            auto next = std::make_shared<IgnoreScope>();
+            next->parent = parent;
+            std::wstring wide;
+            index_widen(dir, wide);
+            std::replace(wide.begin(), wide.end(), L'/', L'\\');
+            read_ignore_rules(dir.empty() ? root_.path : join_path(root_.path, wide), dir, true, true, next->rules, dir.empty() ? root_handle_.h : cursor_.handles[std::count(dir.begin(), dir.end(), '/')].h);
+            return next->rules.empty() ? parent : std::shared_ptr<const IgnoreScope>(std::move(next));
+        };
+        auto cached = scopes_.find("");
+        if (cached == scopes_.end()) cached = scopes_.emplace("", DirState{true, with_rules(nullptr, "")}).first;
+        scope = cached->second.scope;
+        size_t depth = 0, start = 0;
+        while (!relative.empty() && start <= relative.size()) {
+            size_t slash = relative.find('/', start);
+            if (slash == std::string::npos) slash = relative.size();
+            const std::string prefix = relative.substr(0, slash);
+            const std::string_view name = std::string_view(relative).substr(start, slash - start);
+            start = slash + 1;
+            auto it = scopes_.find(prefix);
+            if (it == scopes_.end()) {
+                bool selected = !name.empty() && !hidden_entry(name, 0) && !ignored_path(scope.get(), prefix, true);
+                FILE_BASIC_INFO basic{};
+                if (selected && depth < cursor_.handles.size() &&
+                    GetFileInformationByHandleEx(cursor_.handles[depth].h, FileBasicInfo, &basic, sizeof(basic)) &&
+                    (link_entry(basic.FileAttributes) || hidden_entry(name, basic.FileAttributes)))
+                    selected = false;
+                it = scopes_.emplace(prefix, DirState{selected, selected ? with_rules(scope, prefix) : scope}).first;
+            }
+            if (!it->second.selected) return false;
+            scope = it->second.scope;
+            ++depth;
+        }
+        return true;
+    }
+
+    // Drops cached selection and ignore scopes for `relative` and every directory below it ('' drops all). Cached
+    // entries reflect attributes and rule files as they were, so a changed folder (hidden, unhidden, recreated) or a
+    // changed ignore file must be evaluated afresh. CONTRACT: applier thread only.
+    void forget_scopes(const std::string& relative) {
+        if (relative.empty()) { scopes_.clear(); return; }
+        scopes_.erase(relative);
+        const std::string below = relative + "/";
+        for (auto it = scopes_.lower_bound(below); it != scopes_.end() && it->first.compare(0, below.size(), below) == 0;)
+            it = scopes_.erase(it);
+    }
+
+    // Re-reads one changed path. CONTRACT: applier thread only.
+    void apply_path(const std::string& relative) {
+        const size_t slash = relative.rfind('/');
+        const std::string parent = slash == std::string::npos ? std::string() : relative.substr(0, slash);
+        const std::string name = slash == std::string::npos ? relative : relative.substr(slash + 1);
+        // The path may be a folder whose attributes changed; an ignore file changes its folder's rules.
+        forget_scopes(relative);
+        if (name == ".gitignore" || name == ".ignore" || name == ".shignore" || name == ".git") forget_scopes(parent);
+        HANDLE dir = INVALID_HANDLE_VALUE;
+        std::shared_ptr<const IgnoreScope> scope;
+        std::wstring wide;
+        if (name.empty() || hidden_entry(name, 0) || !directory(parent, dir, scope) || !index_widen(name, wide)) {
+            remove_tree(relative);
+            return;
+        }
+        FILE_BASIC_INFO basic{};
+        FILE_STANDARD_INFO standard{};
+        NTSTATUS status = 0;
+        Handle h(open_entry(dir, wide, basic, standard, status));
+        const bool readable = static_cast<bool>(h);
+        if (!readable) {
+            // Only a path that is gone leaves the index. An open for reading also fails while another program holds
+            // the entry without read sharing; an open for attributes only is not subject to sharing, so it still tells
+            // a folder from a file.
+            const bool gone = status == static_cast<NTSTATUS>(0xC0000034L) ||  // STATUS_OBJECT_NAME_NOT_FOUND
+                              status == static_cast<NTSTATUS>(0xC000003AL) ||  // STATUS_OBJECT_PATH_NOT_FOUND
+                              status == static_cast<NTSTATUS>(0xC0000056L);    // STATUS_DELETE_PENDING
+            if (!gone) h = Handle(open_entry(dir, wide, basic, standard, status, FILE_READ_ATTRIBUTES | SYNCHRONIZE));
+            if (!h) {
+                if (!gone && !binary_extension(name) && !ignored_path(scope.get(), relative, false)) {
+                    OverlayFile file;
+                    file.flags = unindexed_file;  // as the build does: searched every time, so the error is reported
+                    put(relative, std::move(file));
+                } else {
+                    remove_tree(relative);
+                }
+                return;
+            }
+        }
+        const DWORD attributes = basic.FileAttributes;
+        const bool is_directory = (attributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+        if (link_entry(attributes) || hidden_entry(name, attributes) || ignored_path(scope.get(), relative, is_directory) ||
+            (!is_directory && binary_extension(name))) {
+            remove_tree(relative);
+            return;
+        }
+        if (is_directory) {
+            h.close();
+            reconcile(relative);  // a directory moved or created here: its files may never have been reported
+            return;
+        }
+        if (!readable) {
+            // A file held without read sharing: searched every time, as the build does for a file it cannot read, so
+            // the search reads it or reports the error; the next change notification or reconcile retries it.
+            OverlayFile file;
+            file.flags = unindexed_file;
+            put(relative, std::move(file));
+            return;
+        }
+        index_file(relative, h.h, static_cast<uint64_t>(standard.EndOfFile.QuadPart));
+    }
+
+    // CONTRACT: applier thread only.
+    void index_file(const std::string& relative, HANDLE h, uint64_t listed) {
+        OverlayFile file;
+        file.size = listed;
+        std::optional<DecodedText> decoded;
+        std::string_view contents;
+        const IndexRead kind = index_text(h, whole_text_bytes, raw_, decoded, contents, file.size, file.write_time);
+        if (kind == IndexRead::unreadable) {
+            file.flags = unindexed_file;
+        } else if (kind == IndexRead::text) {
+            trigrams_.collect(contents);
+            file.grams = trigrams_.grams;
+        }
+        if (raw_.capacity() > retained_text_capacity) std::string().swap(raw_);
+        put(relative, std::move(file));
+    }
+
+    void put(const std::string& relative, OverlayFile file) {
+        std::unique_lock lock(data_);
+        file.seq = ++seq_;
+        if (const auto id = ids_.find(relative); id != ids_.end()) dead_[id->second] = true;
+        overlay_[relative] = std::move(file);
+    }
+
+    // Marks `relative` and everything below it removed. CONTRACT: applier thread only (it also drops cached scopes).
+    void remove_tree(const std::string& relative) {
+        forget_scopes(relative);
+        std::unique_lock lock(data_);
+        const std::string below = relative + "/";
+        const auto mark = [&](const std::string& path) {
+            OverlayFile& file = overlay_[path];
+            file = OverlayFile{};
+            file.removed = true;
+            file.seq = ++seq_;
+        };
+        if (const auto id = ids_.find(relative); id != ids_.end() && !dead_[id->second]) {
+            dead_[id->second] = true;
+            mark(relative);
+        } else if (const auto it = overlay_.find(relative); it != overlay_.end() && !it->second.removed) {
+            mark(relative);
+        }
+        for (const auto& [path, id] : ids_) {
+            if (!dead_[id] && path.size() > below.size() && path.compare(0, below.size(), below) == 0) {
+                dead_[id] = true;
+                mark(std::string(path));
+            }
+        }
+        for (auto it = overlay_.lower_bound(below); it != overlay_.end() && it->first.compare(0, below.size(), below) == 0; ++it) {
+            if (it->second.removed) continue;
+            it->second = OverlayFile{};
+            it->second.removed = true;
+            it->second.seq = ++seq_;
+        }
+    }
+
+    // Compares every selected file below `start` ('' for the root) with the index by size and last-write time,
+    // re-indexes what differs and removes what is gone. CONTRACT: applier thread only.
+    void reconcile(const std::string& start) {
+        // SAFETY: seen_base is indexed by the base's file ids, which a merge renumbers when it installs its base. Only
+        // this thread starts merges, so once a running one has ended none can start before this reconcile returns.
+        merging_.wait(true);
+        forget_scopes(start);
+        HANDLE first = INVALID_HANDLE_VALUE;
+        std::shared_ptr<const IgnoreScope> first_scope;
+        if (!directory(start, first, first_scope)) {
+            if (!start.empty()) remove_tree(start);
+            return;
+        }
+        std::vector<bool> seen_base;
+        std::unordered_set<std::string> seen_overlay;
+        std::vector<std::string> changed;
+        {
+            std::shared_lock lock(data_);
+            seen_base.assign(base_->files(), false);
+        }
+        struct Item {
+            std::string relative;
+            std::shared_ptr<Handle> handle;  // null: the starting directory, held by cursor_
+            std::shared_ptr<const IgnoreScope> scope;
+            bool rules_loaded;
+        };
+        std::vector<Item> stack;
+        stack.push_back({start, nullptr, first_scope, true});
+        std::vector<uint64_t> listing(8192);
+        std::vector<DirEntry> entries;
+        std::string name, relative;
+        std::wstring wide;
+        while (!stack.empty()) {
+            Item item = std::move(stack.back());
+            stack.pop_back();
+            const HANDLE handle = item.handle ? item.handle->h : first;
+            if (!list_directory(handle, listing, entries))
+                throw std::runtime_error("cannot completely enumerate a directory while reconciling the live index");
+            std::shared_ptr<const IgnoreScope> scope = item.scope;
+            if (!item.rules_loaded) {
+                bool gitignore = false, dotignore = false, git_dir = false;
+                for (const auto& entry : entries) note_rule_file(entry.name, entry.attributes, gitignore, dotignore, git_dir);
+                if (gitignore || dotignore || git_dir) {
+                    auto next = std::make_shared<IgnoreScope>();
+                    next->parent = scope;
+                    index_widen(item.relative, wide);
+                    std::replace(wide.begin(), wide.end(), L'/', L'\\');
+                    read_ignore_rules(join_path(root_.path, wide), item.relative, gitignore, dotignore, next->rules, handle,
+                                      git_dir);
+                    if (!next->rules.empty()) scope = std::move(next);
+                }
+            }
+            for (const auto& entry : entries) {
+                if (!try_utf8(entry.name, name) || name.empty()) continue;
+                const bool is_directory = (entry.attributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+                if (link_entry(entry.attributes) || hidden_entry(name, entry.attributes)) continue;
+                relative = item.relative.empty() ? name : item.relative + "/" + name;
+                if (ignored_path(scope.get(), relative, is_directory)) continue;
+                if (is_directory) {
+                    bool denied = false;
+                    NTSTATUS status = 0;
+                    HANDLE child = open_relative(handle, entry.name, true, denied, &status);
+                    if (child == INVALID_HANDLE_VALUE) {
+                        // CONTRACT: as visit_directory, which index_tree builds with: a folder gone meanwhile or
+                        // denied to this user is skipped. Throwing for a denied folder failed the index on every
+                        // reconcile while walks skipped it.
+                        if (denied || status == static_cast<NTSTATUS>(0xC0000034L) ||
+                            status == static_cast<NTSTATUS>(0xC000003AL)) continue;
+                        throw std::runtime_error("cannot open a directory while reconciling the live index");
+                    }
+                    stack.push_back({relative, std::make_shared<Handle>(child), scope, false});
+                    continue;
+                }
+                if (binary_extension(name)) continue;
+                std::shared_lock lock(data_);
+                if (const auto it = overlay_.find(relative); it != overlay_.end()) {
+                    seen_overlay.insert(relative);
+                    if (!it->second.removed && it->second.size == entry.size && it->second.write_time == entry.write_time) continue;
+                } else if (const auto id = ids_.find(relative); id != ids_.end() && !dead_[id->second]) {
+                    seen_base[id->second] = true;
+                    if (base_->file_size(id->second) == entry.size && base_->write_time(id->second) == entry.write_time) continue;
+                }
+                changed.push_back(relative);
+            }
+        }
+        for (const auto& path : changed) {
+            seen_overlay.insert(path);
+            apply_path(path);
+        }
+        // Known files below `start` that the tree no longer has.
+        std::vector<std::string> gone;
+        {
+            std::shared_lock lock(data_);
+            const std::string below = start.empty() ? std::string() : start + "/";
+            const auto under = [&](std::string_view path) { return below.empty() || path.compare(0, below.size(), below) == 0; };
+            for (const auto& [path, id] : ids_)
+                if (!dead_[id] && !seen_base[id] && under(path)) gone.emplace_back(path);
+            for (const auto& [path, file] : overlay_)
+                if (!file.removed && !seen_overlay.count(path) && under(path)) gone.push_back(path);
+        }
+        for (const auto& path : gone) remove_tree(path);
+    }
+
+    // Folds the overlay into a new base file once it grows past a sixteenth of the base, in the background; changes
+    // applied meanwhile stay in the overlay.
+    void maybe_merge() {
+        size_t changed = 0, base_files = 0;
+        {
+            std::shared_lock lock(data_);
+            changed = overlay_.size();
+            base_files = base_->files();
+        }
+        if (changed < std::max<size_t>(4096, base_files / 16) || merging_.exchange(true)) return;
+        std::thread([this] {
+            try {
+                merge();
+                index_log(false, "index file rewritten with the changes made since it was built");
+            } catch (const std::exception& e) {
+                index_log(true, std::string("index merge failed: ") + e.what());
+            }
+            merging_ = false;
+            merging_.notify_all();  // a reconcile waits for the merge to end
+        }).detach();
+    }
+
+    void merge() {
+        std::shared_ptr<IndexView> base;
+        std::vector<bool> dead;
+        std::map<std::string, OverlayFile> overlay;
+        uint64_t snapshot = 0;
+        {
+            std::shared_lock lock(data_);
+            base = base_;
+            dead = dead_;
+            overlay = overlay_;
+            snapshot = seq_;
+        }
+        std::vector<IndexEntry> files;
+        std::vector<uint32_t> remap(base->files(), 0xffffffffu);
+        for (uint32_t id = 0; id < base->files(); ++id) {
+            if (dead[id]) continue;
+            remap[id] = static_cast<uint32_t>(files.size());
+            files.push_back({std::string(base->path(id)), base->file_size(id), base->write_time(id), base->flags(id)});
+        }
+        PostingSorter sorter(ensure_index_directory(file_), index_sort_budget, 1);
+        std::unordered_set<uint32_t> dense;
+        std::vector<IndexPosting> list;
+        for (uint32_t i = 0; i < base->trigram_count(); ++i) {
+            const IndexTrigram& t = base->trigram_at(i);
+            if (t.count == dense_trigram) {
+                dense.insert(t.key);
+                continue;
+            }
+            if (!base->postings(t, list)) throw std::runtime_error("the base index is damaged");
+            for (const IndexPosting& p : list)
+                if (remap[p.id] != 0xffffffffu)
+                    sorter.add(0, t.key, remap[p.id], static_cast<uint16_t>(p.loc << 8 | p.next));
+        }
+        for (const auto& [path, file] : overlay) {
+            if (file.removed) continue;
+            const auto id = static_cast<uint32_t>(files.size());
+            files.push_back({path, file.size, file.write_time, file.flags});
+            if (!file.grams.empty()) sorter.add_file(0, id, file.grams);
+        }
+        write_index_file(file_, root_final_, files, sorter, dense);
+        auto next = std::make_shared<IndexView>(file_, root_.final);
+        if (!*next) throw std::runtime_error("the merged index cannot be read back");
+        std::unique_lock lock(data_);
+        install(std::move(next));
+        for (auto it = overlay_.begin(); it != overlay_.end();) {
+            if (it->second.seq <= snapshot) {
+                it = overlay_.erase(it);
+                continue;
+            }
+            if (const auto id = ids_.find(it->first); id != ids_.end()) dead_[id->second] = true;
+            ++it;
+        }
+    }
+
+    struct DirState {
+        bool selected;
+        std::shared_ptr<const IgnoreScope> scope;  // including the directory's own rules
+    };
+
+    const SearchContext context_;
+    const WalkRoot root_;
+    const std::wstring file_;
+    const std::string root_final_;
+
+    // Index data. data_ guards base_, ids_, dead_, overlay_ and seq_.
+    std::shared_mutex data_;
+    std::shared_ptr<IndexView> base_;
+    std::unordered_map<std::string_view, uint32_t> ids_;  // base path -> id; views into base_'s mapping
+    std::vector<bool> dead_;                               // base ids superseded by overlay_
+    std::map<std::string, OverlayFile> overlay_;          // sorted, so a directory's entries are one range
+    uint64_t seq_ = 0;
+    std::atomic_bool merging_{false};
+
+    // Watcher state. watch_mutex_ guards everything here except notify_ while a read is pending.
+    std::mutex watch_mutex_;
+    std::condition_variable watch_cv_;
+    Handle watch_;
+    HANDLE event_ = nullptr;
+    OVERLAPPED overlapped_{};
+    std::vector<uint64_t> notify_ = std::vector<uint64_t>((1u << 20) / sizeof(uint64_t));  // 1 MiB, DWORD-aligned
+    std::set<std::string> pending_;
+    bool ready_ = false, failed_ = false, rescan_ = false, rescanning_ = false, busy_ = false;
+    bool watching_ = false;  // a watch_loop thread owns watch_ and overlapped_
+    bool off_ = false;  // turn_off: the index stays off for good
+    std::map<std::string, bool> cookies_;  // sync cookies being waited for -> reported yet
+    std::string state_ = "the index is being built";
+    std::string reason_;     // the last failure, kept for the recovery's state text
+
+    // Applier thread state.
+    Handle root_handle_;
+    DirCursor cursor_;
+    // Ordered so a subtree's entries can be dropped as one range (forget_scopes).
+    std::map<std::string, DirState> scopes_;
+    TrigramSet trigrams_;
+    std::string raw_;
+};
+
+std::mutex& live_mutex() {
+    static std::mutex mutex;
+    return mutex;
+}
+// COMPAT: never destroyed; their threads run until the process exits.
+std::vector<LiveIndex*>& live_indexes() {
+    static auto* indexes = new std::vector<LiveIndex*>;
+    return *indexes;
+}
+
+LiveIndex* find_live_index(const std::wstring& root_final) {
+    std::lock_guard lock(live_mutex());
+    for (LiveIndex* live : live_indexes()) {
+        const std::wstring& final = live->final_path_text();
+        if (final.size() == root_final.size() &&
+            CompareStringOrdinal(final.data(), static_cast<int>(final.size()), root_final.data(),
+                                 static_cast<int>(root_final.size()), TRUE) == CSTR_EQUAL)
+            return live;
+    }
+    return nullptr;
+}
+
+std::wstring environment_text(const wchar_t* name) {
+    const DWORD size = GetEnvironmentVariableW(name, nullptr, 0);
+    if (size == 0) return {};
+    std::wstring value(size, L'\0');
+    const DWORD written = GetEnvironmentVariableW(name, value.data(), size);
+    if (written == 0 || written >= size) return {};
+    value.resize(written);
+    return value;
+}
+
+// The final path of an existing folder, or empty.
+std::wstring final_folder(const std::wstring& path) {
+    Handle h(CreateFileW(absolute_long_path(fs::path(path)).c_str(), FILE_READ_ATTRIBUTES,
+                         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+                         FILE_FLAG_BACKUP_SEMANTICS, nullptr));
+    if (!h) return {};
+    try { return final_path(h.h); } catch (const std::runtime_error&) { return {}; }
+}
+
+// True when `final` (a final path) is too broad for the live index: a drive or network share root, or a folder that is
+// or holds the user profile, Windows, Program Files or ProgramData. Indexing one would read most of the disk.
+bool broad_index_root(const std::wstring& final) {
+    constexpr std::wstring_view unc = L"\\\\?\\UNC\\", local = L"\\\\?\\";
+    std::wstring_view rest = final;
+    const bool network = rest.starts_with(unc);
+    rest.remove_prefix(network ? unc.size() : rest.starts_with(local) ? local.size() : 0);
+    while (!rest.empty() && rest.back() == L'\\') rest.remove_suffix(1);
+    // "C:" is a drive root; "server\share" is a share root.
+    if (network ? std::count(rest.begin(), rest.end(), L'\\') <= 1 : rest.size() <= 2) return true;
+    for (const wchar_t* name : {L"USERPROFILE", L"SystemRoot", L"ProgramFiles", L"ProgramFiles(x86)", L"ProgramW6432",
+                                L"ProgramData"}) {
+        const std::wstring value = environment_text(name);
+        if (value.empty()) continue;
+        const std::wstring known = final_folder(value);
+        if (!known.empty() && inside(known, final)) return true;
+    }
+    return false;
+}
+
+// A snapshot index (`shgrep index`) checked against the tree while the root is walked: a listed file whose size and
+// last-write time equal the snapshot's is opened only when the snapshot names it a candidate; a new or changed file is
+// always opened. The listing costs no file reads, and the result equals a plain walk's.
+// SAFETY: a file another program is still writing can keep a stale directory entry until it is closed, as for any
+// reader; everything closed is exact.
+struct SnapshotFilter {
+    std::wstring root;  // the walk root's path, which the walker's paths start with
+    std::shared_ptr<IndexView> view;
+    std::unordered_map<std::string_view, uint32_t> ids;  // snapshot path -> id; views into view's mapping
+    std::vector<bool> candidate;                         // by id
+    std::atomic<uint64_t> changed{0}, skipped{0};
+};
+
+// True when the walked file `path` is unchanged since the snapshot and cannot match, so it need not be opened.
+bool snapshot_skips(const std::vector<std::unique_ptr<SnapshotFilter>>& filters, const std::wstring& path, uint64_t size,
+                    uint64_t write_time) {
+    for (const auto& f : filters) {
+        if (path.size() <= f->root.size() ||
+            CompareStringOrdinal(path.data(), static_cast<int>(f->root.size()), f->root.data(),
+                                 static_cast<int>(f->root.size()), TRUE) != CSTR_EQUAL)
+            continue;
+        thread_local std::string relative;
+        if (!index_relative(path, f->root, relative)) return false;
+        const auto it = f->ids.find(relative);
+        if (it == f->ids.end() || !write_time || f->view->file_size(it->second) != size ||
+            f->view->write_time(it->second) != write_time) {
+            ++f->changed;
+            return false;
+        }
+        if (f->candidate[it->second]) return false;
+        ++f->skipped;
+        return true;
+    }
+    return false;
+}
+
+// Serves each walk root from its live index or, checked against the tree, its snapshot file. Roots the live index
+// serves move to `uses`; the others stay in `roots` and are walked, a snapshot's with a filter in `filters`. Returns the
+// note the result carries.
+std::string prepare_index(const Request& r, const SearchContext& context, const Control& control,
+                          std::vector<WalkRoot>& roots, std::vector<IndexUse>& uses,
+                          std::vector<std::unique_ptr<SnapshotFilter>>& filters) {
+    // CONTRACT: the notes say how the index was used only when the request named index; a default search just gets
+    // its results. An index in trouble (down, recovering, no sync cookie) goes to the index log instead, once per
+    // distinct reason, never into the result.
+    const bool tell = r.index_requested;
+    if (r.invert) return tell ? "[index not used: invert needs every file]\n" : "";
+    if (r.output == "files_without_match") return tell ? "[index not used: files_without_match needs every file]\n" : "";
+    if (r.hidden || r.no_ignore || r.sniff_all)
+        return tell ? "[index not used: it holds the default selection, without hidden, ignored or binary-extension files]\n"
+                    : "";
+    std::string note;
+    uint64_t oldest = 0;
+    bool live_used = false;
+    std::vector<WalkRoot> walked;
+    for (auto& root : roots) {
+        std::string display;
+        try_utf8(root.path, display);
+        if (LiveIndex* live = find_live_index(root.final)) {
+            std::string why;
+            bool trouble = false;
+            auto use = live->serve(r, control, why, trouble);
+            if (!use) {
+                if (tell) note += "[index not used for " + display + ": " + why + "; searched by walking]\n";
+                if (trouble) {
+                    static std::mutex logged_mutex;
+                    static std::string logged;
+                    std::lock_guard lock(logged_mutex);
+                    if (why != logged) {
+                        logged = why;
+                        index_log(true, "a search walked " + display + " without the index: " + why);
+                    }
+                }
+                walked.push_back(std::move(root));
+                continue;
+            }
+            live_used = true;
+            uses.push_back(std::move(*use));
+            continue;
+        }
+        auto view = std::make_shared<IndexView>(index_file_path(context, root.final), root.final);
+        if (!*view) {
+            if (tell) note += "[index: none for " + display + "; build it with: shgrep index --root \"" + display + "\"]\n";
+            walked.push_back(std::move(root));
+            continue;
+        }
+        IdSet ids = base_candidates(*view, plan_patterns(r));
+        if (!ids) {
+            if (tell) note += "[index not used for " + display + ": a pattern has no literal text of 3+ bytes to look up]\n";
+            walked.push_back(std::move(root));
+            continue;
+        }
+        if (!oldest || view->built() < oldest) oldest = view->built();
+        // The root is still walked (and so scoped, filtered and ignored as a walk is); the snapshot only spares the
+        // reads of unchanged files that cannot match.
+        auto filter = std::make_unique<SnapshotFilter>();
+        filter->root = root.path;
+        filter->candidate.assign(view->files(), false);
+        for (uint32_t id : *ids) filter->candidate[id] = true;
+        filter->ids.reserve(view->files());
+        for (uint32_t id = 0; id < view->files(); ++id) filter->ids.emplace(view->path(id), id);
+        filter->view = std::move(view);
+        filters.push_back(std::move(filter));
+        walked.push_back(std::move(root));
+    }
+    roots = std::move(walked);
+    if (tell && live_used) note += "[index: live, kept current by the file watcher]\n";
+    if (tell && oldest)
+        note += "[index: snapshot built " + utc_text(oldest) + ", checked against the tree: new and changed files are "
+                "searched too]\n";
+    return note;
+}
+
+} // namespace
+
+namespace {
+struct IndexLogState {
+    std::mutex mutex;
+    HANDLE file = INVALID_HANDLE_VALUE;
+    std::move_only_function<void(bool, const std::string&)> listener;
+};
+// COMPAT: never destroyed; detached index threads may log until the process exits.
+IndexLogState& index_log_state() {
+    static auto* state = new IndexLogState;
+    return *state;
+}
+
+// Opens the log file, rewritten at each server start: .shgrep\index.log in the workspace, or
+// %LOCALAPPDATA%\shgrep\index.log for a workspace too broad to write into. Without a file, stderr and the listener
+// still get every line.
+void open_index_log(const SearchContext& context, bool broad) {
+    HANDLE file = INVALID_HANDLE_VALUE;
+    std::string where;
+    try {
+        if (!broad) {
+            const fs::path path = fs::absolute(context.allowed_roots.front()).lexically_normal() / cache_directory_name / L"index.log";
+            file = static_cast<HANDLE>(create_workspace_metadata_log(context, path));
+            // Made inheritable for cmake.log's child process; language servers must not inherit this one.
+            SetHandleInformation(file, HANDLE_FLAG_INHERIT, 0);
+            try_utf8(path.wstring(), where);
+        } else if (const std::wstring base = environment_text(L"LOCALAPPDATA"); !base.empty()) {
+            const fs::path folder = fs::path(base) / L"shgrep";
+            std::error_code error;
+            fs::create_directories(folder, error);
+            file = CreateFileW(long_path((folder / L"index.log").wstring()).c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr,
+                               CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+            if (file != INVALID_HANDLE_VALUE) try_utf8((folder / L"index.log").wstring(), where);
+        }
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "shgrep: index: cannot open the index log: %s\n", e.what());
+        file = INVALID_HANDLE_VALUE;
+    }
+    {
+        auto& log = index_log_state();
+        std::lock_guard lock(log.mutex);
+        if (log.file != INVALID_HANDLE_VALUE) CloseHandle(log.file);
+        log.file = file;
+    }
+    if (!where.empty()) std::fprintf(stderr, "shgrep: index: log file %s\n", where.c_str());
+}
+} // namespace
+
+void index_log(bool warning, const std::string& message) {
+    SYSTEMTIME t{};
+    GetLocalTime(&t);
+    char stamp[32];
+    std::snprintf(stamp, sizeof(stamp), "%04u-%02u-%02u %02u:%02u:%02u", static_cast<unsigned>(t.wYear),
+                  static_cast<unsigned>(t.wMonth), static_cast<unsigned>(t.wDay), static_cast<unsigned>(t.wHour),
+                  static_cast<unsigned>(t.wMinute), static_cast<unsigned>(t.wSecond));
+    const std::string line = std::string(stamp) + (warning ? "  WARNING  " : "  INFO     ") + message + "\r\n";
+    auto& log = index_log_state();
+    std::lock_guard lock(log.mutex);
+    std::fprintf(stderr, "shgrep: index: %s\n", message.c_str());
+    if (log.file != INVALID_HANDLE_VALUE) {
+        DWORD written = 0;
+        if (!WriteFile(log.file, line.data(), static_cast<DWORD>(line.size()), &written, nullptr) || written != line.size()) {
+            const DWORD code = GetLastError();
+            CloseHandle(log.file);
+            log.file = INVALID_HANDLE_VALUE;
+            std::fprintf(stderr, "shgrep: index: the index log file stopped (Windows error %lu)\n", code);
+        }
+    }
+    if (log.listener) {
+        try { log.listener(warning, message); } catch (...) {}  // a viewer failure never reaches the index
+    }
+}
+
+void set_index_log_listener(std::move_only_function<void(bool warning, const std::string& message)> listener) {
+    auto& log = index_log_state();
+    std::lock_guard lock(log.mutex);
+    log.listener = std::move(listener);
+}
+
+bool workspace_too_broad(const SearchContext& context) {
+    if (context.allowed_roots.empty()) return false;
+    const std::wstring final = final_folder(context.allowed_roots.front().wstring());
+    return !final.empty() && broad_index_root(final);
+}
+
+void start_live_indexes(const SearchContext& context) {
+    if (context.read_only) return;  // the live index writes its files and cookies into the workspace
+    if (context.allowed_roots.empty()) return;
+    // CONTRACT: only the workspace gets a live index: the first root, which is the folder shgrep runs in unless --root
+    //   names others. Other roots are walked, or use a snapshot that `shgrep index` built.
+    const fs::path& allowed = context.allowed_roots.front();
+    std::string display;
+    try_utf8(fs::absolute(allowed).lexically_normal().wstring(), display);
+    Handle root(CreateFileW(absolute_long_path(allowed).c_str(), FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                            nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr));
+    if (!root) {
+        const DWORD code = GetLastError();
+        open_index_log(context, true);
+        index_log(true, "live index off: the workspace " + display + " cannot be opened (Windows error " +
+                            std::to_string(code) + ")");
+        return;
+    }
+    WalkRoot walk_root{fs::absolute(allowed).lexically_normal().wstring(), final_path(root.h)};
+    const bool broad = broad_index_root(walk_root.final);
+    open_index_log(context, broad);
+    if (broad) {
+        index_log(true, "live index off for " + display +
+                            ": it is a drive root, the user profile, or a folder holding system folders, so indexing it "
+                            "would read most of the disk; searches walk it instead. Run shgrep from a repo folder, or "
+                            "pass the repo as the first --root");
+        return;
+    }
+    std::string root_final;
+    const std::wstring file = index_file_path(context, walk_root.final);
+    if (!try_utf8(walk_root.final, root_final) || file.empty()) {
+        index_log(true, "live index off: cannot place the index file for " + display);
+        return;
+    }
+    std::string file_display;
+    try_utf8(file, file_display);
+    index_log(false, "live index for the workspace " + display + " (index file " + file_display + ")");
+    auto* live = new LiveIndex(context, std::move(walk_root), file, std::move(root_final));
+    {
+        std::lock_guard lock(live_mutex());
+        live_indexes().push_back(live);
+    }
+    live->start();
+}
+
+
+namespace {
+Json run_unlocked(const std::string& name, const Json& arguments, const SearchContext& context,
+                  const std::shared_ptr<std::atomic_bool>& cancelled, std::shared_ptr<TextStream>* text_stream = nullptr,
+                  uint64_t text_limit = 0);
+
+// The identifier at a 1-based line and UTF-16 column, as a navigation request names it.
+std::string identifier_at(const std::string& text, int64_t line, int64_t column) {
+    size_t start = 0;
+    for (int64_t current = 1; current < line; ++current) {
+        start = text.find('\n', start);
+        if (start == std::string::npos) return {};
+        ++start;
+    }
+    const size_t end = text.find_first_of("\r\n", start);
+    const std::string row = text.substr(start, end == std::string::npos ? std::string::npos : end - start);
+    if (row.empty()) return {};
+    const int n = MultiByteToWideChar(CP_UTF8, 0, row.data(), static_cast<int>(row.size()), nullptr, 0);
+    std::wstring wide(static_cast<size_t>(std::max(n, 0)), L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, row.data(), static_cast<int>(row.size()), wide.data(), n);
+    size_t at = static_cast<size_t>(std::max<int64_t>(column - 1, 0));
+    if (at > wide.size()) return {};
+    auto word = [](wchar_t c) { return std::iswalnum(c) || c == L'_'; };
+    size_t begin = at, finish = at;
+    while (begin > 0 && word(wide[begin - 1])) --begin;
+    while (finish < wide.size() && word(wide[finish])) ++finish;
+    std::string name;
+    if (begin == finish || !try_utf8(std::wstring_view(wide).substr(begin, finish - begin), name)) return {};
+    return name;
+}
+
+// Symbol names a navigation request asks about: last name-path components, without overload index or C++ scope.
+std::vector<std::string> requested_names(const Json& arguments) {
+    std::vector<std::string> names;
+    auto add = [&](std::string value) {
+        if (const size_t slash = value.rfind('/'); slash != std::string::npos) value.erase(0, slash + 1);
+        if (const size_t bracket = value.find('['); bracket != std::string::npos) value.resize(bracket);
+        if (const size_t colons = value.rfind("::"); colons != std::string::npos) value.erase(0, colons + 2);
+        if (!value.empty()) names.push_back(std::move(value));
+    };
+    if (const Json* list = arguments.get("patterns")) for (const auto& item : list->array()) add(item.string());
+    else if (arguments.get("name_path") || arguments.get("pattern")) add(text(arguments, "name_path", text(arguments, "pattern")));
+    return names;
+}
+std::string joined(const std::vector<std::string>& names) {
+    std::string out;
+    for (const auto& name : names) out += (out.empty() ? "" : ", ") + name;
+    return out;
+}
+// Runs a whole-word literal text search for names, optionally limited to path or to one extension, under a note.
+Json word_search(const std::vector<std::string>& names, const Json& arguments, const std::string& path,
+                 const std::string& extension, const std::string& output, const std::string& note,
+                 const SearchContext& context, const std::shared_ptr<std::atomic_bool>& cancelled) {
+    Json::Object query{{"operation", "text"}, {"patterns", Json::Array(names.begin(), names.end())}, {"mode", "literal"},
+                       {"word", true}, {"output", output}};
+    if (const Json* intent = arguments.get("intent")) query.emplace("intent", *intent);
+    if (arguments.get("allow_text_fallback")) query.emplace("allow_text_fallback", *arguments.get("allow_text_fallback"));
+    if (arguments.get("timeout_ms")) query.emplace("timeout_ms", *arguments.get("timeout_ms"));
+    if (!path.empty()) query.emplace("path", path);
+    if (!extension.empty()) query.emplace("extensions", Json::Array{extension});
+    Json result;
+    // A failing ranked search keeps the note, so the LSP failure is still reported.
+    try { result = run_unlocked("search", query, context, cancelled); }
+    catch (const std::exception& e) { throw std::runtime_error(note + e.what()); }
+    auto& object = std::get<Json::Object>(result.value);
+    object["text"] = note + object["text"].string();
+    object["access_note"] = note;
+    return result;
+}
+
+// CONTRACT: a navigation request that no language server can answer (none handles the file type, or the server
+//   failed: failure is then its message) answers with whole-word text matches for the symbol's name under the
+//   failure banner instead of failing, so the user learns semantic results were unavailable. symbols and hover
+//   stay in the file or folder; the other operations search every file with the same extension. nullopt when no
+//   name can be derived or a server should answer.
+std::optional<Json> text_fallback(const std::string& operation, const Json& arguments, const SearchContext& context,
+                                  const std::shared_ptr<std::atomic_bool>& cancelled, const std::string& failure = {}) {
+    const std::string path = text(arguments, "path");
+    bool directory = false;
+    std::optional<SourceText> descriptor;
+    if (!path.empty()) descriptor = source_descriptor(context, path, &directory);
+    std::string reason = failure;
+    if (reason.empty()) {
+        if (!descriptor || directory || lsp_configured(*descriptor, context)) return std::nullopt;
+        reason = lsp_missing(*descriptor, context);
+        if (reason.empty()) reason = "no language server for this file type (add one to .shgrep/lsp.json)";
+    }
+    std::vector<std::string> names = requested_names(arguments);
+    if (names.empty() && descriptor && !directory && arguments.get("line") && arguments.get("column")) {
+        std::string name = identifier_at(read_source_text(context, path).text, arguments.get("line")->integer(),
+                                         arguments.get("column")->integer());
+        if (!name.empty()) names.push_back(std::move(name));
+    }
+    if (names.empty()) return std::nullopt;
+    std::string scope, extension, where = "in the workspace";
+    if (descriptor && (directory || operation == "symbols" || operation == "hover")) {
+        scope = path;
+        where = directory ? "in " + path : "in this file";
+    } else if (descriptor) {
+        std::string suffix;
+        if (try_utf8(descriptor->path.extension().wstring(), suffix) && suffix.size() >= 2) {
+            extension = suffix.substr(1);
+            where = "in every " + suffix + " file";
+        }
+    }
+    const std::string matches = "whole-word text matches for " + joined(names) + " " + where;
+    return word_search(names, arguments, scope, extension, "lines",
+                       lsp_failure_banner(reason, "Fallback below: " + matches + ", not semantic results"), context, cancelled);
+}
+} // namespace
+
+Json run_tool(const std::string& name, const Json& arguments,
+              const SearchContext& context, const std::shared_ptr<std::atomic_bool>& cancelled,
+              std::shared_ptr<TextStream>* stream, uint64_t text_limit) {
+    if (name == "repl") return run_repl(arguments, context, cancelled);
+    if (name == "lsp") return run_lsp_tool(arguments, context, cancelled);
+    const Json plain_arguments = fallback_arguments(name, arguments, context);
+    SearchContext plain = context;
+    plain.require_intent = false;
+    return run_backend_tool(name, plain_arguments, plain, cancelled, stream, text_limit);
+}
+
+void TextStream::add_text(std::string text) {
+    if (text.empty()) return;
+    // Small neighbours share one part, so a result of many small blocks does not become one part per block.
+    if (!parts_.empty() && !parts_.back().spilled && parts_.back().text.size() + text.size() <= (64u << 10)) {
+        parts_.back().text += text;
+        return;
+    }
+    parts_.push_back({std::move(text), 0, 0, false});
+}
+
+void TextStream::add_spilled(uint64_t offset, uint64_t length) {
+    if (length) parts_.push_back({std::string(), offset, length, true});
+}
+
+bool TextStream::next(std::string& piece) {
+    constexpr size_t target = 1u << 20;
+    piece = std::move(carry_);
+    carry_.clear();
+    while (piece.size() < target && part_ < parts_.size()) {
+        Part& part = parts_[part_];
+        if (part.spilled) {
+            const size_t take = static_cast<size_t>(std::min<uint64_t>(part.length - at_, target - piece.size()));
+            std::string bytes;
+            // move_only_function requires a target; retain std::function's empty-reader error.
+            if (!read_) throw std::bad_function_call();
+            read_(part.offset + at_, take, bytes);
+            piece += bytes;
+            at_ += take;
+            if (at_ == part.length) { ++part_; at_ = 0; }
+        } else {
+            const size_t take = std::min(part.text.size() - static_cast<size_t>(at_), target - piece.size());
+            piece.append(part.text, static_cast<size_t>(at_), take);
+            at_ += take;
+            if (at_ == part.text.size()) {
+                if (!retain_text_) std::string().swap(part.text);
+                ++part_; at_ = 0;
+            }
+        }
+    }
+    if (piece.empty()) return false;
+    if (part_ < parts_.size()) {
+        // More text follows: hold back a trailing, possibly incomplete UTF-8 sequence for the next piece.
+        for (size_t back = 1; back <= 3 && back <= piece.size(); ++back) {
+            const auto c = static_cast<unsigned char>(piece[piece.size() - back]);
+            if ((c & 0xC0) == 0x80) continue;
+            const size_t need = c >= 0xF0 ? 4 : c >= 0xE0 ? 3 : c >= 0xC0 ? 2 : 1;
+            if (need > back) {
+                carry_.assign(piece, piece.size() - back, back);
+                piece.resize(piece.size() - back);
+            }
+            break;
+        }
+    }
+    return true;
+}
+
+int64_t default_request_timeout_ms(const std::string& name, const Json& arguments) {
+    std::string operation;
+    if (const Json* value = arguments.get("operation"))
+        if (const auto* text = std::get_if<std::string>(&value->value)) operation = *text;
+    const auto enabled = [&](const char* key) {
+        const Json* value = arguments.get(key);
+        return value && std::holds_alternative<bool>(value->value) && value->boolean();
+    };
+    if (name == "find_files") return 300000;
+    if (name == "lsp" || name == "repl") return 180000;
+    if (name == "search") return operation.empty() || operation == "text" ? 30000 : 180000;
+    if (name == "read_file") {
+        if (!operation.empty() && operation != "text") return 180000;
+        // Text reads of code files are served by LSP (lsp_read_required), so they get the semantic deadline.
+        const auto code = [](const Json* value) {
+            const auto* text = value ? std::get_if<std::string>(&value->value) : nullptr;
+            return text && !text->empty() && lsp_read_required(native_path(*text));
+        };
+        if (code(arguments.get("path"))) return 180000;
+        if (const Json* paths = arguments.get("paths"); paths && std::holds_alternative<Json::Array>(paths->value))
+            for (const auto& item : paths->array()) if (code(&item)) return 180000;
+        return 30000;
+    }
+    if (name == "list_dir") return operation == "overview" ? 180000 : 30000;
+    if (name == "file_info")
+        return operation == "lsp" || operation == "diagnostics" || operation == "restart" ? 180000 : 30000;
+    if (name == "edit_file") {
+        const bool text_edit = operation == "text" || operation == "replace_content" || operation == "replace_in_files" ||
+            operation == "insert_at_line" || operation == "replace_lines" || operation == "delete_lines" ||
+            ((operation.empty() || operation == "auto") && !arguments.get("name_path"));
+        return text_edit ? 30000 : 180000;
+    }
+    if (name == "move_file") return operation == "filesystem" ? 30000 : 180000;
+    if (name == "write_file") return enabled("diagnostics") ? 180000 : 30000;
+    return 30000;
+}
+
+Json run_backend_tool(const std::string& name, const Json& arguments,
+                      const SearchContext& context, const std::shared_ptr<std::atomic_bool>& cancelled,
+                      std::shared_ptr<TextStream>* stream, uint64_t text_limit) {
+    // Facades and direct fallbacks share this gate; a refactor cannot race a navigation snapshot.
+    std::unique_lock<std::shared_timed_mutex> writer(workspace_operation_mutex(), std::defer_lock);
+    std::shared_lock<std::shared_timed_mutex> reader(workspace_operation_mutex(), std::defer_lock);
+    const auto deadline = request_deadline(Clock::now() + std::chrono::milliseconds(
+        bounded(arguments, "timeout_ms", default_request_timeout_ms(name, arguments), 1, 300000)));
+    for (;;) {
+        const bool acquired = is_write_tool(name) ? writer.try_lock_for(std::chrono::milliseconds(10))
+                                                 : reader.try_lock_for(std::chrono::milliseconds(10));
+        if (acquired) break;
+        if (cancelled && cancelled->load()) throw std::runtime_error("request cancelled while waiting for workspace access");
+        if (Clock::now() >= deadline) throw std::runtime_error("request timed out waiting for workspace access");
+    }
+    const RequestDeadline request(deadline);
+    SearchContext request_context = context;
+    request_context.record_user_reads = !is_write_tool(name);
+    try { return run_unlocked(name, arguments, request_context, cancelled, stream, text_limit); }
+    catch (const IndexWarmingFailure& e) {
+        throw IndexWarmingFailure(lsp_failure_banner(e.what(), "No semantic result was returned; retry with a larger timeout_ms"),
+                                  e.details);
+    }
+    catch (const LspFailure& e) {
+        // Requests without a fallback still carry the banner, so the model relays the failure.
+        throw std::runtime_error(lsp_failure_banner(e.what(), "No fallback exists for this operation; nothing was written"));
+    }
+}
+
+namespace {
+// The workspace's .shignore (shgrep's own ignore file, .gitignore syntax, read after .gitignore and .ignore so it
+// wins) is created empty at startup when missing, so the user has one place to list folders shgrep should skip.
+// Returns a notice for the user while it holds no rule. Best effort: a read-only or too-broad workspace, a link, or
+// an unreadable file gets no file and no notice.
+std::string shignore_notice(const SearchContext& context) {
+    if (context.read_only || context.allowed_roots.empty() || workspace_too_broad(context)) return {};
+    const fs::path path = fs::absolute(context.allowed_roots.front()).lexically_normal() / L".shignore";
+    // OPEN_ALWAYS creates it when missing; FILE_FLAG_OPEN_REPARSE_POINT opens a link itself, which is then refused.
+    Handle file(CreateFileW(long_path(path.wstring()).c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                            nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
+    if (!file) return {};
+    BY_HANDLE_FILE_INFORMATION info{};
+    if (!GetFileInformationByHandle(file.h, &info) ||
+        (info.dwFileAttributes & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DIRECTORY)))
+        return {};
+    // Rules are read up to 1 MiB, as for every ignore file; a rule is any line that is not blank or a # comment.
+    std::string text(static_cast<size_t>(std::min<uint64_t>((uint64_t(info.nFileSizeHigh) << 32) | info.nFileSizeLow, 1 << 20)), '\0');
+    DWORD got = 0;
+    if (!text.empty() && !ReadFile(file.h, text.data(), static_cast<DWORD>(text.size()), &got, nullptr)) return {};
+    text.resize(got);
+    if (text.starts_with("\xEF\xBB\xBF")) text.erase(0, 3);
+    for (size_t pos = 0; pos < text.size();) {
+        const size_t eol = std::min(text.find('\n', pos), text.size());
+        const std::string_view line(text.data() + pos, eol - pos);
+        const size_t first = line.find_first_not_of(" \t\r");
+        if (first != std::string_view::npos && line[first] != '#') return {};
+        pos = eol + 1;
+    }
+    std::string display;
+    try_utf8(path.wstring(), display);
+    return failure_banner("SHGREP NOTICE", display + " is empty. Optional: list the folders and files shgrep should skip in "
+                          "search, file listing and its index, one per line in .gitignore syntax (for example build/ or "
+                          "third_party/); it overrides .gitignore and .ignore", "Everything works without it");
+}
+} // namespace
+
+std::string health_notice(const SearchContext& context) {
+    // Index status is not reported here: it goes to the index log (index_log), never into tool results.
+    std::string notice = shignore_notice(context);
+    std::vector<std::string> problems;
+    // Optional ranking services are checked only by ranked searches.
+    for (auto& problem : lsp_health()) problems.push_back(std::move(problem));
+    if (problems.empty()) return notice;
+    std::string detail = "shgrep is not fully working: ";
+    for (size_t i = 0; i < problems.size(); ++i) detail += (i ? "; " : "") + problems[i];
+    return notice + failure_banner("SHGREP HEALTH", detail, "Everything else works; a request that needs a broken part fails "
+                                   "or uses explicitly requested text fallback under its own banner");
+}
+
+namespace {
+// CONTRACT: the caller holds the workspace gate (run_tool), so fallbacks may run nested searches here.
+Json run_unlocked(const std::string& name, const Json& arguments, const SearchContext& context,
+                  const std::shared_ptr<std::atomic_bool>& cancelled, std::shared_ptr<TextStream>* text_stream,
+                  uint64_t text_limit) {
+    if (is_file_tool(name)) return run_file_tool(name, arguments, context, cancelled);
+    if (name == "find_files") {
+        reject_unknown_arguments(name, arguments);
+        const std::string operation = text(arguments, "operation", "filesystem");
+        if (operation != "filesystem") {
+            if (operation != "symbols" && operation != "lsp") throw std::runtime_error("find_files operation must be filesystem, symbols, or lsp");
+            static const std::set<std::string> semantic_args{"operation", "path", "name_path", "pattern", "substring_matching", "include_kinds", "exclude_kinds", "timeout_ms", "allow_text_fallback"};
+            for (const auto& [key, value] : arguments.object()) { (void)value;
+                if (!semantic_args.contains(key)) throw std::runtime_error(key + " is a filesystem filter; use operation=filesystem");
+            }
+            Json::Object query = arguments.object();
+            Json response;
+            try { response = lsp_query(operation == "lsp" ? "files" : "symbols", query, context, cancelled); }
+            catch (const LspFailure& e) {
+                const auto names = requested_names(arguments);
+                if (operation == "lsp" || names.empty() || !boolean(arguments, "allow_text_fallback", false))
+                    throw std::runtime_error(lsp_failure_banner(e.what(), "No text fallback exists for this request"));
+                const std::string path = text(arguments, "path");
+                return word_search(names, arguments, path, {}, "files",
+                    lsp_failure_banner(e.what(), "Fallback below: files with whole-word text matches for " + joined(names) +
+                                                 ", not files with those symbols"), context, cancelled);
+            }
+            if (operation == "lsp") return Json::Object{{"text", response.dump() + "\n"}};
+            Json::Array files;
+            std::set<std::string> seen;
+            for (const auto& item : response.get("results")->array()) {
+                const std::string root = item.get("root") ? item.get("root")->string() : "";
+                const std::string path = item.get("path")->string();
+                if (seen.insert(root + "\n" + path).second) files.push_back(Json::Object{{"root", root}, {"path", path}});
+            }
+            return Json::Object{{"text", Json(Json::Object{{"files", std::move(files)}, {"backend", "lsp"}}).dump() + "\n"}};
+        }
+        for (const char* key : {"path", "name_path", "pattern", "substring_matching", "include_kinds", "exclude_kinds"})
+            if (arguments.get(key)) throw std::runtime_error(std::string(key) + " requires find_files operation=symbols or lsp");
+    }
+    if (name == "search") {
+        reject_unknown_arguments(name, arguments);
+        const std::string operation = text(arguments, "operation", "symbols");
+        if (operation == "text") {
+            for (const char* key : {"name_path", "include_body", "full_lines", "include_info", "include_kinds", "exclude_kinds", "depth", "substring_matching", "line", "column", "include_declaration"})
+                if (arguments.get(key)) throw std::runtime_error(std::string(key) + " is only supported by LSP navigation");
+            if (context.require_intent && text(arguments, "intent").find_first_not_of(" \t\r\n") == std::string::npos)
+                throw std::runtime_error("operation=text requires intent: the user's task in words. Built-in BM25 always ranks "
+                                         "the findings (an optional reranker, when running, reorders the top ones) and the "
+                                         "best 10 hunks return; for symbols use the LSP operations");
+        }
+        // GPU build (#87): LSP symbols ranked by meaning for a question in words.
+        if (operation == "meaning") {
+            static const std::set<std::string> meaning_args{"operation", "intent", "path", "max_results", "timeout_ms", "output"};
+            for (const auto& [key, value] : arguments.object()) {
+                (void)value;
+                if (!meaning_args.contains(key))
+                    throw std::runtime_error(key + " is not an operation=meaning option (intent, path, max_results, timeout_ms, output)");
+            }
+            if (const Json* output = arguments.get("output"); output && output->string() != "lines" && output->string() != "json")
+                throw std::runtime_error("operation=meaning output must be lines or json");
+            return meaning_search(arguments, context, cancelled);
+        }
+        if (operation != "text") {
+            if (operation != "symbols" && operation != "definition" && operation != "references" && operation != "declaration" &&
+                operation != "type_definition" && operation != "implementation" && operation != "hover")
+                throw std::runtime_error("unknown search operation");
+            static const std::set<std::string> navigation_args{
+                "operation", "path", "name_path", "pattern", "patterns", "include_body", "full_lines", "substring_matching",
+                "line", "column", "include_declaration", "timeout_ms", "include_info", "include_kinds", "exclude_kinds", "depth", "allow_text_fallback"};
+            for (const auto& [key, value] : arguments.object()) {
+                (void)value;
+                if (!navigation_args.contains(key))
+                    throw std::runtime_error(key + " is a text-search option; use operation=text or omit it for LSP");
+            }
+            try {
+                return Json::Object{{"text", lsp_query(operation, arguments, context, cancelled).dump() + "\n"}};
+            } catch (const LspFailure& e) {
+                if (boolean(arguments, "allow_text_fallback", false)) {
+                    if (auto fallback = text_fallback(operation, arguments, context, cancelled, e.what())) return std::move(*fallback);
+                }
+                throw;
+            }
+        }
+    }
+    // CONTRACT: CLI only (`shgrep index`); tool_list never offers it, so MCP clients cannot reach it.
+    if (name == "index") return build_index(context, cancelled);
+    if (name != "search" && name != "search_bytes" && name != "find_files") throw std::runtime_error("unknown tool");
+    Request r = parse_request(name, arguments, context);
+    // CONTRACT: an intent turns on keyword ranking of the findings (hunks, best first, capped per file); without one
+    //   the search returns every finding in scan order, exactly as before.
+    const std::string intent = name == "search" ? text(arguments, "intent") : std::string();
+    const bool ranking = intent.find_first_not_of(" \t\r\n") != std::string::npos;
+    const uint32_t requested_results = r.max_results, requested_per_file = r.max_per_file;
+    const size_t requested_output = r.max_output;
+    // CONTRACT (#89): ranked files and count output rank by the same hunks as line output. The scan collects lines;
+    //   the ranking step lists each file once, in the order of its best hunk, and count shows its matching lines.
+    const std::string requested_output_mode = r.output;
+    const bool ranked_file_list = ranking && (r.output == "files" || r.output == "count");
+    if (ranking) {
+        if (ranked_file_list) r.output = "lines";
+        // CONTRACT: ranking sees the findings up to SHGREP_RANK_SCAN_LIMIT matches (the status says when that cut in);
+        //   explicit result/output limits apply afterwards.
+        r.max_results = rank_scan_limit();
+        r.max_per_file = UINT32_MAX;
+        r.max_output = SIZE_MAX;
+        r.use_index = false;
+        r.color = false;
+        r.profile = false;
+    }
+    const auto started = Clock::now();
+    Control control{cancelled, request_deadline(started + std::chrono::milliseconds(r.timeout_ms))};
+    std::unique_ptr<Ranker> ranker;
+    if (ranking) ranker = std::make_unique<Ranker>(intent);
+    if (ranked_file_list) ranker->set_per_file(1);  // one hunk per file: the returned hunks name distinct files
+    // GPU build (#87): ranked search always mixes in meaning scores from the model; its failures fail the search.
+    if (ranking && embed_built()) ranker->set_dense(meaning_hunk_scorer(intent, context, control.deadline), meaning_weight());
+    const int64_t began = ticks();
+    std::shared_ptr<const Database> database;
+    if (!r.file_only) database = compiled_database(r, context);
+    const int64_t compiled = ticks();
+    std::vector<std::pair<fs::path, std::wstring>> roots;
+    for (const auto& allowed : context.allowed_roots) {
+        Handle h(CreateFileW(absolute_long_path(allowed).c_str(), FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                             nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr));
+        if (!h) throw std::runtime_error("configured root unavailable: " + utf8(allowed.wstring()));
+        roots.emplace_back(allowed, final_path(h.h));
+    }
+    struct Selected { fs::path raw; std::wstring final; std::shared_ptr<Handle> handle; };
+    struct NamedFile { SourceText source; std::wstring final; std::string scope; WalkRoot root; };
+    std::vector<Selected> selected;
+    std::vector<NamedFile> named_files;
+    for (const auto& raw : r.roots) {
+        // The listing handle itself is validated and then walked (WalkRoot::handle).
+        auto h = std::make_shared<Handle>(open_root_directory(raw.wstring()));
+        if (!*h) throw std::runtime_error("requested root unavailable: " + utf8(raw.wstring()));
+        BY_HANDLE_FILE_INFORMATION info{};
+        if (!GetFileInformationByHandle(h->h, &info))
+            throw std::runtime_error("cannot inspect requested root: " + utf8(raw.wstring()));
+        std::wstring final = final_path(h->h);
+        bool allowed = false;
+        for (const auto& root : roots) if (inside(final, root.second)) { allowed = true; break; }
+        if (!allowed) throw std::runtime_error("requested root is outside configured roots");
+        if (!(info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
+            if (r.file_only || r.binary) throw std::runtime_error("requested root is not a directory");
+            bool directory = false;
+            const SourceText source = source_descriptor(context, utf8(fs::absolute(raw).lexically_normal().wstring()), &directory);
+            if (directory) throw std::runtime_error("requested file changed while resolving roots");
+            bool duplicate = false;
+            for (const auto& named : named_files)
+                if (same_name(final, named.final.c_str())) { duplicate = true; break; }
+            if (duplicate) continue;
+            const std::wstring root_path = source.root.wstring();
+            const std::wstring full = source.path.wstring();
+            if (full.size() <= root_path.size() ||
+                CompareStringOrdinal(full.data(), static_cast<int>(root_path.size()), root_path.data(),
+                                     static_cast<int>(root_path.size()), TRUE) != CSTR_EQUAL)
+                throw std::runtime_error("requested file is outside configured roots");
+            std::wstring relative = full.substr(root_path.size());
+            while (!relative.empty() && (relative.front() == L'\\' || relative.front() == L'/')) relative.erase(0, 1);
+            std::replace(relative.begin(), relative.end(), L'\\', L'/');
+            std::string scope;
+            if (!try_utf8(relative, scope) || scope.empty()) throw std::runtime_error("invalid requested file path");
+            auto root_handle = std::make_shared<Handle>(open_root_directory(root_path));
+            if (!*root_handle) throw std::runtime_error("configured root unavailable: " + utf8(root_path));
+            const std::wstring root_final = final_path(root_handle->h);
+            bool root_matches = false;
+            for (const auto& root : roots)
+                if (same_name(root.second, root_final.c_str()))
+                    root_matches = true;
+            if (!root_matches) throw std::runtime_error("configured root changed while resolving requested file");
+            named_files.push_back({source, std::move(final), std::move(scope),
+                                   {root_path, root_final, std::move(root_handle)}});
+            continue;
+        }
+        selected.push_back({raw, std::move(final), std::move(h)});
+    }
+    std::sort(selected.begin(), selected.end(), [](const Selected& a, const Selected& b) { return a.final.size() < b.final.size(); });
+    std::vector<WalkRoot> walk_roots;
+    for (auto& candidate : selected) {
+        bool covered = false;
+        for (const auto& prior : walk_roots) if (inside(candidate.final, prior.final)) { covered = true; break; }
+        if (!covered) walk_roots.push_back({fs::absolute(candidate.raw).lexically_normal().wstring(), std::move(candidate.final),
+                                            std::move(candidate.handle)});
+    }
+    // CONTRACT: the workspace's .shgrep directory (the pattern cache) is never walked, whatever hidden or
+    // no_ignore say. Walks build paths from the walk root's path, so the cache's final path is mapped onto it.
+    if (!roots.empty()) {
+        const std::wstring cache_parent = join_path(roots.front().second, cache_directory_name);
+        const auto exclude_cache = [&](const WalkRoot& root) {
+            if (cache_parent.size() <= root.final.size() || !inside(cache_parent, root.final)) return;
+            const size_t skip = root.final.size() + (root.final.back() == L'\\' ? 0 : 1);
+            r.excluded_directories.push_back(join_path(root.path, std::wstring_view(cache_parent).substr(skip)));
+        };
+        for (const auto& root : walk_roots) exclude_cache(root);
+        for (const auto& named : named_files) exclude_cache(named.root);
+    }
+
+    const int64_t resolved = ticks();
+    Outcome out;
+    // JSON output is escaped twice (result object, then MCP text), so it gets half the budget; text output is
+    // escaped once and keeps room for the footer.
+    const bool text_output = r.output != "json";
+    // Large text output may stay on disk for main.cpp to stream. Ranked requests read every block, so they never spill.
+    if (text_stream && text_output && !ranking && r.max_output == SIZE_MAX) out.spill = std::make_shared<TextSpill>();
+    // A caller that would refuse a text result over text_limit bytes does not wait for it to be built. Ranking can shrink
+    // what the scan accumulates, so ranked requests are not checked.
+    if (text_limit && text_output && !ranking) out.raw_limit = text_limit;
+    // Reserve a modest starting batch; the default result count is unbounded.
+    if (text_output) out.blocks.reserve(std::min<uint32_t>(r.max_results, 100));
+    else out.results.reserve(std::min<uint32_t>(r.max_results, 100));
+    // Both outputs are measured as they travel, escaped inside the MCP text field; 768 bytes stay for the footer or
+    // summary and the envelope.
+    const size_t content_budget = r.max_output > 1024 ? r.max_output - 768 : r.max_output / 2;
+    // PERF: one worker per logical processor across all processor groups, by the owner's decision.
+    // Concurrent MCP requests each get their own full pool.
+    const DWORD processors = GetActiveProcessorCount(ALL_PROCESSOR_GROUPS);
+    // PERF: measured 12/18/24 workers on a 12-thread CPU with a warm cache: more workers than logical
+    // processors did not hide open latency and was up to 6 ms slower.
+    const unsigned worker_override = env_workers();
+    const unsigned worker_count = worker_override ? worker_override
+                                  : processors == 0 ? 1u : static_cast<unsigned>(processors);
+    std::vector<WorkerProfile> profiles(r.profile ? worker_count : 0);
+    std::vector<std::unique_ptr<Worker>> workers;
+    for (unsigned i = 0; i < worker_count; ++i) {
+        auto worker = std::make_unique<Worker>();
+        if (r.profile) worker->profile = &profiles[i];
+        if (database) {
+            // PCRE2 databases have no Hyperscan scratch; their match state is created per worker on first use.
+            const bool cloned = !database->db || hs_clone_scratch(database->scratch.get(), std::out_ptr(worker->scratch)) == HS_SUCCESS;
+            if (!cloned) throw std::runtime_error("scratch allocation failed");
+            if (database->engine) worker->engine_scratch = database->engine->make_scratch();
+        }
+        workers.push_back(std::move(worker));
+    }
+    MemoryBudget memory(text_memory_budget);
+    // Relative paths use a configured root, never the selected subdirectory.
+    // With several configured roots, relative output requires an explicit request
+    // and every selected target must belong to the same configured root.
+    std::vector<std::wstring> relative_prefixes;
+    std::string relative_root;
+    if (r.relative && (roots.size() == 1 || r.paths_explicit)) {
+        size_t owner = roots.size();
+        bool ambiguous = false;
+        const auto consider = [&](const std::wstring& final) {
+            size_t best = roots.size();
+            for (size_t i = 0; i < roots.size(); ++i)
+                if (inside(final, roots[i].second) &&
+                    (best == roots.size() || roots[i].second.size() > roots[best].second.size())) best = i;
+            if (best == roots.size()) ambiguous = true;
+            else if (owner == roots.size()) owner = best;
+            else if (owner != best) ambiguous = true;
+        };
+        for (const auto& root : walk_roots) consider(root.final);
+        for (const auto& named : named_files) consider(named.final);
+        if (!ambiguous && owner < roots.size()) {
+            std::wstring lexical = fs::absolute(roots[owner].first).lexically_normal().wstring();
+            std::replace(lexical.begin(), lexical.end(), L'/', L'\\');
+            const std::wstring canonical = roots[owner].second;
+            std::wstring canonical_plain = canonical;
+            if (canonical_plain.starts_with(L"\\\\?\\UNC\\"))
+                canonical_plain = L"\\\\" + canonical_plain.substr(8);
+            else if (canonical_plain.starts_with(L"\\\\?\\"))
+                canonical_plain.erase(0, 4);
+            const auto represented = [&](std::wstring path) {
+                std::replace(path.begin(), path.end(), L'/', L'\\');
+                return inside(path, lexical) || inside(path, canonical) || inside(path, canonical_plain);
+            };
+            const bool all_represented =
+                std::all_of(walk_roots.begin(), walk_roots.end(), [&](const WalkRoot& root) { return represented(root.path); }) &&
+                std::all_of(named_files.begin(), named_files.end(), [&](const NamedFile& named) {
+                    return represented(named.source.path.wstring());
+                });
+            if (all_represented && try_utf8(lexical, relative_root)) {
+                const auto add_prefix = [&](std::wstring prefix) {
+                    if (!prefix.empty() && prefix.back() != L'\\' && prefix.back() != L'/') prefix.push_back(L'\\');
+                    if (!prefix.empty()) relative_prefixes.push_back(std::move(prefix));
+                };
+                add_prefix(lexical);
+                if (!same_name(canonical, lexical.c_str())) add_prefix(canonical);
+                if (!same_name(canonical_plain, lexical.c_str()) && !same_name(canonical_plain, canonical.c_str()))
+                    add_prefix(canonical_plain);
+            }
+        }
+    }
+    // CONTRACT: only a request with index: true consults an index; every other search walks every root as before.
+    std::vector<IndexUse> index_uses;
+    std::vector<std::unique_ptr<SnapshotFilter>> snapshot_filters;
+    std::string index_note;
+    std::vector<WalkRoot> plain_roots = walk_roots;
+    if (r.use_index) index_note = prepare_index(r, context, control, plain_roots, index_uses, snapshot_filters);
+    const ScanShared shared{r, database.get(), control, out, memory, content_budget, relative_prefixes, context};
+    // Named files are searched independently even when a listed directory contains them.
+    // Skip their equivalent paths in directory walks and indexed candidates.
+    std::vector<std::wstring> named_paths;
+    for (const auto& named : named_files) {
+        named_paths.push_back(named.source.path.wstring());
+        named_paths.push_back(named.final);
+        for (const auto& root : walk_roots) {
+            if (!inside(named.final, root.final) || named.final.size() <= root.final.size()) continue;
+            size_t first = root.final.size();
+            while (first < named.final.size() && (named.final[first] == L'\\' || named.final[first] == L'/')) ++first;
+            named_paths.push_back(join_path(root.path, std::wstring_view(named.final).substr(first)));
+        }
+    }
+    if (!named_files.empty() && r.use_index && r.index_requested)
+        index_note += "[index not used for explicitly named files; searched directly]\n";
+    const int64_t prepared = ticks();
+    for (const auto& named : named_files) {
+        if (control.stop.load()) break;
+        Request scoped = r;
+        scoped.scope = named.scope;
+        scoped.scope_file = true;
+        scoped.use_index = false;
+        const ScanShared file_shared{scoped, database.get(), control, out, memory, content_budget, relative_prefixes, context};
+        const FileVisitor visit_named = [&](unsigned index, HANDLE directory, std::wstring_view name,
+                                             const std::wstring& path, uint64_t listed_size, uint64_t) {
+            try { scan_file(file_shared, *workers[index], directory, name, path, listed_size); }
+            catch (const fs::filesystem_error&) { ++out.errors; }
+        };
+        walk(scoped, std::vector<WalkRoot>{named.root}, worker_count, control, out, visit_named,
+             profiles.empty() ? nullptr : profiles.data());
+        if (out.failure) std::rethrow_exception(out.failure);
+    }
+    const FileVisitor visit = [&](unsigned index, HANDLE directory, std::wstring_view name, const std::wstring& path,
+                                  uint64_t listed_size, uint64_t listed_write_time) {
+        for (const auto& named : named_paths) if (same_name(path, named.c_str())) return;
+        if (!snapshot_filters.empty() && snapshot_skips(snapshot_filters, path, listed_size, listed_write_time)) return;
+        try { scan_file(shared, *workers[index], directory, name, path, listed_size); }
+        catch (const fs::filesystem_error&) { ++out.errors; }
+    };
+    for (const auto& use : index_uses) {
+        for (auto& worker : workers) worker->index_snapshot = true;
+        scan_index(r, use, worker_count, control, out, visit);
+        for (auto& worker : workers) worker->index_snapshot = false;
+    }
+    if (!plain_roots.empty())
+        walk(r, plain_roots, worker_count, control, out, visit, profiles.empty() ? nullptr : profiles.data());
+    const int64_t walked = ticks();
+    if (out.failure) std::rethrow_exception(out.failure);
+    if (out.over_limit)
+        throw std::runtime_error("the output is over " + std::to_string(text_limit >> 20) + " MiB, more than the " +
+                                 std::to_string(text_limit >> 20) + " MiB the server keeps for continue; narrow the request "
+                                 "(path, include, patterns or max_results)");
+
+    const uint64_t files = out.files.load(), errors = out.errors.load(), skipped_size = out.skipped_size.load();
+    const uint64_t skipped_lsp = out.skipped_lsp.load(), text_fallbacks = out.text_fallbacks.load();
+    std::string access_note;
+    if (skipped_lsp) access_note = "[LSP required: skipped " + std::to_string(skipped_lsp) +
+        " programming/XML files before reading content; use the direct lsp tool. Semantic text fallback remains explicit]\n";
+    if (text_fallbacks) access_note += lsp_failure_banner(out.fallback_reason,
+        "Explicit text fallback for " + std::to_string(text_fallbacks) + " files without working LSP");
+    std::string state = out.state;
+    if (state == "complete" && out.per_file_limited.load()) state = "per_file_limit";
+    if (state == "complete" && (errors || skipped_size)) state = "partial_files";
+    Json::Array results = std::move(out.results);
+    std::vector<TextBlock> blocks = std::move(out.blocks);
+    Json::Array skipped_files = std::move(out.skipped_files);
+    // CONTRACT: the work after the walk (sorting, ranking, limits, output assembly) stops on cancellation and at the
+    //   deadline, which a walk that already timed out extends by the 1 s main.cpp grants partial results; it is not
+    //   left running for a response the encoder would refuse. post_check(true) checks at once, else every 1024th call.
+    const Clock::time_point post_deadline =
+        state == "timeout" ? std::max(control.deadline, Clock::now() + std::chrono::seconds(1)) : control.deadline;
+    size_t post_steps = 0;
+    const auto post_check = [&](bool now = false) {
+        if (!now && (++post_steps & 1023) != 0) return;
+        if (cancelled->load()) throw std::runtime_error("search cancelled while assembling its results");
+        if (Clock::now() >= post_deadline) throw std::runtime_error("search timed out while assembling its results");
+    };
+    // CONTRACT: workers finish files in nondeterministic order; sorting keeps output stable for a result set.
+    // PERF: both sorts order indexes by keys read once, then move each element once; moving Json values
+    // allocates on MSVC, and stable_sort moves each element O(log n) times.
+    if (!blocks.empty()) {
+        std::vector<size_t> order(blocks.size());
+        for (size_t i = 0; i < order.size(); ++i) order[i] = i;
+        std::stable_sort(order.begin(), order.end(), [&](size_t a, size_t b) {
+            post_check();
+            return blocks[a].path < blocks[b].path;
+        });
+        std::vector<TextBlock> sorted;
+        sorted.reserve(blocks.size());
+        for (size_t i : order) sorted.push_back(std::move(blocks[i]));
+        blocks = std::move(sorted);
+    }
+    if (!results.empty()) {
+        struct Key {
+            const std::string* path;
+            const Json* start;
+        };
+        std::vector<Key> keys;
+        keys.reserve(results.size());
+        for (const auto& item : results) keys.push_back({&item.object().at("path").string(), item.get("byte_start")});
+        std::vector<size_t> order(results.size());
+        for (size_t i = 0; i < order.size(); ++i) order[i] = i;
+        std::stable_sort(order.begin(), order.end(), [&](size_t a, size_t b) {
+            post_check();
+            const Key& x = keys[a];
+            const Key& y = keys[b];
+            if (*x.path != *y.path) return *x.path < *y.path;
+            return x.start && y.start && x.start->integer() < y.start->integer();
+        });
+        Json::Array sorted;
+        sorted.reserve(results.size());
+        for (size_t i : order) sorted.push_back(std::move(results[i]));
+        results = std::move(sorted);
+    }
+    Json rank_report;
+    std::string rank_note;  // told to the reader when ranking returned fewer hunks than it found or ran without the reranker
+    if (ranker) {
+        // CONTRACT: ranking orders hunks of the text output (groups between "--" separators, or nearby matched lines
+        //   when there are none) or groups of json results with overlapping context. The returned groups keep their
+        //   original output text and come best first; explicit result/output limits apply afterwards.
+        struct Piece {
+            std::string path, text, code;  // text: original output lines; code: the source without grep prefixes
+            uint64_t first = 0, last = 0, end = 0;  // lines (0 = unknown); end: raw context end of a json group
+            uint32_t units = 0;
+            std::vector<size_t> items;  // json results in this group
+        };
+        std::vector<Piece> pieces;
+        if (text_output) {
+            const bool separated = r.before_lines || r.after_lines || r.block;
+            for (auto& block : blocks) {
+                if (r.output != "lines") {
+                    Piece whole;
+                    whole.path = block.path;
+                    whole.text = std::move(block.text);
+                    whole.units = block.units;
+                    pieces.push_back(std::move(whole));
+                    continue;
+                }
+                Piece piece;
+                piece.path = block.path;
+                uint64_t previous_line = 0;
+                const auto close = [&] {
+                    if (!piece.text.empty()) pieces.push_back(std::move(piece));
+                    piece = Piece();
+                    piece.path = block.path;
+                    previous_line = 0;
+                };
+                const std::string_view text = block.text;
+                const std::string_view path = block.path;
+                for (size_t pos = 0; pos < text.size();) {
+                    post_check();
+                    const size_t newline = text.find('\n', pos);
+                    const size_t next = newline == std::string_view::npos ? text.size() : newline + 1;
+                    const std::string_view line = text.substr(pos, next - pos);
+                    pos = next;
+                    if (line == "--\n" || line == "--") { close(); continue; }
+                    // Lines are path:N:text for matches and path-N-text for context (path:text without numbers).
+                    std::string_view code = line;
+                    uint64_t number = 0;
+                    bool matched = false;
+                    if (line.size() > path.size() && line.starts_with(path) &&
+                        (line[path.size()] == ':' || line[path.size()] == '-')) {
+                        const char separator = line[path.size()];
+                        matched = separator == ':';
+                        code = line.substr(path.size() + 1);
+                        if (r.line) {
+                            size_t digits = 0;
+                            while (digits < code.size() && digits < 19 && code[digits] >= '0' && code[digits] <= '9') ++digits;
+                            if (digits && digits < code.size() && code[digits] == separator) {
+                                for (size_t d = 0; d < digits; ++d) number = number * 10 + static_cast<uint64_t>(code[d] - '0');
+                                code.remove_prefix(digits + 1);
+                            }
+                        }
+                    }
+                    // Without separators, nearby matches stay together and distant ones form their own hunk.
+                    if (!separated && !piece.text.empty() &&
+                        (piece.text.size() >= 1200 || (number && previous_line && number > previous_line + 3)))
+                        close();
+                    if (number) {
+                        if (!piece.first) piece.first = number;
+                        piece.last = number;
+                        previous_line = number;
+                    }
+                    piece.text.append(line);
+                    piece.code.append(code);
+                    piece.units += matched;
+                }
+                close();
+            }
+        } else {
+            for (size_t i = 0; i < results.size(); ++i) {
+                post_check();
+                const Json& item = results[i];
+                const std::string& path = item.get("path")->string();
+                const Json* window = item.get("context");
+                const std::string_view text = window && std::holds_alternative<std::string>(window->value)
+                                                  ? std::string_view(window->string()) : std::string_view();
+                const Json* start_field = item.get("context_start");
+                const uint64_t start = start_field ? static_cast<uint64_t>(start_field->integer()) : 0;
+                uint64_t first = 0, last = 0;
+                if (const Json* line = item.get("line")) {
+                    const Json* at = item.get("context_match_start");
+                    const size_t match = at ? std::min<size_t>(static_cast<size_t>(at->integer()), text.size()) : 0;
+                    const auto before = static_cast<uint64_t>(std::count(text.begin(), text.begin() + match, '\n'));
+                    const auto number = static_cast<uint64_t>(line->integer());
+                    first = number > before ? number - before : 1;
+                    const std::string_view body = text.ends_with('\n') ? text.substr(0, text.size() - 1) : text;
+                    last = first + static_cast<uint64_t>(std::count(body.begin(), body.end(), '\n'));
+                }
+                // Results are sorted by path and offset, so overlapping windows of one place are adjacent.
+                if (!pieces.empty() && pieces.back().path == path && start <= pieces.back().end) {
+                    Piece& group = pieces.back();
+                    const uint64_t overlap = group.end - start;
+                    if (overlap < text.size()) group.code.append(text.substr(static_cast<size_t>(overlap)));
+                    group.end = std::max<uint64_t>(group.end, start + text.size());
+                    if (first) {
+                        group.first = group.first ? std::min(group.first, first) : first;
+                        group.last = std::max(group.last, last);
+                    }
+                    ++group.units;
+                    group.items.push_back(i);
+                    continue;
+                }
+                Piece group;
+                group.path = path;
+                group.code = std::string(text);
+                group.first = first;
+                group.last = last;
+                group.end = start + text.size();
+                group.units = 1;
+                group.items.push_back(i);
+                pieces.push_back(std::move(group));
+            }
+        }
+        std::vector<RankCandidate> rank_candidates;
+        rank_candidates.reserve(pieces.size());
+        for (const auto& piece : pieces) rank_candidates.push_back({piece.path, piece.first, piece.last, piece.code});
+        const std::vector<Ranked> ranked = ranker->rank(rank_candidates, cancelled);
+        post_check(true);
+        size_t matching_files = 0;  // ranked files/count output: files with at least one hunk
+        if (ranked_file_list) {
+            // Counts cover every hunk of a file, not only the returned one (grep -c: matching lines). With several
+            // patterns the per-pattern split of plain count output is not available here.
+            std::map<std::string_view, uint64_t> matched_lines;
+            for (const auto& piece : pieces) matched_lines[piece.path] += piece.units;
+            matching_files = matched_lines.size();
+            std::vector<TextBlock> kept_blocks;
+            kept_blocks.reserve(ranked.size());
+            for (const auto& pick : ranked) {
+                const Piece& piece = pieces[pick.index];
+                std::string line = piece.path;
+                if (requested_output_mode == "count") line += ":" + std::to_string(matched_lines[piece.path]);
+                kept_blocks.push_back(TextBlock{piece.path, line + "\n", 1});
+            }
+            blocks = std::move(kept_blocks);
+        } else if (text_output) {
+            std::vector<TextBlock> kept_blocks;
+            kept_blocks.reserve(ranked.size());
+            for (const auto& pick : ranked) {
+                Piece& piece = pieces[pick.index];
+                kept_blocks.push_back(TextBlock{piece.path, std::move(piece.text), std::max<uint32_t>(piece.units, 1)});
+            }
+            blocks = std::move(kept_blocks);
+        } else {
+            Json::Array kept_results;
+            for (size_t position = 0; position < ranked.size(); ++position) {
+                const Ranked& pick = ranked[position];
+                for (size_t i : pieces[pick.index].items) {
+                    Json item = std::move(results[i]);
+                    Json::Object ranking{{"rank", static_cast<int64_t>(position + 1)},
+                                         {"keyword_rank", static_cast<int64_t>(pick.keyword_rank + 1)}, {"score", pick.score}};
+                    if (pick.reranked) ranking.emplace("rerank_score", pick.rerank_score);
+                    std::get<Json::Object>(item.value).emplace("ranking", std::move(ranking));
+                    kept_results.push_back(std::move(item));
+                }
+            }
+            results = std::move(kept_results);
+        }
+        rank_report = ranker->report();
+        if (const Json* error = rank_report.get("rerank_error"))
+            rank_note = "ranked by BM25 only; the optional reranker that reorders the top hunks is not running (" +
+                        error->string() + ")";
+        if (ranked_file_list) {
+            if (ranked.size() < matching_files)
+                rank_note += std::string(rank_note.empty() ? "" : ". ") + "showing " + std::to_string(ranked.size()) + " of " +
+                             std::to_string(matching_files) + " matching files, ordered by each file's best hunk for the "
+                             "intent; narrow path, include or the patterns to see the rest";
+        } else if (ranked.size() < pieces.size()) {
+            rank_note += std::string(rank_note.empty() ? "" : ". ") + "showing " + std::to_string(ranked.size()) + " of " +
+                         std::to_string(pieces.size()) + " matching hunks, best first for the intent; narrow path, include or "
+                         "the patterns, or use LSP references, to see the rest";
+        }
+        if (state == "limit")
+            rank_note += std::string(rank_note.empty() ? "" : ". ") +
+                         "the scan stopped at SHGREP_RANK_SCAN_LIMIT matches, so these are the best of the first matches found; "
+                         "narrow path, include or the patterns to rank the rest";
+        if (!rank_note.empty()) std::get<Json::Object>(rank_report.value).emplace("note", rank_note);
+        r.max_results = requested_results;
+        r.max_per_file = requested_per_file;
+        r.max_output = requested_output;
+        r.output = requested_output_mode;  // files/count scanned as lines (#89); limits and rendering use the request's mode
+        uint64_t returned = 0;
+        std::vector<TextBlock> limited_blocks;
+        // max_matches_per_file counts across all of a file's hunks, as per_file does for json below.
+        std::map<std::string, uint64_t> block_per_file;
+        for (auto& block : blocks) {
+            const uint64_t allowance = returned < r.max_results ? r.max_results - returned : 0;
+            uint64_t& used = block_per_file[block.path];
+            const uint64_t file_left = used < r.max_per_file ? r.max_per_file - used : 0;
+            const uint32_t keep = static_cast<uint32_t>(std::min<uint64_t>(
+                allowance, r.output == "lines" ? file_left : UINT32_MAX));
+            if (block.units > keep) {
+                if (state == "complete") state = allowance < block.units ? "limit" : "per_file_limit";
+                if (!keep) continue;
+                block.text = keep_matched_lines(r, block.text, block.path, keep);
+                block.units = keep;
+            }
+            used += block.units;
+            returned += block.units;
+            limited_blocks.push_back(std::move(block));
+        }
+        blocks = std::move(limited_blocks);
+        Json::Array limited_results;
+        std::map<std::string, uint64_t> per_file;
+        for (auto& item : results) {
+            if (limited_results.size() >= r.max_results) {
+                if (state == "complete") state = "limit";
+                break;
+            }
+            auto& count = per_file[item.get("path")->string()];
+            if (count >= r.max_per_file) {
+                if (state == "complete") state = "per_file_limit";
+                continue;
+            }
+            ++count;
+            limited_results.push_back(std::move(item));
+        }
+        results = std::move(limited_results);
+    }
+    const int64_t ordered = ticks();
+    auto elapsed = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - started).count());
+    uint64_t index_files = 0, index_opened = 0;
+    for (const auto& use : index_uses) {
+        index_files += use.indexed_files;
+        index_opened += use.candidates.size();
+    }
+    if (!index_uses.empty() && r.index_requested) {
+        index_note += "[index: " + std::to_string(index_opened) + " of " + std::to_string(index_files) +
+                      " indexed files were candidates";
+        if (out.index_missing.load()) index_note += ", " + std::to_string(out.index_missing.load()) + " of them deleted since";
+        index_note += "]\n";
+    }
+    if (r.index_requested)
+        for (const auto& filter : snapshot_filters)
+            index_note += "[index: " + std::to_string(filter->skipped.load()) + " unchanged files ruled out by the snapshot, " +
+                          std::to_string(filter->changed.load()) + " new or changed files searched]\n";
+    // An index that ruled out every file is not a selection problem.
+    bool show_selection = files == 0 && index_uses.empty() && snapshot_filters.empty();
+    auto make_profile = [&] {
+        // Request phases are wall-clock time on the calling thread.
+        Json::Object profile = profile_json(profiles, prepared);
+        profile.emplace("request_us", Json::Object{{"compile", ticks_to_us(compiled - began)},
+            {"roots", ticks_to_us(resolved - compiled)}, {"setup", ticks_to_us(prepared - resolved)},
+            {"walk", ticks_to_us(walked - prepared)}, {"sort", ticks_to_us(ordered - walked)},
+            {"finish", ticks_to_us(ticks() - walked)}});
+        if (database) {
+            const char* engine = database->engine ? backend_name(database->engine->backend())
+                                                  : database->db ? "hyperscan" : "pcre2";
+            profile.emplace("backend", std::string(engine));
+            profile.emplace("engine_fallbacks", out.engine_fallbacks.load());
+        }
+        if (Closer* closer = Closer::get()) profile.emplace("closes_pending", closer->pending());
+        return profile;
+    };
+    if (text_output) {
+        Footer footer{state, {}, files, errors, skipped_size, elapsed, 0, show_selection,
+                      out.regular_seen.load(), out.files_filtered.load(), out.files_ignored.load(),
+                      out.files_hidden.load(), out.directories_pruned.load(), out.reparse_skipped.load()};
+        for (const auto& root : walk_roots) {
+            std::string display;
+            if (try_utf8(root.path, display)) footer.roots.push_back(std::move(display));
+        }
+        for (const auto& named : named_files) {
+            std::string display;
+            if (try_utf8(named.source.path.wstring(), display)) footer.roots.push_back(std::move(display));
+        }
+        // Ranking returns block-mode hunks one per block, so they need the separator the scan put between them.
+        const bool separate_files = r.output == "lines" && (r.before_lines || r.after_lines || (ranking && r.block));
+        const bool grouped = r.output == "lines" && !r.binary && !r.file_only;
+        const bool single_file = r.scope_file || (named_files.size() == 1 && walk_roots.empty());
+        if (text_stream && out.spill && out.spill->size()) {
+            // The same text as the loop below builds (it is the only pass without an output limit), kept as parts: blocks
+            // still in memory are moved in, spilled ones are read back by main.cpp while it writes the response.
+            post_check(true);
+            const std::shared_ptr<TextSpill> original_spill = out.spill;
+            const std::shared_ptr<TextSpill> spill = grouped ? std::make_shared<TextSpill>() : original_spill;
+            auto stream = std::make_shared<TextStream>([spill](uint64_t offset, uint64_t length, std::string& bytes) {
+                spill->read(offset, length, bytes);
+            });
+            std::string head = access_note;
+            if (!relative_prefixes.empty() && !blocks.empty()) head += "[paths relative to " + relative_root + "]\n";
+            stream->add_text(std::move(head));
+            if (!ranking && r.output == "lines") stream->add_text(narrow_hint(blocks, out.found.load()));
+            uint64_t units = 0;
+            std::string previous_path;
+            for (size_t i = 0; i < blocks.size(); ++i) {
+                post_check();
+                auto& block = blocks[i];
+                if (separate_files && i) stream->add_text("--\n");
+                if (grouped && !single_file && (i == 0 || block.path != previous_path))
+                    stream->add_text(painted(r, block.path) + "\n");
+                previous_path = block.path;
+                if (!grouped) {
+                    if (block.spilled) stream->add_spilled(block.spill_offset, block.spill_length);
+                    else stream->add_text(std::move(block.text));
+                } else {
+                    GroupedLines formatter(painted(r, block.path));
+                    if (block.spilled) {
+                        const uint64_t start = spill->size();
+                        for (uint64_t at = 0; at < block.spill_length;) {
+                            post_check();
+                            const uint64_t take = std::min<uint64_t>(block.spill_length - at, 1u << 20);
+                            std::string chunk;
+                            original_spill->read(block.spill_offset + at, take, chunk);
+                            at += take;
+                            spill->append(formatter.append(chunk, at == block.spill_length));
+                        }
+                        stream->add_spilled(start, spill->size() - start);
+                    } else {
+                        stream->add_text(formatter.append(block.text, true));
+                        std::string().swap(block.text);
+                    }
+                }
+                units += block.units;
+            }
+            footer.state = state;
+            footer.returned = units;
+            std::string tail = render_footer(r, footer, skipped_files);
+            tail += index_note;
+            if (!profiles.empty()) tail += "[profile " + Json(make_profile()).dump() + "]\n";
+            stream->add_text(std::move(tail));
+            *text_stream = std::move(stream);
+            return Json::Object{{"access_note", access_note},
+                {"summary", summary(files, out.bytes.load(), out.found.load(), units, errors, skipped_size,
+                                    out.skipped_binary.load(), elapsed, state)}};
+        }
+        const std::string hint = ranking || r.output != "lines" ? std::string() : narrow_hint(blocks, out.found.load());
+        for (;;) {
+            post_check(true);  // each pass rebuilds the whole text
+            std::string text;
+            uint64_t units = 0;
+            size_t length = 0;
+            for (const auto& block : blocks) length += block.text.size() + 3;
+            text.reserve(length + 1024 + hint.size());
+            text += access_note;
+            text += hint;
+            if (ranking) text += "[ranking " + rank_report.dump() + "]\n";
+            if (!rank_note.empty()) text += "[" + rank_note + "]\n";
+            if (!relative_prefixes.empty() && !blocks.empty()) text += "[paths relative to " + relative_root + "]\n";
+            std::string previous_path;
+            for (size_t i = 0; i < blocks.size(); ++i) {
+                post_check();
+                if (separate_files && i) text += "--\n";
+                if (grouped && !single_file && (i == 0 || blocks[i].path != previous_path))
+                    text += painted(r, blocks[i].path) + "\n";
+                previous_path = blocks[i].path;
+                if (grouped) {
+                    GroupedLines formatter(painted(r, blocks[i].path));
+                    text += formatter.append(blocks[i].text, true);
+                } else text += blocks[i].text;
+                units += blocks[i].units;
+                // Without an output limit this is the only pass, so the block is not needed again.
+                if (r.max_output == SIZE_MAX) std::string().swap(blocks[i].text);
+            }
+            footer.state = state;
+            // Selection can retain supporting context without a grep hit; do not claim the scan found nothing.
+            footer.returned = ranking && out.found.load() ? std::max<uint64_t>(units, 1) : units;
+            text += render_footer(r, footer, skipped_files);
+            text += index_note;
+            // PERF: blocks were budgeted while publishing, so this loop rarely drops anything.
+            const size_t size = Json::escaped_size(text) + 256;
+            if (blocks.empty() || r.max_output == SIZE_MAX || size <= r.max_output) {
+                // CONTRACT: the diagnostic profile is a trailing line, added after the budget check.
+                if (!profiles.empty()) text += "[profile " + Json(make_profile()).dump() + "]\n";
+                return Json::Object{{"text", std::move(text)}, {"access_note", access_note},
+                    {"summary", summary(files, out.bytes.load(), out.found.load(), units, errors, skipped_size,
+                                        out.skipped_binary.load(), elapsed, state)}};
+            }
+            state = "output_limit";
+            // A last block that is too large is cut to whole lines rather than dropped, so matches never come back
+            // as "No matches."
+            if (blocks.size() == 1) {
+                const size_t own = Json::escaped_size(blocks.front().text);
+                const size_t excess = size - r.max_output + 8;
+                if (own > excess && trim_block(r, blocks.front(), own - excess)) continue;
+            }
+            blocks.pop_back();
+        }
+    }
+    Json output;
+    do {
+        post_check(true);  // each pass serializes the whole result
+        const size_t result_count = results.size();
+        Json::Object payload{{"skipped_files", skipped_files},
+            {"summary", summary(files, out.bytes.load(), out.found.load(), result_count, errors, skipped_size,
+                                out.skipped_binary.load(), elapsed, state)}};
+        payload.emplace("results", std::move(results));
+        if (!access_note.empty()) payload.emplace("access_note", access_note);
+        payload.emplace("skipped_lsp", skipped_lsp);
+        payload.emplace("text_fallbacks", text_fallbacks);
+        if (ranking) payload.emplace("ranking", rank_report);
+        if (show_selection)
+            payload.emplace("selection", Json::Object{{"regular_files_seen", out.regular_seen.load()},
+                {"files_filtered", out.files_filtered.load()}, {"files_ignored", out.files_ignored.load()},
+                {"files_hidden", out.files_hidden.load()}, {"directories_pruned", out.directories_pruned.load()},
+                {"reparse_points_skipped", out.reparse_skipped.load()}});
+        if (!relative_prefixes.empty()) payload.emplace("root", relative_root);
+        if (!index_note.empty())
+            payload.emplace("index", Json::Object{{"note", index_note}, {"candidates", index_opened},
+                                                  {"indexed_files", index_files}, {"deleted", out.index_missing.load()}});
+        if (!profiles.empty()) payload.emplace("profile", make_profile());
+        output = std::move(payload);
+        if (r.max_output == SIZE_MAX) break;
+        const size_t size = Json::escaped_size(output.dump()) + 256;
+        if (size <= r.max_output) break;
+        // The results were moved into the payload; take them back for the next pass.
+        results = std::move(std::get<Json::Array>(std::get<Json::Object>(output.value).at("results").value));
+        if (show_selection) { show_selection = false; continue; }
+        if (!skipped_files.empty()) { skipped_files.pop_back(); continue; }
+        if (results.empty()) throw std::runtime_error("max_output_bytes cannot hold summary");
+        state = "output_limit";
+        // The last result is shortened rather than dropped, so matches never come back as an empty list.
+        if (results.size() == 1 && shrink_context(results.front(), size - r.max_output)) continue;
+        results.pop_back();
+    } while (true);
+    return output;
+}
+} // namespace
+
+// CONTRACT: these descriptions are the model's only documentation of the tools; every statement must match the
+// implementation. Update them with any behavior change.
+Json tool_definitions() {
+    // PERF: these schemas are sent to the model with every session; every word costs tokens. Keep contracts an
+    // agent needs to call correctly, nothing else.
+    auto schema = [](Json::Object properties) -> Json {
+        return Json::Object{{"type", "object"}, {"properties", std::move(properties)}, {"additionalProperties", false}};
+    };
+    auto field = [](const char* type, const char* description) -> Json {
+        return Json::Object{{"type", type}, {"description", description}};
+    };
+    auto list = [](const char* description) -> Json {
+        return Json::Object{{"type", "array"}, {"items", Json::Object{{"type", "string"}}}, {"description", description}};
+    };
+    auto choice = [](Json::Array values, const char* description) -> Json {
+        return Json::Object{{"type", "string"}, {"enum", std::move(values)}, {"description", description}};
+    };
+    Json::Object common{
+        {"roots", list("Absolute dirs inside the configured roots. Default: the workspace (first root) only.")},
+        {"types", list("File types: asm bat c cmake cpp cs css go h html java js json lua make md msbuild proto ps py "
+                       "rust sh sql toml ts txt xml yaml.")},
+        {"include", list("File globs (* ?, case-insensitive). Without '/' a glob matches the whole filename, with '/' "
+                         "the whole relative path: \"*.cpp\", \"*parser*\", \"src/*\".")},
+        {"exclude", list("Globs of files or dirs to skip; a matching dir is not entered: \"third_party\".")},
+        {"extensions", list("Extensions to keep: [\"cpp\", \"h\"].")},
+        {"path_filter", field("string", "Substring of the relative path.")},
+        {"no_ignore", field("boolean", "Include .gitignore/.ignore/.shignore'd files.")},
+        {"hidden", field("boolean", "Include hidden files.")},
+        {"max_results", field("integer", "Optional result limit, 1-10000; default or 0 is unlimited. Set 50 for a short result list.")},
+        {"paths", choice(Json::Array{"absolute", "relative"}, "Default: relative to the configured root when there is one, absolute with multiple configured roots. Explicit relative uses one configured root when all selected targets share it; otherwise paths remain absolute.")},
+        {"max_output_bytes", field("integer", "Optional byte cap, 512-1048576; default unlimited.")},
+        {"timeout_ms", field("integer", "Request deadline, 1-300000 ms; semantic search defaults to 180000, text search to 30000, and find_files to 300000. Partial timed-out text searches get up to 1000 ms extra for response encoding.")}};
+
+    auto content_props = common;
+    content_props.emplace("allow_text_fallback", field("boolean", "For semantic search, permit labeled whole-word text matches when LSP fails and a name can be determined; these are not semantic results. Has no effect on ordinary text or byte searches. Default false."));
+    content_props.emplace("pattern", field("string", "One pattern; search LSP mode accepts symbol name paths and #kind hints such as ClassName#ctor. Plain generic type names match generic symbols."));
+    content_props.emplace("patterns", list("Text: up to 1000 in one pass. LSP: symbol name paths with optional #kind hints; plain generic type names match generic symbols."));
+    content_props.emplace("max_matches_per_file", field("integer", "Optional per-file match limit; default unlimited."));
+    content_props.emplace("context_bytes", field("integer", "json: context bytes per side, default 80."));
+    content_props.emplace("context_before_bytes", field("integer", "json: context bytes before."));
+    content_props.emplace("context_after_bytes", field("integer", "json: context bytes after."));
+
+    auto search_props = content_props;
+    search_props["roots"] = list("Text search accepts absolute files and directories inside configured roots, including mixtures. Explicit files are searched directly; duplicates are skipped. Default: the workspace (first root) only; name other roots to search them.");
+    search_props.emplace("intent", field("string",
+        "Required for operation=text: the task in words, to locate where something is. Built-in BM25 always ranks the hunks "
+        "(at most 3 per file) and the best 10 return; an optional reranker (off unless SHGREP_RERANK_PORT is set), when "
+        "running, only reorders the top ones. A note says how many were left out."));
+    search_props.emplace("operation", choice(Json::Array{"symbols", "definition", "declaration", "type_definition", "implementation", "references", "hover", "text"},
+        "Default symbols via LSP. text uses live grep; its text filters and budgets apply only there."));
+    search_props.emplace("path", field("string", "File or folder to limit text search or symbols to; other navigation needs a file. Omit for all workspaces."));
+    search_props.emplace("name_path", field("string", "Symbol name or slash-separated parent/name. /prefix anchors at the root; otherwise suffix match. Append #kind (e.g. ClassName#ctor). Plain generic names match generic symbols; unique lookups require one generic match and report candidates if ambiguous. Other ambiguities return candidates; overloads take an index such as Name[0]. No parent is selected."));
+    search_props.emplace("include_body", field("boolean", "Include complete symbol bodies; default false."));
+    search_props.emplace("full_lines", field("boolean", "With include_body, return complete touched source lines and body_range; inline lines may contain neighboring code. Default false."));
+    search_props.emplace("substring_matching", field("boolean", "Substring match on the last name-path component only; default false."));
+    search_props.emplace("include_info", field("boolean", "Include hover/signature information for symbol hits; default false."));
+    search_props.emplace("depth", field("integer", "Child depth from each symbol hit, default 0; -1 all."));
+    search_props.emplace("include_kinds", Json::Object{{"type", "array"}, {"items", Json::Object{{"type", "integer"}}}, {"description", "LSP kinds 1-26 to include."}});
+    search_props.emplace("exclude_kinds", Json::Object{{"type", "array"}, {"items", Json::Object{{"type", "integer"}}}, {"description", "LSP kinds to exclude."}});
+    search_props.emplace("line", field("integer", "1-based usage line for definition/references, instead of name_path."));
+    search_props.emplace("column", field("integer", "1-based UTF-16 column; use with line."));
+    search_props.emplace("include_declaration", field("boolean", "Include declaration in references; default false."));
+    search_props.emplace("mode", choice(Json::Array{"regex", "literal"},
+        "Default regex (PCRE, per line). Backreferences, lookaround or \\b make the whole call slow; use word."));
+    search_props.emplace("case_insensitive", field("boolean", "Unicode-aware."));
+    search_props.emplace("output", choice(Json::Array{"lines", "files", "files_without_match", "count", "json"},
+        "lines (default, grouped by file; omit path for a single file; over 50 matches start with a summary line naming the busiest files), files (cheapest), files_without_match, count, json (byte offsets)."));
+    search_props.emplace("context_lines", field("integer", "Lines around matches, 0-100."));
+    search_props.emplace("before_lines", field("integer", "Lines before matches."));
+    search_props.emplace("after_lines", field("integer", "Lines after matches."));
+    search_props.emplace("max_line_bytes", field("integer", "Optional line window; default 0 shows whole lines."));
+    search_props.emplace("block", field("boolean", "Show each match inside its whole enclosing function (else class); "
+                                                   "lines output. Brace languages and Python."));
+    search_props.emplace("max_block_lines", field("integer", "Optional block line limit; default unlimited. Longer blocks show the header and match context (3 lines each side unless context is explicitly set, including zero)."));
+    search_props.emplace("invert", field("boolean", "Lines matching no pattern (not json)."));
+    search_props.emplace("multiline", field("boolean", "Matches may span lines."));
+    search_props.emplace("word", field("boolean", "Whole words; fast, unlike \\b."));
+    search_props.emplace("line_numbers", field("boolean", "Default true."));
+    search_props.emplace("sniff_all", field("boolean", "Also open binary-extension files."));
+    search_props.emplace("index", field("boolean", "Use the trigram index: opens only candidates. Default true unless "
+                                                   "the server runs --no-live-index. Results equal a plain search: "
+                                                   "the live index syncs with the watcher first, a snapshot is "
+                                                   "checked against the tree."));
+    search_props.emplace("max_file_bytes", field("integer", "Skip larger text files; default 256 MiB, max 512 MiB. Over 64 MiB, files are scanned in line chunks; multiline, invert and block skip them."));
+
+    auto bytes_props = content_props;
+    bytes_props.erase("allow_text_fallback");  // byte searches never consult LSP, so the flag has no meaning here
+    bytes_props.emplace("mode", choice(Json::Array{"literal", "regex"},
+        "literal (default): hex such as \"4d5a\". regex: byte regex such as \"\\\\x4d\\\\x5a\" or plain ASCII."));
+    bytes_props.emplace("case_insensitive", field("boolean", "ASCII only."));
+    bytes_props.emplace("output", choice(Json::Array{"json", "files", "count"}, "Default json (offsets, hex context)."));
+    bytes_props.emplace("line_numbers", field("boolean", "Add lines to json."));
+
+    auto files_props = common;
+    files_props.emplace("allow_text_fallback", field("boolean", "Symbol searches only: explicitly permit text fallback after LSP failure. Default false."));
+    files_props.emplace("operation", choice(Json::Array{"filesystem", "symbols", "lsp"}, "Default filesystem. symbols finds files containing symbol hits; lsp lists configured source files without starting servers."));
+    files_props.emplace("path", field("string", "LSP file/directory scope; omit for all configured roots."));
+    files_props.emplace("pattern", field("string", "symbols: name-path pattern; accepts #kind hints and plain generic type names."));
+    files_props.emplace("name_path", field("string", "symbols: alternative to pattern; accepts #kind hints and plain generic type names."));
+    files_props.emplace("substring_matching", field("boolean", "symbols: substring match on final component."));
+    files_props.emplace("include_kinds", Json::Object{{"type", "array"}, {"items", Json::Object{{"type", "integer"}}}});
+    files_props.emplace("exclude_kinds", Json::Object{{"type", "array"}, {"items", Json::Object{{"type", "integer"}}}});
+    files_props.emplace("exact_name", field("string", "Whole filename, case-insensitive."));
+    files_props.emplace("substring", field("string", "Text in the name or relative path."));
+    files_props.emplace("glob", field("string", "Glob on the name or relative path."));
+    files_props.emplace("output", choice(Json::Array{"lines", "json"}, "Default lines."));
+
+    return Json::Array{
+        Json::Object{{"name", "search"}, {"description",
+            "Navigate live code through LSP: symbols, definition/declaration/type_definition, implementation, references, or hover. "
+            "Bodies are opt-in; no LSP output cap. Lua, XML, C/C++, Rust, Python and C# (with the .NET 10+ SDK) work out of the box; .shgrep/lsp.json adds or overrides servers. "
+            "Semantic operations require LSP. Text/byte searches can read all file types without a server. Semantic fallback remains explicit. "
+            "operation=text requires intent (the task in words): built-in BM25 always ranks the hunks (at most 3 per file) "
+            "and the best 10 return, with a note on how many were left out. An optional reranker (off unless "
+            "SHGREP_RERANK_PORT is set), when running, only reorders the top ones; without it BM25 order is final. For every reference to a symbol "
+            "use operation=references. "
+            "Text searches skip programming/XML files before reading; explicit fallback cannot bypass a working server."},
+            {"inputSchema", schema(search_props)}},
+        Json::Object{{"name", "search_bytes"}, {"description",
+            "Search raw bytes in any file, including programming/XML files, by hex or byte regex; exact offsets. No language server is required."},
+            {"inputSchema", schema(bytes_props)}},
+        Json::Object{{"name", "find_files"}, {"description",
+            "Find live files by name/path, configured LSP source files, or files containing symbol hits. Use list_dir for folder or symbol overviews."},
+            {"inputSchema", schema(files_props)}}
+    };
+}
+
+bool tool_available(const std::string& name, const SearchContext& context) {
+    if (name == "repl" || name == "lsp") return !context.read_only;
+    if (name == "search" || name == "search_bytes" || name == "find_files") return true;
+    return is_file_tool(name) && !(context.read_only && is_write_tool(name));
+}
+
+Json tool_list(const SearchContext& context) {
+    Json::Array tools;
+    if (!context.read_only) {
+        tools.push_back(lsp_tool_definition());
+        tools.push_back(repl_tool_definition());
+    }
+    const Json fallbacks = fallback_tool_definitions(context);
+    for (const auto& tool : fallbacks.array()) tools.push_back(tool);
+    return tools;
+}
+}

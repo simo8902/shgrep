@@ -1,0 +1,45 @@
+Apply on top of clang-23.1.4-repl-failed-input.patch (v2). Fixes SHGREP-issues.md #70, remaining case.
+
+A REPL input with a Sema error keeps instantiating constexpr function templates after the error; each one is
+handed to CodeGen, which ignores it while the error is pending. The specialization keeps its body after the input
+is withdrawn, so no later input instantiates or hands it over again, and its first use finds no deferred decl.
+GetOrCreateLLVMFunction now queues such a definition in incremental mode, for the linkages that later inputs
+re-emit anyway (see CodeGenModule::addEmittedDeferredDecl).
+
+--- a/clang/lib/CodeGen/CodeGenModule.cpp
++++ b/clang/lib/CodeGen/CodeGenModule.cpp
+@@ -5675,14 +5675,34 @@
+     } else if (getLangOpts().CPlusPlus && D) {
+       // Look for a declaration that's lexically in a record.
++      bool Found = false;
+       for (const auto *FD = cast<FunctionDecl>(D)->getMostRecentDecl(); FD;
+            FD = FD->getPreviousDecl()) {
+         if (isa<CXXRecordDecl>(FD->getLexicalDeclContext())) {
+           if (FD->doesThisDeclarationHaveABody()) {
+             addDeferredDeclToEmit(GD.getWithDecl(FD));
++            Found = true;
+             break;
+           }
+         }
+       }
++      // Incremental mode: a definition Sema finished while an earlier input
++      // had an unrecoverable error never reached CodeGen (HandleTopLevelDecl
++      // skips decls then) and is neither deferred nor in a record, e.g. a
++      // constexpr function template instantiated eagerly in a failed input.
++      // Its specialization keeps its body after the input is withdrawn, so
++      // Sema never hands it over again. Queue it, for the linkages that later
++      // inputs re-emit anyway (addEmittedDeferredDecl).
++      const FunctionDecl *Def = nullptr;
++      if (!Found && getLangOpts().IncrementalExtensions &&
++          cast<FunctionDecl>(D)->hasBody(Def) && !Def->isLateTemplateParsed() &&
++          !Def->isInvalidDecl() && !Def->isDeleted()) {
++        GlobalDecl DefGD = GD.getWithDecl(Def);
++        llvm::GlobalValue::LinkageTypes L = getFunctionLinkage(DefGD);
++        if (llvm::GlobalValue::isInternalLinkage(L) ||
++            llvm::GlobalValue::isLinkOnceLinkage(L) ||
++            llvm::GlobalValue::isWeakLinkage(L))
++          addDeferredDeclToEmit(DefGD);
++      }
+     }
+   }
+ 

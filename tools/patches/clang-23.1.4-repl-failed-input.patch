@@ -1,0 +1,206 @@
+shgrep patch for clang 23.1.4 (the same code is still on upstream main as of 2026-11-01).
+
+clang-repl does not fully withdraw an input that fails to compile, so the C++ REPL session breaks after one bad cell:
+- The partial llvm::Module stays open and the next input is generated into it. Redefining a function the failed
+  input defined then fails with "definition with same mangled name ... as another definition", and the failed
+  input's initializers and top-level statements would still run with the next input.
+- Sema has already set the points of instantiation for the templates the failed input used, but its pending
+  instantiations are discarded. Later inputs never queue them again, so their definitions stay missing and the
+  cell DLL fails to link with "undefined symbol" for std::get, std::construct_at, std::_Traits_find and similar.
+- An input whose decl a consumer rejects returns without any cleanup or diagnostics reset.
+
+The fix withdraws a failed input in both error paths of IncrementalParser: it clears the pending error so CodeGen
+sees the next step, finishes the pending instantiations, discards the partial module through the new
+CodeGenerator::DiscardModule(), removes the input from Sema and resets the diagnostics. DiscardModule() drops the
+module and the per-module CodeGen state (initializers, queued inline member functions) and makes the inline and
+template code queued or emitted there pending again, so later modules emit it where they use it. Running CodeGen's
+normal end-of-module step instead is not safe after an unrecoverable error.
+
+Apply in the LLVM source folder (tag llvmorg-23.1.4; no git repository needed), then rebuild and reinstall LLVM:
+  git apply <shgrep>\tools\patches\clang-23.1.4-repl-failed-input.patch
+  cmake --build <LLVM build folder> --target install
+
+diff -ru a/clang/include/clang/CodeGen/ModuleBuilder.h b/clang/include/clang/CodeGen/ModuleBuilder.h
+--- a/clang/include/clang/CodeGen/ModuleBuilder.h
++++ b/clang/include/clang/CodeGen/ModuleBuilder.h
+@@ -116,6 +116,13 @@
+   /// Create a new \c llvm::Module after calling HandleTranslationUnit. This
+   /// enable codegen in interactive processing environments.
+   llvm::Module* StartModule(llvm::StringRef ModuleName, llvm::LLVMContext &C);
++
++  /// Discard the module being built, with everything emitted into it, and
++  /// start an empty module in its place. Inline and template code emitted into
++  /// the discarded module becomes pending again, so later modules emit it where
++  /// they use it. For interactive processing, when an input fails and its code
++  /// must not run.
++  llvm::Module *DiscardModule(llvm::StringRef NewModuleName);
+ };
+ 
+ /// CreateLLVMCodeGen - Create a CodeGenerator instance.
+diff -ru a/clang/lib/CodeGen/CodeGenModule.cpp b/clang/lib/CodeGen/CodeGenModule.cpp
+--- a/clang/lib/CodeGen/CodeGenModule.cpp
++++ b/clang/lib/CodeGen/CodeGenModule.cpp
+@@ -8854,10 +8854,12 @@
+   assert(NewBuilder->DeferredVTables.empty() &&
+          "Newly created module should not have deferred vtables");
+   NewBuilder->DeferredVTables = std::move(DeferredVTables);
++  NewBuilder->DeferredVTablesAtModuleStart = NewBuilder->DeferredVTables;
+ 
+   assert(NewBuilder->EmittedVTables.empty() &&
+          "Newly created module should not have defined vtables");
+   NewBuilder->EmittedVTables = std::move(EmittedVTables);
++  NewBuilder->EmittedVTablesAtModuleStart = NewBuilder->EmittedVTables;
+ 
+   assert(NewBuilder->MangledDeclNames.empty() &&
+          "Newly created module should not have mangled decl names");
+@@ -8870,6 +8872,18 @@
+   NewBuilder->ABI->MangleCtx = std::move(ABI->MangleCtx);
+ }
+ 
++void CodeGenModule::discardModuleEmissions() {
++  // Queued for this module but never emitted: emit them where used later.
++  for (const GlobalDecl &GD : DeferredDeclsToEmit)
++    DeferredDecls[getMangledName(GD)] = GD;
++  DeferredDeclsToEmit.clear();
++  // Emitted only into this module: emit them again where used later.
++  DeferredDecls.insert_range(EmittedDeferredDecls);
++  EmittedDeferredDecls.clear();
++  DeferredVTables = DeferredVTablesAtModuleStart;
++  EmittedVTables = EmittedVTablesAtModuleStart;
++}
++
+ std::string CodeGenModule::getPFPFieldName(const FieldDecl *FD) {
+   std::string OutName;
+   llvm::raw_string_ostream Out(OutName);
+diff -ru a/clang/lib/CodeGen/CodeGenModule.h b/clang/lib/CodeGen/CodeGenModule.h
+--- a/clang/lib/CodeGen/CodeGenModule.h
++++ b/clang/lib/CodeGen/CodeGenModule.h
+@@ -483,6 +483,11 @@
+   /// by moveLazyEmissionStates() so later PTUs skip re-defining them.
+   llvm::SmallPtrSet<const CXXRecordDecl *, 8> EmittedVTables;
+ 
++  /// DeferredVTables and EmittedVTables when this module started; restored by
++  /// discardModuleEmissions().
++  std::vector<const CXXRecordDecl *> DeferredVTablesAtModuleStart;
++  llvm::SmallPtrSet<const CXXRecordDecl *, 8> EmittedVTablesAtModuleStart;
++
+   /// A queue of (optional) vtables that may be emitted opportunistically.
+   std::vector<const CXXRecordDecl *> OpportunisticVTables;
+ 
+@@ -1855,6 +1860,12 @@
+   /// because we'll lose all important information after each repl.
+   void moveLazyEmissionStates(CodeGenModule *NewBuilder);
+ 
++  /// Incremental compilation: forget what was emitted into the current module,
++  /// which is being discarded. Declarations queued or emitted only there become
++  /// deferred again, and the vtable queues return to their state at the start
++  /// of the module.
++  void discardModuleEmissions();
++
+   /// Emit the IR encoding to attach the CUDA launch bounds attribute to \p F.
+   /// If \p MaxThreadsVal is not nullptr, the max threads value is stored in it,
+   /// if a valid one was found.
+diff -ru a/clang/lib/CodeGen/ModuleBuilder.cpp b/clang/lib/CodeGen/ModuleBuilder.cpp
+--- a/clang/lib/CodeGen/ModuleBuilder.cpp
++++ b/clang/lib/CodeGen/ModuleBuilder.cpp
+@@ -155,6 +155,17 @@
+       return M.get();
+     }
+ 
++    llvm::Module *DiscardModule(llvm::StringRef NewModuleName) {
++      assert(M && "No module to discard");
++      assert(!HandlingTopLevelDecls && "Discarding while handling a decl");
++      // Inline member functions still waiting belong to the discarded input.
++      DeferredInlineMemberFuncDefs.clear();
++      Builder->discardModuleEmissions();
++      // StartModule destroys the old builder; keep its module alive until then.
++      std::unique_ptr<llvm::Module> Discarded = std::move(M);
++      return StartModule(NewModuleName, Discarded->getContext());
++    }
++
+     void Initialize(ASTContext &Context) override {
+       Ctx = &Context;
+ 
+@@ -394,6 +405,10 @@
+   return static_cast<CodeGeneratorImpl*>(this)->StartModule(ModuleName, C);
+ }
+ 
++llvm::Module *CodeGenerator::DiscardModule(llvm::StringRef NewModuleName) {
++  return static_cast<CodeGeneratorImpl *>(this)->DiscardModule(NewModuleName);
++}
++
+ std::unique_ptr<CodeGenerator>
+ clang::CreateLLVMCodeGen(DiagnosticsEngine &Diags, llvm::StringRef ModuleName,
+                          IntrusiveRefCntPtr<llvm::vfs::FileSystem> FS,
+diff -ru a/clang/lib/Interpreter/IncrementalParser.cpp b/clang/lib/Interpreter/IncrementalParser.cpp
+--- a/clang/lib/Interpreter/IncrementalParser.cpp
++++ b/clang/lib/Interpreter/IncrementalParser.cpp
+@@ -19,6 +19,7 @@
+ #include "clang/AST/DeclContextInternals.h"
+ #include "clang/AST/DeclTemplate.h"
+ #include "clang/AST/DeclVisitor.h"
++#include "clang/CodeGen/ModuleBuilder.h"
+ #include "clang/Frontend/CompilerInstance.h"
+ #include "clang/Interpreter/PartialTranslationUnit.h"
+ #include "clang/Parse/Parser.h"
+@@ -76,22 +77,54 @@
+     S.ActOnTranslationUnitScope(P->getCurScope());
+   }
+ 
++  DiagnosticsEngine &Diags = S.getDiagnostics();
++
++  // Withdraw a failed input so that later inputs see the state before it.
++  auto DiscardInput = [&] {
++    // CodeGen ignores new decls while an unrecoverable error is pending, so
++    // clear the error first: the instantiations below must reach CodeGen to be
++    // emitted later.
++    Diags.Reset(/*soft=*/true);
++    Diags.getClient()->clear();
++
++    // Finish the implicit instantiations this input requested. Sema has already
++    // recorded their points of instantiation, so a later input that uses the
++    // same specializations would not queue them again and their definitions
++    // would stay missing; the scopes above would discard what is still pending.
++    LocalInstantiations.perform();
++    GlobalInstantiations.perform();
++
++    // Drop the partial module: its definitions from this input would collide
++    // with those of a later input, and its initializers must not run. CodeGen
++    // makes the inline and template code it emitted there pending again.
++    if (CodeGenerator *CG = Act ? Act->getCodeGen() : nullptr) {
++      if (CG->GetModule()) {
++        static unsigned DiscardedID = 0;
++        CG->DiscardModule("incr_module_discarded_" +
++                          std::to_string(DiscardedID++));
++      }
++    }
++
++    CleanUpPTU(C.getTranslationUnitDecl());
++
++    Diags.Reset(/*soft=*/true);
++    Diags.getClient()->clear();
++  };
++
+   Parser::DeclGroupPtrTy ADecl;
+   Sema::ModuleImportState ImportState;
+   for (bool AtEOF = P->ParseFirstTopLevelDecl(ADecl, ImportState); !AtEOF;
+        AtEOF = P->ParseTopLevelDecl(ADecl, ImportState)) {
+-    if (ADecl && !Consumer->HandleTopLevelDecl(ADecl.get()))
++    if (ADecl && !Consumer->HandleTopLevelDecl(ADecl.get())) {
++      DiscardInput();
+       return llvm::make_error<llvm::StringError>("Parsing failed. "
+                                                  "The consumer rejected a decl",
+                                                  std::error_code());
++    }
+   }
+ 
+-  DiagnosticsEngine &Diags = S.getDiagnostics();
+   if (Diags.hasErrorOccurred()) {
+-    CleanUpPTU(C.getTranslationUnitDecl());
+-
+-    Diags.Reset(/*soft=*/true);
+-    Diags.getClient()->clear();
++    DiscardInput();
+     return llvm::make_error<llvm::StringError>("Parsing failed.",
+                                                std::error_code());
+   }

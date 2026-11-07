@@ -1,0 +1,11 @@
+#pragma once
+// Compile the public facade and JSON implementation into each incremental interpreter.
+// No checkout files are opened by the interpreter at runtime.
+inline constexpr char shgrep_cpp_prelude[] = R"SHGREP_CPP(
+#line 1 "shgrep_json.hpp"
+@SHGREP_REPL_JSON_HEADER@
+#line 1 "shgrep_json.cpp"
+@SHGREP_REPL_JSON_SOURCE@
+#line 1 "shgrep_cpp.hpp"
+@SHGREP_REPL_CPP_HEADER@
+)SHGREP_CPP";
