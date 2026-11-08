@@ -1,11 +1,9 @@
 # shgrep
 
-i started shgrep because i wanted agents to grab useful code without eating their context
-then it turned into something handy for normal searches too
-so yeah you can navigate a codebase or find that mp3 buried somewhere on your drive
+i dont remember for what i made this tool, but i hope it would be for any good use to y'all. 
 
-it uses LSP servers for code navigation and supports multiple repos and solutions at once
-there’s keyword ranking plus optional embedded models for finding code by meaning
+it uses LSP servers for code navigation and supports multiple repos and solutions at once \
+there’s keyword ranking plus optional embedded models for finding code by meaning \
 the idea is fast searches and accurate results without throwing a wall of text at you
 
 under the hood it’s C++26 with Intel Hyperscan PCRE2 and Boost
@@ -184,3 +182,6 @@ MRR@5 rewards getting the correct file closer to the top of five results
 these are ranking experiments from November 4 2026
 the mix was tuned on these same questions so it still needs checking elsewhere
 current-build search speed needs separate measurements
+
+comparison against: tgrep, rg, sg, serena, git grep, astgrep
+
