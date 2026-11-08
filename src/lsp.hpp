@@ -34,20 +34,35 @@ std::string lsp_failure_banner(const std::string& detail, const std::string& fal
 int64_t lsp_request_timeout_ms(const Json& arguments, const SearchContext& context,
                                const std::shared_ptr<std::atomic_bool>& cancelled);
 // Shared navigation, refactoring and lifecycle backend for the existing tool surface.
-bool lsp_required(const std::filesystem::path& path);
+// root: the configured root that owns path (SourceText::root). Its .shgrep/lsp.json is the one server selection loads,
+// so extensions claimed there count; an empty root checks only the built-in lists.
+bool lsp_required(const std::filesystem::path& path, const std::filesystem::path& root);
 // A code file that read_file serves only through LSP: lsp_required minus markup and data formats such as XML.
-bool lsp_read_required(const std::filesystem::path& path);
+bool lsp_read_required(const std::filesystem::path& path, const std::filesystem::path& root);
 std::string lsp_fallback_reason(const SourceText& source, const Json& arguments, const SearchContext& context,
                                 const std::shared_ptr<std::atomic_bool>& cancelled);
 std::string require_text_access(const SourceText& source, const Json& arguments, const SearchContext& context,
                                 const std::shared_ptr<std::atomic_bool>& cancelled);
 bool lsp_configured(const SourceText& source, const SearchContext& context);
+// Stable identity of configured server commands/settings/coverage; starts no backend.
+// root: the configured root whose servers are fingerprinted (the meaning index covers one root).
+std::string lsp_index_fingerprint(const SearchContext& context, const std::filesystem::path& root,
+                                  const std::shared_ptr<std::atomic_bool>& cancelled);
+// Size and last-write time of a file from its metadata, without opening it; empty for a folder, a link, or when
+// unavailable. Only a cache key (the symbol and meaning indexes skip unchanged files with it); reads still go
+// through read_source_text.
+std::string lsp_file_stamp(const std::filesystem::path& path);
 // Why source has no server although a bundled one serves its type (not installed, or turned off); empty when a
 //   server is configured or no bundled server knows the type. Callers report it through lsp_failure_banner.
 std::string lsp_missing(const SourceText& source, const SearchContext& context);
-// Problems with the bundled servers: not installed beside shgrep.exe, or missing what they need (Roslyn's .NET).
-//   Starts nothing, so it is cheap enough for the session health check.
-std::vector<std::string> lsp_health();
+// Records the language of a file a tool result shows the model (list_dir, find_files, search). Per request thread.
+void lsp_note_listed_file(std::string_view path);
+// Forgets the files recorded on this thread; called when a request starts (pool threads are reused).
+void lsp_clear_listed_files();
+// After a tool call: one notice line per bundled server that is missing (or lacks its prerequisite, such as Roslyn's
+//   .NET) for files the call listed, each server at most once per process; empty otherwise. Clears the recorded
+//   files. Nothing is said at session start, and languages the model has not been shown are never mentioned (#101).
+std::string lsp_language_notice(const SearchContext& context);
 // Starts, on a background thread, the language servers for the languages the workspace (the first root) holds, so the
 //   first semantic request does not wait for a cold start. Returns at once; failures are logged, and the first query
 //   for that language reports them. Off with --read-only or SHGREP_LSP_WARMUP=0.

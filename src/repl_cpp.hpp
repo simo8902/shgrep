@@ -74,6 +74,7 @@ inline Value call(const std::string& method, const Json::Object& arguments = {})
 struct Lsp {
     SHGREP_CPP_METHOD(lsp, get_symbols_overview)
     SHGREP_CPP_METHOD(lsp, find_symbol)
+    SHGREP_CPP_METHOD(lsp, search_by_meaning)
     SHGREP_CPP_METHOD(lsp, find_referencing_symbols)
     SHGREP_CPP_METHOD(lsp, find_implementations)
     SHGREP_CPP_METHOD(lsp, find_declaration)

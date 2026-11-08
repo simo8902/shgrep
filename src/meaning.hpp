@@ -22,6 +22,10 @@ namespace shgrep {
 // at once; a no-op in the portable build. Failures are logged and the next question reports them.
 void start_meaning_index(const SearchContext& context);
 
+// Cancels the background builder and waits for it to return, before server shutdown destroys the state it uses (LSP
+// sessions, logs). Safe to call when it never started or already finished.
+void stop_meaning_index();
+
 // search operation=meaning: the LSP symbols that best match `intent` (a question in words), best first.
 // Arguments: intent (required), path (file or folder scope), max_results (default 10), timeout_ms.
 Json meaning_search(const Json& arguments, const SearchContext& context,

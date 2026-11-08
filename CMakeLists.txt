@@ -4,11 +4,77 @@ project(shgrep LANGUAGES C CXX)
 
 # shgrep's own code is C++26. CMake has no cxx_std_26 mode for clang-cl, and clang-cl's /std:c++latest goes past
 # C++26 (__cplusplus 202700L), so clang-cl gets clang's exact flag (__cplusplus and _MSVC_LANG 202400L).
+option(SHGREP_STL_HARDENING "Enable MSVC STL hardening for shgrep targets" ON)
+option(SHGREP_ASAN "Instrument shgrep targets with AddressSanitizer (separate diagnostic build only)" OFF)
+set(SHGREP_ASAN_RUNTIME_DLL "" CACHE FILEPATH "Matching compiler clang_rt.asan_dynamic-x86_64.dll for SHGREP_ASAN")
+option(SHGREP_ZERO_INIT "Zero-initialize automatic variables in shgrep targets (measure before release)" OFF)
+option(SHGREP_UNSAFE_BUFFER_WARNINGS "Report Clang unsafe-buffer warnings in shgrep targets" OFF)
+option(SHGREP_THREAD_SAFETY_WARNINGS "Report Clang thread-safety warnings in shgrep targets" OFF)
+option(SHGREP_CLANG_TIDY "Run the src-only clang-tidy checks while building shgrep targets" OFF)
+if(SHGREP_ASAN OR SHGREP_ZERO_INIT OR SHGREP_UNSAFE_BUFFER_WARNINGS OR SHGREP_THREAD_SAFETY_WARNINGS)
+    if(NOT CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
+        message(FATAL_ERROR "shgrep diagnostic options require Clang; dependencies keep their own flags")
+    endif()
+endif()
+if(SHGREP_ASAN)
+    if(NOT EXISTS "${SHGREP_ASAN_RUNTIME_DLL}")
+        message(FATAL_ERROR "SHGREP_ASAN needs SHGREP_ASAN_RUNTIME_DLL: select clang_rt.asan_dynamic-x86_64.dll from the matching compiler installation")
+    endif()
+    get_filename_component(SHGREP_ASAN_RUNTIME_NAME "${SHGREP_ASAN_RUNTIME_DLL}" NAME)
+    if(NOT SHGREP_ASAN_RUNTIME_NAME STREQUAL "clang_rt.asan_dynamic-x86_64.dll")
+        message(FATAL_ERROR "SHGREP_ASAN_RUNTIME_DLL must name clang_rt.asan_dynamic-x86_64.dll from the matching compiler")
+    endif()
+endif()
+if(SHGREP_CLANG_TIDY)
+    get_filename_component(SHGREP_COMPILER_BIN "${CMAKE_CXX_COMPILER}" DIRECTORY)
+    find_program(SHGREP_CLANG_TIDY_EXECUTABLE NAMES clang-tidy HINTS "${SHGREP_COMPILER_BIN}" REQUIRED)
+endif()
+
 function(shgrep_use_cxx26 target)
     if(MSVC AND CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
         target_compile_options(${target} PRIVATE /clang:-std=c++26)
     else()
         target_compile_features(${target} PRIVATE cxx_std_26)
+    endif()
+    if(MSVC AND SHGREP_STL_HARDENING)
+        target_compile_definitions(${target} PRIVATE _MSVC_STL_HARDENING=1)
+    endif()
+    # Apply only to the two owning targets, never globally or to linked third-party targets.
+    set(diagnostic_flags)
+    if(SHGREP_ASAN)
+        list(APPEND diagnostic_flags -fsanitize=address)
+        if(MSVC)
+            target_link_options(${target} PRIVATE /INCREMENTAL:NO)
+        else()
+            target_link_options(${target} PRIVATE -fsanitize=address)
+        endif()
+        # shgrep runs as the header packer in an earlier post-build command, so its runtime
+        # must already exist before linking completes, not in a later post-build command.
+        add_custom_command(TARGET ${target} PRE_LINK
+            COMMAND "${CMAKE_COMMAND}" -E make_directory "$<TARGET_FILE_DIR:${target}>"
+            COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${SHGREP_ASAN_RUNTIME_DLL}"
+                "$<TARGET_FILE_DIR:${target}>/clang_rt.asan_dynamic-x86_64.dll"
+            COMMENT "Staging the matching AddressSanitizer runtime" VERBATIM)
+    endif()
+    if(SHGREP_ZERO_INIT)
+        list(APPEND diagnostic_flags -ftrivial-auto-var-init=zero)
+    endif()
+    if(SHGREP_UNSAFE_BUFFER_WARNINGS)
+        list(APPEND diagnostic_flags -Wunsafe-buffer-usage -Wno-error=unsafe-buffer-usage)
+    endif()
+    if(SHGREP_THREAD_SAFETY_WARNINGS)
+        list(APPEND diagnostic_flags -Wthread-safety -Wno-error=thread-safety)
+    endif()
+    foreach(flag IN LISTS diagnostic_flags)
+        if(MSVC)
+            target_compile_options(${target} PRIVATE "/clang:${flag}")
+        else()
+            target_compile_options(${target} PRIVATE "${flag}")
+        endif()
+    endforeach()
+    if(SHGREP_CLANG_TIDY)
+        set_property(TARGET ${target} PROPERTY CXX_CLANG_TIDY
+            "${SHGREP_CLANG_TIDY_EXECUTABLE};--config-file=${CMAKE_CURRENT_SOURCE_DIR}/src/.clang-tidy")
     endif()
 endfunction()
 
@@ -113,7 +179,8 @@ string(REPLACE "#include \"json.hpp\"" "" SHGREP_REPL_CPP_HEADER "${SHGREP_REPL_
 configure_file(src/repl_prelude.hpp.in "${CMAKE_CURRENT_BINARY_DIR}/generated/repl_prelude.hpp" @ONLY)
 add_executable(shgrep src/main.cpp src/log_window.cpp src/cli.cpp src/json.cpp src/search.cpp src/ignore.cpp src/files.cpp
                src/backend.cpp src/teddy.cpp src/dfa.cpp src/lsp.cpp src/dotnet_projects.cpp src/compile_db.cpp src/lsp_watch.cpp
-               src/rank.cpp src/embed.cpp src/meaning.cpp src/edit.cpp src/repl.cpp src/repl_compiler_loader.cpp
+               src/workspace_profile.cpp
+               src/rank.cpp src/embed.cpp src/meaning.cpp src/edit.cpp src/repl.cpp src/repl_compiler_loader.cpp src/external_diagnostics.cpp
                tools/pack_repl_headers.cpp)
 # The executable has no LLVM link dependency. Only isolated REPL workers load this backend, through its
 # versioned C entry point.
@@ -214,6 +281,27 @@ add_custom_target(portable_zip
         -P "${CMAKE_CURRENT_BINARY_DIR}/generated/package_portable.cmake"
     DEPENDS shgrep COMMENT "Packaging shgrep.exe, shgrep-compiler.dll and shgrep.dat" VERBATIM)
 shgrep_use_cxx26(shgrep)
+
+# Real C++26 reflection runs in a separate native Windows generator.
+# Only portable generated C++ reaches the application and its existing LLVM/MSVC ABI.
+set(SHGREP_REFLECTION_CXX "${CMAKE_CURRENT_SOURCE_DIR}/toolchains/mingw64/bin/g++.exe"
+    CACHE FILEPATH "GCC 16+ compiler with C++26 reflection and matching libstdc++ <meta>")
+if(NOT EXISTS "${SHGREP_REFLECTION_CXX}")
+    message(FATAL_ERROR "Install GCC 16+ under toolchains/mingw64, or set SHGREP_REFLECTION_CXX to its g++.exe")
+endif()
+set(SHGREP_CONTRACT_HEADER "${CMAKE_CURRENT_BINARY_DIR}/generated/tool_contracts.generated.hpp")
+add_custom_command(OUTPUT "${SHGREP_CONTRACT_HEADER}"
+    COMMAND "${CMAKE_COMMAND}"
+        "-DSHGREP_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}"
+        "-DSHGREP_BINARY_DIR=${CMAKE_CURRENT_BINARY_DIR}"
+        "-DSHGREP_REFLECTION_CXX=${SHGREP_REFLECTION_CXX}"
+        -P "${CMAKE_CURRENT_SOURCE_DIR}/tools/generate_contracts.cmake"
+    DEPENDS tools/generate_contracts.cpp tools/generate_contracts.cmake
+        src/tool_contracts.hpp src/contract_codec.hpp src/json.hpp src/json.cpp "${SHGREP_REFLECTION_CXX}"
+    BYPRODUCTS "${CMAKE_CURRENT_BINARY_DIR}/generated/shgrep-reflect.exe"
+    COMMENT "Generating tool contracts using C++26 reflection" VERBATIM)
+add_custom_target(shgrep_contracts DEPENDS "${SHGREP_CONTRACT_HEADER}")
+add_dependencies(shgrep shgrep_contracts)
 target_include_directories(shgrep PRIVATE "${SHGREP_HYPERSCAN_DIR}/src" "${CMAKE_CURRENT_BINARY_DIR}/generated")
 # ntdll provides NtCreateFile for opening entries relative to their parent directory handle; bcrypt provides the
 # SHA-256 that read_file reports and edit_file/write_file check with expected_sha256; advapi32 copies a replaced
@@ -347,7 +435,7 @@ set(SHGREP_DEPLOY
     "${CMAKE_CURRENT_SOURCE_DIR}/dist/shgrep.exe"
 )
 # The GPU build runs from its own build folder, beside its DLLs and model; dist/ keeps the portable build.
-if(SHGREP_EMBED)
+if(SHGREP_EMBED OR SHGREP_ASAN)
     set(SHGREP_DEPLOY "")
 endif()
 if(SHGREP_DEPLOY)
@@ -366,6 +454,9 @@ if(SHGREP_DEPLOY)
     add_dependencies(deploy shgrep)
 endif()
 
+if(SHGREP_ASAN)
+    install(CODE "message(FATAL_ERROR \"AddressSanitizer builds are diagnostic-only; build a normal release for installation\")" COMPONENT shgrep)
+endif()
 install(TARGETS shgrep RUNTIME DESTINATION . COMPONENT shgrep)
 # Install the DLL file explicitly, excluding its build-only import library.
 install(FILES "$<TARGET_FILE:shgrep_compiler>" "$<TARGET_FILE_DIR:shgrep>/shgrep.dat"

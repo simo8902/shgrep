@@ -26,6 +26,11 @@ bool embed_built();
 // anything; it is a no-op in the portable build.
 void start_embedder();
 
+// Waits, at most `timeout`, while a model load that start_embedder began is still running; returns at once when
+// none is. Called before the server exits: the load runs on a detached thread inside the GPU runtime, and process
+// exit while that thread is still in it never finishes (the server hung until killed). No-op in the portable build.
+void embed_finish_loading(std::chrono::milliseconds timeout);
+
 // One line for status output: "off (portable build)", "not started", "loading: <step>", "ready: <device>, <model>,
 // <n> dimensions" or "failed: <cause>".
 std::string embedder_state();

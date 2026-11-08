@@ -1,4 +1,6 @@
 #include "compile_db.hpp"
+#include "process.hpp"
+#include <cwchar>
 #include "files.hpp"
 #include <windows.h>
 #include <algorithm>
@@ -297,7 +299,7 @@ fs::path system_folder() {
 }
 // SAFETY: the child inherits only its standard handles and dies with its job object when shgrep exits.
 bool launch(std::wstring command, HANDLE output, HANDLE error, const fs::path& folder, Handle& process, Handle& job,
-            std::string& problem) {
+            std::string& problem, void* environment = nullptr) {
     Handle input = null_device(false);
     if (!input.valid()) { problem = "cannot open NUL"; return false; }
     job.reset(CreateJobObjectW(nullptr, nullptr));
@@ -328,7 +330,7 @@ bool launch(std::wstring command, HANDLE output, HANDLE error, const fs::path& f
     startup.lpAttributeList = attributes;
     PROCESS_INFORMATION info{};
     const BOOL created = CreateProcessW(nullptr, command.data(), nullptr, nullptr, TRUE,
-        CREATE_NO_WINDOW | CREATE_SUSPENDED | EXTENDED_STARTUPINFO_PRESENT, nullptr, folder.c_str(), &startup.StartupInfo, &info);
+        CREATE_NO_WINDOW | CREATE_SUSPENDED | EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT, environment, folder.c_str(), &startup.StartupInfo, &info);
     const DWORD code = GetLastError();
     DeleteProcThreadAttributeList(attributes);
     if (!created) { problem = "cannot start process (Windows error " + std::to_string(code) + ")"; return false; }
@@ -338,7 +340,11 @@ bool launch(std::wstring command, HANDLE output, HANDLE error, const fs::path& f
         TerminateProcess(process.h, 1);
         problem = "cannot assign process to its job"; return false;
     }
-    ResumeThread(thread.h);
+    if (ResumeThread(thread.h) == static_cast<DWORD>(-1)) {
+        problem = "cannot resume process (Windows error " + std::to_string(GetLastError()) + ")";
+        TerminateJobObject(job.h, 1);
+        return false;
+    }
     return true;
 }
 std::optional<std::string> run_capture(const std::wstring& command, std::chrono::milliseconds timeout) {
@@ -705,6 +711,167 @@ fs::path fallback_database(const fs::path& base, const fs::path& root, const Fal
     return database;
 }
 } // namespace
+
+CapturedProcess capture_process(const std::vector<std::string>& arguments, const fs::path& directory,
+    Clock::time_point deadline, const std::shared_ptr<std::atomic_bool>& cancelled, size_t max_output_bytes) {
+    if (arguments.empty() || arguments.size() > 256 || arguments.front().empty())
+        throw std::runtime_error("external check needs 1-256 command arguments");
+    const auto check_cancelled = [&] {
+        if (cancelled && cancelled->load()) throw std::runtime_error("external check cancelled");
+    };
+    check_cancelled();
+    if (Clock::now() >= deadline) return {"timed_out", {}, "request deadline expired before launch", {}, false};
+    const auto quote = [](const std::wstring& value) {
+        if (value.find(L'\0') != std::wstring::npos) throw std::runtime_error("NUL in command argument");
+        std::wstring result = L"\"";
+        size_t slashes = 0;
+        for (wchar_t c : value) {
+            if (c == L'\\') { ++slashes; continue; }
+            if (c == L'"') result.append(slashes * 2 + 1, L'\\');
+            else result.append(slashes, L'\\');
+            slashes = 0;
+            result += c;
+        }
+        result.append(slashes * 2, L'\\');
+        result += L'"';
+        return result;
+    };
+    fs::path program = wide(arguments.front());
+    if (!program.is_absolute() && program.has_parent_path()) program = plain(directory) / program;
+    if (!program.is_absolute()) {
+        const DWORD required = SearchPathW(nullptr, program.c_str(), L".exe", 0, nullptr, nullptr);
+        if (!required) return {"not_started", {}, "configured executable was not found", {}, false};
+        std::wstring resolved(required, L'\0');
+        const DWORD length = SearchPathW(nullptr, program.c_str(), L".exe", required, resolved.data(), nullptr);
+        if (!length || length >= required)
+            return {"not_started", {}, "cannot resolve configured executable", {}, false};
+        resolved.resize(length);
+        program = resolved;
+    }
+    program = plain(program).lexically_normal();
+    std::wstring command = quote(program.wstring());
+    for (size_t i = 1; i < arguments.size(); ++i) {
+        command += L" " + quote(wide(arguments[i]));
+        if (command.size() >= 32767) throw std::runtime_error("external command exceeds Windows command-line limit");
+    }
+    // Keep the parent's environment intact; GCC subprocesses need the matching compiler DLL directory.
+    std::wstring environment;
+    LPWCH inherited_environment = GetEnvironmentStringsW();
+    if (!inherited_environment) throw std::runtime_error("cannot read process environment");
+    struct EnvironmentOwner {
+        LPWCH value;
+        ~EnvironmentOwner() { FreeEnvironmentStringsW(value); }
+    } environment_owner{inherited_environment};
+    std::map<std::wstring, std::wstring> variables;
+    std::wstring original_path;
+    for (const wchar_t* entry = inherited_environment; *entry; entry += std::wcslen(entry) + 1) {
+        std::wstring value(entry);
+        const size_t equal = value.find(L'=', value.starts_with(L"=") ? 1 : 0);
+        if (equal == std::wstring::npos) continue;
+        const auto key = lower(value.substr(0, equal));
+        if (key == L"path") original_path = value.substr(equal + 1);
+        else variables.emplace(key, std::move(value));
+    }
+    variables[L"path"] = L"PATH=" + program.parent_path().wstring() +
+        (original_path.empty() ? L"" : L";" + original_path);
+    // SAFETY (#51): the mandatory offline values go last, replacing any inherited spelling of the same name.
+    for (const auto& [name, value] : offline_environment()) variables[lower(name)] = name + L"=" + value;
+    for (const auto& [key, value] : variables) {
+        (void)key;
+        environment.append(value);
+        environment.push_back(L'\0');
+    }
+    environment.push_back(L'\0');
+    SECURITY_ATTRIBUTES security{sizeof(SECURITY_ATTRIBUTES), nullptr, TRUE};
+    HANDLE read_handle = nullptr, write_handle = nullptr;
+    if (!CreatePipe(&read_handle, &write_handle, &security, 0))
+        throw std::runtime_error("cannot create external diagnostic pipe");
+    Handle read(read_handle), write(write_handle), process, job;
+    if (!SetHandleInformation(read.h, HANDLE_FLAG_INHERIT, 0))
+        throw std::runtime_error("cannot isolate external diagnostic pipe");
+    std::string problem;
+    if (!launch(command, write.h, write.h, plain(directory), process, job, problem, environment.data()))
+        return {"not_started", {}, problem, {}, false};
+    write.reset();
+    CapturedProcess result{"completed", {}, {}, {}, false, true};
+    const auto terminate = [&](const char* status, const char* message) {
+        result.status = status;
+        result.error = message;
+        if (job.valid() && !TerminateJobObject(job.h, 1))
+            result.error += "; terminating process tree failed (Windows error " + std::to_string(GetLastError()) + ")";
+        WaitForSingleObject(process.h, 5000);
+    };
+    char buffer[16384];
+    bool finished = false;
+    for (;;) {
+        check_cancelled();
+        if (Clock::now() >= deadline) {
+            terminate("timed_out", "external check exceeded request deadline");
+            break;
+        }
+        DWORD available = 0;
+        if (!PeekNamedPipe(read.h, nullptr, 0, nullptr, &available, nullptr)) {
+            if (GetLastError() != ERROR_BROKEN_PIPE) {
+                terminate("failed", "cannot read external check output");
+                break;
+            }
+            available = 0;
+        }
+        if (available) {
+            DWORD got = 0;
+            if (!ReadFile(read.h, buffer, std::min<DWORD>(available, sizeof buffer), &got, nullptr) || !got) {
+                terminate("failed", "external check output read failed");
+                break;
+            }
+            const size_t remaining = max_output_bytes > result.output.size() ? max_output_bytes - result.output.size() : 0;
+            result.output.append(buffer, std::min<size_t>(remaining, got));
+            if (got > remaining) {
+                result.truncated = true;
+                terminate("output_limit", "external check exceeded output limit");
+                break;
+            }
+            continue;
+        }
+        if (finished) break;
+        const DWORD waited = WaitForSingleObject(process.h, 20);
+        if (waited == WAIT_FAILED) {
+            terminate("failed", "cannot wait for external check");
+            break;
+        }
+        if (waited == WAIT_OBJECT_0) {
+            finished = true;
+            // The configured command has exited; close its remaining descendant processes and output writers.
+            job.reset();
+        }
+    }
+    DWORD exit_code = 0;
+    if (WaitForSingleObject(process.h, 0) == WAIT_OBJECT_0 && GetExitCodeProcess(process.h, &exit_code)) {
+        result.exit_code = exit_code;
+        if (result.status == "completed" && exit_code != 0) result.status = "failed";
+    } else if (result.status == "completed") {
+        result.status = "failed";
+        result.error = "external check exit status is unavailable";
+    }
+    return result;
+}
+
+// SAFETY: environment for every child that may reach a network: language servers and the runtimes they start
+//   (dotnet/MSBuild, node/npm, cargo, deno, uv/pip, PowerShell), and configured compiler/build checks. It disables
+//   telemetry, update checks and package downloads. The firewall rules from tools/egress_firewall.ps1 are the
+//   enforcement; this removes the reasons.
+const std::vector<std::pair<std::wstring, std::wstring>>& offline_environment() {
+    static const std::vector<std::pair<std::wstring, std::wstring>> values{
+        {L"DO_NOT_TRACK", L"1"},
+        {L"DOTNET_CLI_TELEMETRY_OPTOUT", L"1"}, {L"DOTNET_NOLOGO", L"1"}, {L"DOTNET_SKIP_FIRST_TIME_EXPERIENCE", L"1"},
+        {L"DOTNET_CLI_WORKLOAD_UPDATE_NOTIFY_DISABLE", L"1"}, {L"DOTNET_GENERATE_ASPNET_CERTIFICATE", L"false"},
+        {L"MSBUILDDISABLENODEREUSE", L"1"},
+        {L"NO_UPDATE_NOTIFIER", L"1"}, {L"NPM_CONFIG_OFFLINE", L"true"}, {L"NPM_CONFIG_UPDATE_NOTIFIER", L"false"},
+        {L"NPM_CONFIG_AUDIT", L"false"}, {L"NPM_CONFIG_FUND", L"false"}, {L"YARN_ENABLE_TELEMETRY", L"0"},
+        {L"NEXT_TELEMETRY_DISABLED", L"1"}, {L"CARGO_NET_OFFLINE", L"true"}, {L"DENO_NO_UPDATE_CHECK", L"1"},
+        {L"DENO_NO_PROMPT", L"1"}, {L"UV_OFFLINE", L"1"}, {L"PIP_NO_INDEX", L"1"},
+        {L"POWERSHELL_TELEMETRY_OPTOUT", L"1"}, {L"POWERSHELL_UPDATECHECK", L"Off"}};
+    return values;
+}
 
 CompileSetup cpp_compile_setup(const fs::path& workspace, const SearchContext& context, bool cmake_enabled,
                                const std::shared_ptr<std::atomic_bool>& cancelled) {

@@ -1,15 +1,21 @@
 #include "lsp.hpp"
+#include "external_diagnostics.hpp"
+#include "thread_safety.hpp"
 #include "edit.hpp"
 #include "banner.hpp"
 #include "compile_db.hpp"
 #include "dotnet_projects.hpp"
 #include "ignore.hpp"
 #include "lsp_watch.hpp"
+#include "process.hpp"
+#include "workspace_profile.hpp"
 #include <windows.h>
 #include <winternl.h>
+#include <psapi.h>
 #include <algorithm>
 #include <array>
 #include <string_view>
+#include <list>
 #include <unordered_map>
 #include <chrono>
 #include <condition_variable>
@@ -48,6 +54,13 @@ public:
     throw RejectedLspRequest(message, fallback);
 }
 [[noreturn]] void fail(const std::string& s) { throw std::runtime_error(s); }
+// A server position that does not fit the file's text: the server counts lines or columns differently from the LSP
+//   rule shgrep follows (\n, \r\n and a lone \r each end a line). That file's answer is unusable, but the server is
+//   healthy, so it is not restarted and a folder walk skips just that file and reports it.
+class PositionMismatch : public std::runtime_error {
+public:
+    using std::runtime_error::runtime_error;
+};
 // A malformed answer from the language server, or no server for the request, as opposed to a caller mistake;
 //   callers turn it into the failure banner.
 [[noreturn]] void server_fail(const std::string& s) { throw LspFailure(s); }
@@ -175,6 +188,9 @@ struct Config {
     std::map<std::string, std::string> extension_languages;
     J initialization = J::Object{}, settings = J::Object{};
     std::vector<fs::path> state_directories;  // created before the server starts
+    // The configured root whose .shgrep holds state_directories. root can change to another workspace root
+    // (shared C# and JavaScript servers), so the state folders are checked against this one.
+    fs::path state_root;
     bool bundled = false;
     // CONTRACT: the server indexes the whole workspace from disk itself. shgrep then opens only the files a request
     //   touches or that changed since the server read them, and cross-file requests wait for indexing to finish.
@@ -190,22 +206,7 @@ struct Config {
     std::vector<std::pair<std::wstring, std::wstring>> environment;
 };
 
-// SAFETY: environment for every child that may reach a network: language servers and the runtimes they start
-//   (dotnet/MSBuild, node/npm, cargo, deno, uv/pip, PowerShell). It disables telemetry, update checks and package
-//   downloads. The firewall rules from tools/egress_firewall.ps1 are the enforcement; this removes the reasons.
-const std::vector<std::pair<std::wstring, std::wstring>>& offline_environment() {
-    static const std::vector<std::pair<std::wstring, std::wstring>> values{
-        {L"DO_NOT_TRACK", L"1"},
-        {L"DOTNET_CLI_TELEMETRY_OPTOUT", L"1"}, {L"DOTNET_NOLOGO", L"1"}, {L"DOTNET_SKIP_FIRST_TIME_EXPERIENCE", L"1"},
-        {L"DOTNET_CLI_WORKLOAD_UPDATE_NOTIFY_DISABLE", L"1"}, {L"DOTNET_GENERATE_ASPNET_CERTIFICATE", L"false"},
-        {L"MSBUILDDISABLENODEREUSE", L"1"},
-        {L"NO_UPDATE_NOTIFIER", L"1"}, {L"NPM_CONFIG_OFFLINE", L"true"}, {L"NPM_CONFIG_UPDATE_NOTIFIER", L"false"},
-        {L"NPM_CONFIG_AUDIT", L"false"}, {L"NPM_CONFIG_FUND", L"false"}, {L"YARN_ENABLE_TELEMETRY", L"0"},
-        {L"NEXT_TELEMETRY_DISABLED", L"1"}, {L"CARGO_NET_OFFLINE", L"true"}, {L"DENO_NO_UPDATE_CHECK", L"1"},
-        {L"DENO_NO_PROMPT", L"1"}, {L"UV_OFFLINE", L"1"}, {L"PIP_NO_INDEX", L"1"},
-        {L"POWERSHELL_TELEMETRY_OPTOUT", L"1"}, {L"POWERSHELL_UPDATECHECK", L"Off"}};
-    return values;
-}
+// SAFETY: offline_environment() (process.hpp) is the mandatory child environment for every process started here.
 
 // Evaluation only: no targets, build, restore, shell, or persistent MSBuild worker.
 // The job owns every child and is killed on cancellation, deadline, or any exceptional return.
@@ -252,8 +253,9 @@ J evaluate_dotnet_project(const Config& config, const fs::path& project,
         if (equals != std::wstring::npos) variables[entry.substr(0, equals)] = entry.substr(equals + 1);
     }
     FreeEnvironmentStringsW(inherited_environment);
-    for (const auto& [name, value] : offline_environment()) variables[name] = value;
     for (const auto& [name, value] : config.environment) variables[name] = value;
+    // The offline policy is mandatory, including case-insensitive configuration overrides.
+    for (const auto& [name, value] : offline_environment()) variables[name] = value;
     for (const auto* name : {L"DOTNET_CLI_TELEMETRY_OPTOUT", L"DOTNET_SKIP_FIRST_TIME_EXPERIENCE",
                             L"DOTNET_CLI_WORKLOAD_UPDATE_NOTIFY_DISABLE", L"DOTNET_NOLOGO", L"MSBUILDDISABLENODEREUSE"})
         variables[name] = L"1";
@@ -529,6 +531,7 @@ void add_bundled(std::vector<Config>& result, const fs::path& root, const std::s
         config.settings = std::move(settings);
         config.initialization = std::move(initialization);
         config.state_directories = std::move(directories);
+        config.state_root = root;
         config.bundled = true;
         config.indexes_workspace = true;
         config.details = std::move(details);
@@ -784,14 +787,22 @@ Config project_profile(Config config, const SourceText& source, const SearchCont
         fs::path library;
         for (fs::path parent = source.path.parent_path();; parent = parent.parent_path()) {
             const fs::path package = parent / L"node_modules" / L"typescript" / L"package.json";
-            if (GetFileAttributesW(package.c_str()) != INVALID_FILE_ATTRIBUTES) {
+            const DWORD attributes = GetFileAttributesW(package.c_str());
+            if (attributes != INVALID_FILE_ATTRIBUTES) {
                 try {
                     const J json = J::parse(read_source_text(context, utf8(package.wstring())).text);
-                    version = str(json, "version", "unknown");
+                    version = str(json, "version");
+                    if (version.empty()) fail("TypeScript package has no version");
                     library = package.parent_path() / L"lib";
-                } catch (const std::exception&) { version = "unreadable"; }
+                } catch (const std::exception& error) {
+                    throw LspFailure("cannot select the TypeScript server for " + utf8(package.wstring()) + ": " + error.what());
+                }
                 break;
             }
+            const DWORD error = GetLastError();
+            if (error != ERROR_FILE_NOT_FOUND && error != ERROR_PATH_NOT_FOUND)
+                throw LspFailure("cannot inspect the TypeScript package " + utf8(package.wstring()) +
+                     " (Windows error " + std::to_string(error) + ")");
             if (parent == source.root || parent == parent.parent_path()) break;
         }
         config.key += ":ts:" + version;
@@ -871,6 +882,16 @@ Position text_end(const std::string& text) {
     return out;
 }
 size_t offset(const std::wstring& text, Position wanted) {
+    const auto mismatch = [&](const std::string& what) {
+        std::string message = what;
+        for (size_t at = text.find(L'\r'); at != std::wstring::npos; at = text.find(L'\r', at + 1))
+            if (at + 1 >= text.size() || text[at + 1] != L'\n') {
+                message += " (the file ends a line with a lone CR, which the LSP counts as a line break but some "
+                           "servers do not, so their positions drift; normalizing its line endings fixes it)";
+                break;
+            }
+        throw PositionMismatch(message);
+    };
     size_t i = 0;
     int64_t line = 0;
     while (i < text.size() && line < wanted.line) {
@@ -880,10 +901,10 @@ size_t offset(const std::wstring& text, Position wanted) {
         }
         ++i;
     }
-    if (line != wanted.line) fail("LSP range is outside the current file");
+    if (line != wanted.line) mismatch("LSP range is outside the current file");
     const size_t start = i;
     while (i < text.size() && text[i] != L'\r' && text[i] != L'\n') ++i;
-    if (static_cast<uint64_t>(wanted.column) > i - start) fail("LSP column is outside the current line");
+    if (static_cast<uint64_t>(wanted.column) > i - start) mismatch("LSP column is outside the current line");
     const size_t result = start + static_cast<size_t>(wanted.column);
     if (result > 0 && result < text.size() && text[result - 1] >= 0xD800 && text[result - 1] <= 0xDBFF &&
         text[result] >= 0xDC00 && text[result] <= 0xDFFF) fail("LSP range splits a UTF-16 surrogate pair");
@@ -1056,7 +1077,7 @@ std::string firewall_record(const fs::path& program) {
             }
             loaded_stamp = stamp;
         }
-        return programs.contains(lower(utf8(program.lexically_normal().wstring()))) ? "blocked" : "not blocked";
+        return programs.contains(lower(utf8(program.lexically_normal().wstring()))) ? "block rule recorded; live firewall state unverified" : "no block rule recorded for this program";
     }
     return "no firewall rules recorded; run tools/egress_firewall.ps1 as administrator";
 }
@@ -1067,7 +1088,7 @@ class Session {
     std::thread reader_, writer_;
     std::mutex writer_mutex_;
     std::timed_mutex sender_mutex_;
-    mutable std::mutex registrations_mutex_;
+    mutable sync::Mutex registrations_mutex_;
     std::condition_variable writer_ready_;
     std::string outgoing_;
     bool writer_stopping_ = false, write_done_ = true, write_ok_ = true;
@@ -1096,15 +1117,19 @@ class Session {
     std::set<std::wstring, PathLess> diagnosed_;  // diagnostic_key of every open document; messages_mutex_
     size_t diagnostic_bytes_ = 0;                 // the bodies of published_diagnostics_; messages_mutex_
     struct Registration { std::string method; J options; size_t bytes; };
-    std::map<std::string, Registration> registrations_;  // by id; registrations_mutex_
-    size_t registration_bytes_ = 0;                      // registrations_mutex_
+    std::map<std::string, Registration> registrations_ SHGREP_GUARDED_BY(registrations_mutex_);  // by id; registrations_mutex_
+    size_t registration_bytes_ SHGREP_GUARDED_BY(registrations_mutex_) = 0;                      // registrations_mutex_
     Clock::time_point initialized_at_{};  // when "initialized" was sent; late dynamic registrations settle after it
-    Clock::time_point process_started_at_{};  // protected by the session mutex
+    Clock::time_point process_started_at_{};
+    std::atomic<Clock::duration::rep> last_request_ticks_{0};
+    static constexpr int64_t kServerIdleMs = 300000;  // protected by the session mutex
     int64_t next_id_ = 0;
     J capabilities_ = J::Object{};
     int sync_kind_ = 0;
     // rust-analyzer's experimental/serverStatus: answers before quiescence miss the not-yet-loaded project.
     bool announces_status_ = false, status_seen_ = false, quiescent_ = true, ready_ = false;
+    // The index was ready at least once since start; an empty outline is then a real answer, not a cold server's.
+    bool ever_ready_ = false;
     bool roslyn_projects_ready_ = false;  // messages_mutex_
     std::string roslyn_project_error_;  // messages_mutex_
     std::string status_message_, status_health_;  // bounded experimental/serverStatus details; messages_mutex_
@@ -1116,6 +1141,7 @@ class Session {
     // Work-done progress the server reports ($/progress), by token; messages_mutex_.
     struct Progress { std::string title, message; int64_t percentage = -1; };
     std::map<std::string, Progress> progress_;
+    Clock::time_point last_progress_log_{};  // messages_mutex_; throttle server progress in the viewer
     Clock::time_point last_activity_{};  // server start, progress or a newly opened document; messages_mutex_
     // indexes_workspace sessions: documents changed since the server indexed them stay open (pinned_); others
     // opened for a request are closed again once more than kRecentDocuments are open (recent_, oldest first).
@@ -1352,7 +1378,25 @@ private:
                                         it->second.message = bounded_progress_text(str(*value, "message"), kMaxProgressMessage);
                                 }
                             }
-                            else if (kind == "end") progress_.erase(key);
+                            if (auto it = progress_.find(key); it != progress_.end()) {
+                                const std::string title = lower(it->second.title);
+                                const bool indexing = title.find("diagnos") == std::string::npos &&
+                                    title.find("check") == std::string::npos && title.find("lint") == std::string::npos;
+                                const auto now = Clock::now();
+                                if (indexing && (kind == "begin" || kind == "end" ||
+                                    (kind == "report" && (last_progress_log_ == Clock::time_point{} ||
+                                     now - last_progress_log_ >= std::chrono::seconds(5))))) {
+                                    std::string line = "language server " + config.server + " (" + config.language +
+                                        ", root " + utf8(config.root.wstring()) + "): ";
+                                    line += it->second.title.empty() ? "indexing" : it->second.title;
+                                    if (!it->second.message.empty()) line += ": " + it->second.message;
+                                    if (it->second.percentage >= 0) line += " " + std::to_string(it->second.percentage) + "%";
+                                    if (kind == "end") line += " (finished)";
+                                    index_log(false, line);
+                                    last_progress_log_ = now;
+                                }
+                            }
+                            if (kind == "end") progress_.erase(key);
                             last_activity_ = Clock::now();
                             messages_ready_.notify_all();
                         }
@@ -1449,6 +1493,7 @@ private:
     }
     void send(J message, const Control& control) {
         control.check();
+        last_request_ticks_.store(Clock::now().time_since_epoch().count(), std::memory_order_relaxed);
         std::unique_lock<std::timed_mutex> sender(sender_mutex_, std::defer_lock);
         while (!sender.try_lock_for(std::chrono::milliseconds(10))) control.check();
         control.check();
@@ -1497,7 +1542,7 @@ private:
         } else if (method == "workspace/applyEdit") {
             result = J::Object{{"applied", false}, {"failureReason", "unsolicited server edits require an explicit edit_file operation"}};
         } else if (method == "client/registerCapability" || method == "client/unregisterCapability") {
-            std::lock_guard lock(registrations_mutex_);
+            sync::LockGuard lock(registrations_mutex_);
             const J* params = request.get("params");
             const J* entries = params ? params->get(method == "client/registerCapability" ? "registrations" : "unregisterations") : nullptr;
             if (!entries && params) entries = params->get("unregistrations");
@@ -1613,15 +1658,16 @@ public:
         if (reader_.joinable()) { CancelSynchronousIo(reader_.native_handle()); reader_.join(); }
         output_.reset(); process_.reset(); job_.reset();
         process_started_at_ = {};
+        last_request_ticks_.store(0, std::memory_order_relaxed);
         documents_.clear();
         std::lock_guard lock(messages_mutex_);
         messages_.clear(); queued_bytes_ = 0; reader_error_.clear();
         published_diagnostics_.clear(); diagnosed_.clear(); diagnostic_bytes_ = 0;
-        status_seen_ = false; quiescent_ = true; announces_status_ = false; ready_ = false; roslyn_projects_ready_ = false;
+        status_seen_ = false; quiescent_ = true; announces_status_ = false; ready_ = false; ever_ready_ = false; roslyn_projects_ready_ = false;
         status_message_.clear(); status_health_.clear(); roslyn_project_error_.clear(); project_loads_.clear(); latest_project_state_.clear();
         latest_project_message_.clear(); latest_project_file_.clear(); progress_.clear(); last_activity_ = {}; initialized_at_ = {};
         reset_watches(); pinned_.clear(); recent_.clear();
-        { std::lock_guard registrations_lock(registrations_mutex_); registrations_.clear(); registration_bytes_ = 0; }
+        { sync::LockGuard registrations_lock(registrations_mutex_); registrations_.clear(); registration_bytes_ = 0; }
         capabilities_ = J::Object{};
     }
     J request(const std::string& method, J params, const Control& control) {
@@ -1780,7 +1826,7 @@ public:
                     project_discovery_cancelled_ = control.cancelled;
                     project_discovery_context_ = *context;
                     project_discovery_context_->record_user_reads = false;
-                    project_discovery_focus_ = SourceText{primary->path, primary->root, {}, primary->sha256, {}};
+                    project_discovery_focus_ = SourceText{primary->path, primary->root, {}, primary->sha256, {}, primary->first_root};
                 }
             }
             if (!project_pool_) project_pool_ = std::make_unique<DotnetProjects>();
@@ -1825,9 +1871,31 @@ public:
 
     void start_impl(const Control& control) {
         if (process_.h) return;
+        // Managed C# already has project-aware idle unloading. Other backends release their
+        // entire job after five minutes without requests; the next operation starts them again.
+        // Create this thread on first use, never for a temporary observational status session.
+        if (!config.managed_projects && !project_reaper_.joinable()) {
+            project_reaper_ = std::jthread([this](std::stop_token stop) {
+                while (!stop.stop_requested()) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                    if (stop.stop_requested()) break;
+                    std::unique_lock lock(mutex, std::try_to_lock);
+                    if (!lock) {
+                        // A long operation is still using this session; its runtime is not idle time.
+                        last_request_ticks_.store(Clock::now().time_since_epoch().count(), std::memory_order_relaxed);
+                        continue;
+                    }
+                    if (!process_.h) continue;
+                    const auto ticks = last_request_ticks_.load(std::memory_order_relaxed);
+                    const auto used = Clock::time_point{Clock::duration{ticks}};
+                    if (ticks && Clock::now() - used >= std::chrono::milliseconds(kServerIdleMs))
+                        this->stop();
+                }
+            });
+        }
         {
             std::lock_guard lock(messages_mutex_);
-            ready_ = false; status_seen_ = false; quiescent_ = true; announces_status_ = false;
+            ready_ = false; ever_ready_ = false; status_seen_ = false; quiescent_ = true; announces_status_ = false;
             status_message_.clear(); status_health_.clear(); progress_.clear(); initialized_at_ = {};
             last_activity_ = Clock::now();
         }
@@ -1838,10 +1906,21 @@ public:
                 if (PathLess{}(root.wstring(), config.root.wstring()) || PathLess{}(config.root.wstring(), root.wstring()))
                     extra_watches_.push_back(std::make_unique<DirectoryWatch>(root));
         }
-        for (const auto& directory : config.state_directories) {
-            std::error_code error;
-            fs::create_directories(directory, error);
-            if (error) fail("cannot create language server state folder " + utf8(directory.wstring()) + ": " + error.message());
+        // SAFETY (#93): state folders sit under the server's root (.shgrep\lsp-state). They are made from that root
+        // without following links or junctions, and stay pinned against replacement while the server runs, so a
+        // junction at .shgrep or below cannot send the server's writes outside the workspace.
+        state_pins_.clear();
+        if (!config.state_directories.empty()) {
+            SearchContext state_context;
+            state_context.allowed_roots = {config.state_root.empty() ? config.root : config.state_root};
+            for (const auto& directory : config.state_directories) {
+                try {
+                    state_pins_.push_back(pin_workspace_metadata_directory(state_context, directory));
+                } catch (const std::exception& e) {
+                    state_pins_.clear();
+                    fail("cannot create language server state folder " + utf8(directory.wstring()) + ": " + e.what());
+                }
+            }
         }
         SECURITY_ATTRIBUTES security{sizeof(SECURITY_ATTRIBUTES), nullptr, TRUE};
         Handle child_input, child_output, child_error;
@@ -1885,16 +1964,15 @@ public:
             if (!command.empty()) command.push_back(L' ');
             command += quoted(wide(part));
         }
-        // config.environment overrides same-named variables (case-insensitive) of shgrep's own environment.
-        // SAFETY: every language server, bundled or configured, starts with telemetry, update checks and package
-        //   downloads switched off for the runtimes it may use. Values a configuration sets explicitly win.
+        // Configuration overrides inherited values, but cannot override the mandatory offline policy.
         auto child_environment = config.environment;
-        for (const auto& [name, value] : offline_environment())
-            if (std::none_of(child_environment.begin(), child_environment.end(), [&](const auto& item) {
-                    return CompareStringOrdinal(item.first.data(), static_cast<int>(item.first.size()), name.data(),
-                                                static_cast<int>(name.size()), TRUE) == CSTR_EQUAL;
-                }))
-                child_environment.emplace_back(name, value);
+        for (const auto& [name, value] : offline_environment()) {
+            std::erase_if(child_environment, [&](const auto& item) {
+                return CompareStringOrdinal(item.first.data(), static_cast<int>(item.first.size()), name.data(),
+                                            static_cast<int>(name.size()), TRUE) == CSTR_EQUAL;
+            });
+            child_environment.emplace_back(name, value);
+        }
         std::wstring environment;
         if (!child_environment.empty()) {
             std::vector<std::wstring> entries;
@@ -2020,7 +2098,7 @@ public:
         const J* p = capabilities_.get(capability);
         if (p && (std::holds_alternative<J::Object>(p->value) || (std::holds_alternative<bool>(p->value) && p->boolean()))) return true;
         const std::string method = capability_method(capability);
-        std::lock_guard lock(registrations_mutex_);
+        sync::LockGuard lock(registrations_mutex_);
         for (const auto& [id, entry] : registrations_) { (void)id; if (entry.method == method) return true; }
         return false;
     }
@@ -2059,7 +2137,7 @@ public:
         const J* operations = workspace ? workspace->get("fileOperations") : nullptr;
         if (const J* configured = operations ? operations->get(name) : nullptr) options.push_back(*configured);
         {
-            std::lock_guard lock(registrations_mutex_);
+            sync::LockGuard lock(registrations_mutex_);
             for (const auto& [id, entry] : registrations_) { (void)id;
                 if (entry.method == "workspace/" + name + "Files") options.push_back(entry.options);
             }
@@ -2128,6 +2206,24 @@ public:
         result["uptime_seconds"] = process_started_at_ == Clock::time_point{} || !process_.h ||
             WaitForSingleObject(process_.h, 0) != WAIT_TIMEOUT ? J(nullptr) :
             J(static_cast<int64_t>(std::chrono::duration_cast<std::chrono::seconds>(Clock::now() - process_started_at_).count()));
+        if (process_.h) {
+            result["process_id"] = static_cast<uint64_t>(GetProcessId(process_.h));
+            PROCESS_MEMORY_COUNTERS_EX counters{};
+            counters.cb = sizeof(counters);
+            if (K32GetProcessMemoryInfo(process_.h, reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&counters), sizeof(counters))) {
+                result["memory"] = J::Object{
+                    {"working_set_bytes", static_cast<uint64_t>(counters.WorkingSetSize)},
+                    {"peak_working_set_bytes", static_cast<uint64_t>(counters.PeakWorkingSetSize)},
+                    {"private_bytes", static_cast<uint64_t>(counters.PrivateUsage)}};
+            } else {
+                result["memory"] = J::Object{{"error", "cannot read process memory"},
+                    {"windows_error", static_cast<uint64_t>(GetLastError())}};
+            }
+            JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits{};
+            if (job_.h && QueryInformationJobObject(job_.h, JobObjectExtendedLimitInformation, &limits, sizeof(limits), nullptr)) {
+                result["job_peak_memory_bytes"] = static_cast<uint64_t>(limits.PeakJobMemoryUsed);
+            }
+        }
         J::Array language_ids{config.language};
         std::set<std::string> seen{config.language};
         for (const auto& [extension, language] : config.extension_languages) {
@@ -2136,7 +2232,7 @@ public:
         }
         result.emplace("language_ids", std::move(language_ids));
         {
-            std::lock_guard lock(registrations_mutex_);
+            sync::LockGuard lock(registrations_mutex_);
             if (full) {
                 J::Array dynamic;
                 std::set<std::string> dynamic_seen;
@@ -2191,10 +2287,11 @@ public:
             for (const auto& root : config.workspace_roots) roots.emplace_back(utf8(root.wstring()));
             result["workspace_roots"] = std::move(roots);
         }
+        result["idle_timeout_ms"] = config.managed_projects ? config.project_idle_ms : kServerIdleMs;
         // Issue #51: what keeps this server's data on the machine.
         result["egress"] = J::Object{
             {"telemetry_and_downloads", config.bundled
-                ? "off: shgrep's server settings and offline environment"
+                ? "disabled by server settings and enforced offline environment; binary audit unverified"
                 : "offline environment only; check this server's own settings"},
             {"firewall", config.command.empty() ? std::string("unknown")
                                                 : firewall_record(fs::path(wide(config.command.front())))}};
@@ -2366,7 +2463,10 @@ public:
         DirectoryWatch::Sync synced = DirectoryWatch::Sync::confirmed;
         for (DirectoryWatch* watch : watches()) {
             const DirectoryWatch::Sync result = watch->sync(wait);
-            watch->take(changed, reload);
+            // Each watch reports only its own state; any one asking for a reload forces it for the request.
+            bool watch_reload = false;
+            watch->take(changed, watch_reload);
+            reload = reload || watch_reload;
             if (result == DirectoryWatch::Sync::no_cookie) synced = result;
             else if (result != DirectoryWatch::Sync::confirmed && synced == DirectoryWatch::Sync::confirmed) synced = result;
         }
@@ -2478,12 +2578,14 @@ public:
     //   inferred project of the files that are open, so references, implementations and renames miss every other
     //   file (a Vite JSX app without jsconfig). Before such cross-file requests, the scripts under the nearest
     //   package.json folder are opened, skipping dependency and build-output folders, up to kLooseScripts files.
-    void open_loose_scripts(const SourceText& source, const SearchContext& context, const Control& control) {
-        if (config.language != "javascript") return;
+    bool open_loose_scripts(const SourceText& source, const SearchContext& context, const Control& control) {
+        // false: more than kLooseScripts scripts were found, so the inferred project misses the rest; callers mark
+        // reads partial and refuse writes that need every reference (F10).
+        if (config.language != "javascript") return true;
         const auto exists = [](const fs::path& path) { return GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES; };
         fs::path package_root;
         for (fs::path parent = source.path.parent_path();; parent = parent.parent_path()) {
-            if (exists(parent / L"tsconfig.json") || exists(parent / L"jsconfig.json")) return;  // tsserver loads it
+            if (exists(parent / L"tsconfig.json") || exists(parent / L"jsconfig.json")) return true;  // tsserver loads it
             if (package_root.empty() && exists(parent / L"package.json")) package_root = parent;
             if (parent == source.root || parent == parent.parent_path()) break;
         }
@@ -2507,12 +2609,13 @@ public:
         for (const auto& path : source_paths(context, utf8(source.root.wstring()), config.extensions, control.deadline,
                                              control.cancelled, inside_package)) {
             control.check();
-            if (++opened > kLooseScripts) break;
+            if (++opened > kLooseScripts) return false;
             try { sync_one(read_source_text(context, path), control); }
             catch (const std::exception& e) {
                 if (!std::string(e.what()).ends_with(" is not valid Unicode source text")) throw;
             }
         }
+        return true;
     }
     static constexpr size_t kLooseScripts = 1000;
     // A file shgrep just wrote: the server must see these bytes now, not when the watcher reports them.
@@ -2575,12 +2678,12 @@ public:
             if (indexing_progress_locked()) return "indexing";
             return "starting";
         }
-        ready_ = true;
+        ready_ = ever_ready_ = true;
         return "ready";
     }
     // CONTRACT: messages_mutex_ held. Empty once the server's index covers the workspace, else what it is doing.
     std::string indexing_locked(const SourceText* source = nullptr) {
-        if (index_ready_locked(source)) { ready_ = true; return {}; }
+        if (index_ready_locked(source)) { ready_ = ever_ready_ = true; return {}; }
         if (config.managed_projects && project_pool_) {
             size_t loaded = 0;
             for (const auto& path : project_pool_->requested()) {
@@ -2636,7 +2739,10 @@ public:
         return details;
     }
     // CONTRACT: messages_mutex_ held.
-    IndexWarmingFailure warming_failure_locked(const std::string& phase, const SourceText* source = nullptr) {
+    // record: false when the failure only decides a response's partial flag (warming_timeout) and is not raised; the
+    //   index log then stays free of one warning per answered file.
+    IndexWarmingFailure warming_failure_locked(const std::string& phase, const SourceText* source = nullptr,
+                                               bool record = true) {
         J details = readiness_details_locked(phase, source);
         const std::string state = str(details, "indexing_state", "starting");
         const std::string busy = str(details, "indexing");
@@ -2649,27 +2755,37 @@ public:
             message = "index_warming: language server " + config.server + " is still starting and did not finish "
                       "initializing within timeout_ms; no semantic result was returned. Retry shortly or pass a larger timeout_ms";
         } else {
-            message = "index_warming: language server is ";
+            message = "index_warming: language server " + config.server + " (" + config.language + ", root " +
+                      utf8(config.root.wstring()) + ") is ";
             message += state == "indexing" ? "still indexing the workspace" : "starting";
             if (!busy.empty()) message += " (" + busy + ")";
+            if (source) message += " while answering for " + utf8(source->path.wstring());
             message += "; no semantic result was returned. Retry shortly or pass a larger timeout_ms";
         }
+        // The log keeps which server held the request, phase and readiness, even when the caller only sees a retry.
+        if (record) index_log(true, message + " [phase " + phase + ", state " + state + "]");
         return IndexWarmingFailure(std::move(message), std::move(details));
+    }
+    bool ever_ready() {
+        std::lock_guard lock(messages_mutex_);
+        return ever_ready_;
     }
     std::optional<IndexWarmingFailure> warming_timeout(const SourceText* source = nullptr) {
         std::lock_guard lock(messages_mutex_);
-        if (index_ready_locked(source)) { ready_ = true; return std::nullopt; }
-        return warming_failure_locked(initialized_at_ == Clock::time_point{} ? "startup" : "workspace_index", source);
+        if (index_ready_locked(source)) { ready_ = ever_ready_ = true; return std::nullopt; }
+        return warming_failure_locked(initialized_at_ == Clock::time_point{} ? "startup" : "workspace_index", source, false);
     }
     // CONTRACT: cross-file answers come from the server's index, so they wait until it covers the whole workspace.
     void wait_indexed(const Control& control, const SourceText* source = nullptr) {
         if (!config.indexes_workspace) {
             std::lock_guard lock(messages_mutex_);
             if (!reader_error_.empty()) fail(reader_error_);
-            if (initialized_at_ != Clock::time_point{}) ready_ = true;
+            if (initialized_at_ != Clock::time_point{}) ready_ = ever_ready_ = true;
             return;
         }
         const auto give_up = control.deadline - std::chrono::seconds(2);
+        auto next_progress_log = Clock::now() + std::chrono::seconds(2);
+        bool logged_wait = false;
         try {
             for (;;) {
                 {
@@ -2689,8 +2805,24 @@ public:
                         }
                     }
                     const std::string busy = indexing_locked(source);
-                    if (busy.empty()) { ready_ = true; return; }
+                    if (busy.empty()) {
+                        ready_ = ever_ready_ = true;
+                        if (logged_wait) {
+                            lock.unlock();
+                            index_log(false, "language server " + config.server + " (" + config.language +
+                                ", root " + utf8(config.root.wstring()) + ") is ready");
+                        }
+                        return;
+                    }
                     if (Clock::now() >= give_up) throw warming_failure_locked("workspace_index", source);
+                    if (Clock::now() >= next_progress_log) {
+                        next_progress_log = Clock::now() + std::chrono::seconds(5);
+                        logged_wait = true;
+                        lock.unlock();
+                        index_log(false, "waiting for language server " + config.server + " (" + config.language +
+                            ", root " + utf8(config.root.wstring()) + "): " + busy);
+                        lock.lock();
+                    }
                     messages_ready_.wait_for(lock, std::chrono::milliseconds(50));
                 }
                 control.check();
@@ -2715,6 +2847,8 @@ public:
         if (!has_document(source)) fail("source changed during LSP navigation; retry the request");
     }
 private:
+    // Handles that keep the server's state folders from being replaced while it runs (start_impl).
+    std::vector<std::shared_ptr<void>> state_pins_;
     // Last, so it is joined before any state it observes is destroyed.
     std::jthread project_reaper_;
 };
@@ -2773,6 +2907,290 @@ struct Symbol {
     int depth;
     bool has_body;
 };
+
+
+// CONTRACT (symbol index): a server's document symbols depend only on the file's bytes and the server
+//   configuration, so each outline is kept under (configuration key, path) with the sha256 of the text it came
+//   from, and reused while that file is unchanged. Per-file server round trips are the known cost on large
+//   repositories (arXiv 2604.18413); Serena keeps a content-hash symbol cache the same way. Folder symbol searches
+//   answer from it without opening the file in the server; a miss asks the server and fills it. Empty outlines are
+//   kept only after the server's index was ready once; C# (syntax-only until its project loads) is never kept. Full outlines stay in memory up to kMaxSymbols
+//   symbols (least recently used dropped first); each file's distinct names (up to kMaxNames) with their stamps are
+//   also saved to %LOCALAPPDATA%\shgrep\symbol-names.bin, so restarts keep skipping unchanged files.
+class SymbolIndex {
+public:
+    // Full outlines (every symbol with ranges) are large; names are small. The name layer decides which files a
+    // folder search must read and keeps every file; the outline layer keeps the most recently used outlines up to
+    // kMaxSymbols symbols, so a walk over a folder larger than that cannot evict what the next walk needs to skip.
+    static constexpr size_t kMaxSymbols = 1'000'000;
+    static constexpr size_t kMaxNames = 4'000'000;
+    std::optional<std::vector<Symbol>> find(const std::string& key, const std::string& sha256) {
+        std::lock_guard lock(mutex_);
+        const auto found = outlines_.find(key);
+        if (found == outlines_.end() || found->second.sha256 != sha256) return std::nullopt;
+        order_.splice(order_.end(), order_, found->second.position);  // most recently used last
+        return found->second.symbols;
+    }
+    // The distinct symbol names of a file whose size and last-write time still equal `stamp`, without reading the
+    // file. Unchanged metadata is trusted and changed metadata means a re-read and re-hash (the mtime-then-hash rule
+    // of LAFORGE, arXiv 2108.12469, and OxyMake, arXiv 2606.20989). The gap: a same-size edit inside one 100 ns
+    // write-time tick.
+    std::optional<std::vector<std::string>> names_stamped(const std::string& key, const std::string& stamp) {
+        if (stamp.empty()) return std::nullopt;
+        std::lock_guard lock(mutex_);
+        const auto found = names_.find(key);
+        if (found == names_.end() || found->second.stamp != stamp) return std::nullopt;
+        found->second.used = true;
+        return found->second.names;
+    }
+    // Attaches the metadata stamp taken before the read whose text hashed to sha256. A file changed between the stamp
+    // and the read only makes the next lookup miss and re-read; it never pairs new metadata with old names.
+    void attach_stamp(const std::string& key, const std::string& sha256, const std::string& stamp) {
+        std::lock_guard lock(mutex_);
+        if (const auto found = names_.find(key); found != names_.end() && found->second.sha256 == sha256 &&
+            (found->second.stamp != stamp || !found->second.used)) {
+            found->second.stamp = stamp;
+            found->second.used = true;
+            dirty_ = true;
+        }
+    }
+    void store(const std::string& key, const std::string& sha256, const std::vector<Symbol>& symbols) {
+        if (sha256.empty() || symbols.size() > kMaxSymbols) return;  // callers decide whether an empty outline is real
+        std::vector<std::string> names;
+        names.reserve(symbols.size());
+        for (const auto& symbol : symbols) names.push_back(symbol.name);
+        std::sort(names.begin(), names.end());
+        names.erase(std::unique(names.begin(), names.end()), names.end());
+        std::lock_guard lock(mutex_);
+        // Names: one small entry per file; the same bytes keep their verified stamp.
+        std::string stamp;
+        if (const auto found = names_.find(key); found != names_.end()) {
+            if (found->second.sha256 == sha256) stamp = std::move(found->second.stamp);
+            name_total_ -= found->second.names.size();
+            names_.erase(found);
+        }
+        if (name_total_ + names.size() <= kMaxNames) {
+            name_total_ += names.size();
+            names_.emplace(key, Names{sha256, std::move(stamp), std::move(names), true});
+            dirty_ = true;
+        }
+        // Outlines: least recently used dropped first.
+        if (const auto found = outlines_.find(key); found != outlines_.end()) {
+            total_ -= found->second.symbols.size();
+            order_.erase(found->second.position);
+            outlines_.erase(found);
+        }
+        while (total_ + symbols.size() > kMaxSymbols && !order_.empty()) {
+            if (const auto oldest = outlines_.find(order_.front()); oldest != outlines_.end()) {
+                total_ -= oldest->second.symbols.size();
+                outlines_.erase(oldest);
+            }
+            order_.pop_front();
+        }
+        order_.push_back(key);
+        outlines_.emplace(key, Outline{sha256, symbols, std::prev(order_.end())});
+        total_ += symbols.size();
+    }
+    // Persistence of the name layer (with stamps), so a restart keeps skipping unchanged files. The file lives under
+    // %LOCALAPPDATA%\shgrep, outside every workspace: a file planted in a repository cannot hide its symbols. Only
+    // stamped entries are written. A damaged, oversized or foreign file is ignored and replaced on the next save.
+    void load(const std::wstring& path) {
+        std::lock_guard lock(mutex_);
+        path_ = path;
+        if (path.empty()) return;
+        HANDLE file = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (file == INVALID_HANDLE_VALUE) return;
+        LARGE_INTEGER size{};
+        std::string bytes;
+        if (GetFileSizeEx(file, &size) && size.QuadPart > 0 && size.QuadPart <= kMaxSavedBytes) {
+            bytes.resize(static_cast<size_t>(size.QuadPart));
+            DWORD read = 0;
+            if (!ReadFile(file, bytes.data(), static_cast<DWORD>(bytes.size()), &read, nullptr) || read != bytes.size())
+                bytes.clear();
+        }
+        CloseHandle(file);
+        size_t at = 0;
+        const auto take = [&](size_t count) -> std::optional<std::string_view> {
+            if (bytes.size() - at < count) return std::nullopt;
+            const std::string_view out(bytes.data() + at, count);
+            at += count;
+            return out;
+        };
+        const auto number = [&]() -> std::optional<uint32_t> {
+            const auto raw = take(4);
+            if (!raw) return std::nullopt;
+            uint32_t value = 0;
+            for (size_t i = 0; i < 4; ++i) value |= static_cast<uint32_t>(static_cast<unsigned char>((*raw)[i])) << (8 * i);
+            return value;
+        };
+        const auto text = [&]() -> std::optional<std::string> {
+            const auto length = number();
+            if (!length) return std::nullopt;
+            const auto raw = take(*length);
+            if (!raw) return std::nullopt;
+            return std::string(*raw);
+        };
+        std::unordered_map<std::string, Names> loaded;
+        size_t loaded_names = 0;
+        const auto magic = take(kSavedMagic.size());
+        auto entries = magic && *magic == kSavedMagic ? number() : std::nullopt;
+        // Every entry holds at least four length fields, so a count larger than that allows is a damaged file.
+        if (!entries || *entries > (bytes.size() - at) / 16) return;
+        for (uint32_t i = 0; i < *entries; ++i) {
+            auto key = text(), sha256 = text(), stamp = text();
+            const auto count = number();
+            if (!key || !sha256 || !stamp || !count || *count > (bytes.size() - at) / 4) return;
+            Names entry{std::move(*sha256), std::move(*stamp), {}, false};
+            entry.names.reserve(*count);
+            for (uint32_t n = 0; n < *count; ++n) {
+                auto name = text();
+                if (!name) return;
+                entry.names.push_back(std::move(*name));
+            }
+            loaded_names += entry.names.size();
+            if (loaded_names > kMaxNames) return;
+            loaded.emplace(std::move(*key), std::move(entry));
+        }
+        if (at != bytes.size()) return;
+        names_ = std::move(loaded);
+        name_total_ = loaded_names;
+    }
+    // Writes the name layer when it changed, at most every 30 seconds; atomic (temporary file, then replace).
+    void save_if_due() {
+        std::string bytes;
+        std::wstring path;
+        {
+            std::lock_guard lock(mutex_);
+            const auto now = Clock::now();
+            if (!dirty_ || path_.empty() || (saved_ != Clock::time_point{} && now - saved_ < std::chrono::seconds(30))) return;
+            const bool used_only = name_total_ > kMaxNames / 2;  // crowded: keep what this process needed
+            const auto put_number = [&](size_t value) {
+                for (size_t i = 0; i < 4; ++i) bytes.push_back(static_cast<char>((value >> (8 * i)) & 0xff));
+            };
+            const auto put_text = [&](std::string_view value) { put_number(value.size()); bytes.append(value); };
+            size_t count = 0;
+            for (const auto& [key, entry] : names_) count += !entry.stamp.empty() && (!used_only || entry.used);
+            bytes.append(kSavedMagic);
+            put_number(count);
+            for (const auto& [key, entry] : names_) {
+                if (entry.stamp.empty() || (used_only && !entry.used)) continue;
+                put_text(key);
+                put_text(entry.sha256);
+                put_text(entry.stamp);
+                put_number(entry.names.size());
+                for (const auto& name : entry.names) put_text(name);
+            }
+            if (bytes.size() > kMaxSavedBytes) return;
+            dirty_ = false;
+            saved_ = now;
+            path = path_;
+        }
+        CreateDirectoryW(path.substr(0, path.rfind(L'\\')).c_str(), nullptr);
+        const std::wstring temporary = path + L".tmp";
+        HANDLE file = CreateFileW(temporary.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        bool written = file != INVALID_HANDLE_VALUE;
+        for (size_t at = 0; written && at < bytes.size();) {
+            DWORD wrote = 0;
+            const DWORD chunk = static_cast<DWORD>(std::min<size_t>(bytes.size() - at, 1 << 20));
+            written = WriteFile(file, bytes.data() + at, chunk, &wrote, nullptr) && wrote == chunk;
+            at += wrote;
+        }
+        if (file != INVALID_HANDLE_VALUE) {
+            written = written && FlushFileBuffers(file);
+            CloseHandle(file);
+        }
+        if (!written || !MoveFileExW(temporary.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+            const DWORD error = GetLastError();
+            DeleteFileW(temporary.c_str());
+            index_log(true, "symbol index names not saved to " + utf8(path) + " (Windows error " +
+                            std::to_string(error) + "); the next folder search tries again");
+            std::lock_guard lock(mutex_);
+            dirty_ = true;
+        }
+    }
+private:
+    static constexpr std::string_view kSavedMagic = "SHGSYMN1";
+    static constexpr int64_t kMaxSavedBytes = 256LL << 20;
+    struct Outline {
+        std::string sha256;
+        std::vector<Symbol> symbols;
+        std::list<std::string>::iterator position;
+    };
+    struct Names {
+        std::string sha256;
+        std::string stamp;  // size and write time seen just before the read that produced sha256; empty if unverified
+        std::vector<std::string> names;  // distinct symbol names, sorted
+        bool used = false;  // looked up or written by this process (a crowded saved file keeps only these)
+    };
+    std::mutex mutex_;
+    std::list<std::string> order_;  // outline keys, least recently used first
+    std::unordered_map<std::string, Outline> outlines_;
+    std::unordered_map<std::string, Names> names_;
+    size_t total_ = 0, name_total_ = 0;
+    bool dirty_ = false;          // names changed since the last save
+    Clock::time_point saved_{};  // last save
+    std::wstring path_;           // the saved file; empty without LOCALAPPDATA
+};
+// Process lifetime on purpose: request threads can still be reading it while the server exits.
+// %LOCALAPPDATA%\shgrep\symbol-names.bin, or empty when LOCALAPPDATA is unset (the index then stays in memory).
+std::wstring symbol_names_path() {
+    wchar_t base[MAX_PATH] = {};
+    const DWORD length = GetEnvironmentVariableW(L"LOCALAPPDATA", base, MAX_PATH);
+    if (!length || length >= MAX_PATH) return {};
+    return std::wstring(base, length) + L"\\shgrep\\symbol-names.bin";
+}
+SymbolIndex& symbol_index() {
+    static auto* index = [] {
+        auto* created = new SymbolIndex;
+        created->load(symbol_names_path());
+        return created;
+    }();
+    return *index;
+}
+std::string symbol_index_key(const Config& config, const fs::path& path) {
+    return config.key + "\n" + lower(utf8(path.wstring()));
+}
+// Size and last-write time from the file's metadata, without opening it; empty when unavailable, for a folder or a
+// link. Only a cache key: every read still goes through the guarded read_source_text.
+// The \\?\ spelling of an absolute path, so long paths work; separators are made native first.
+std::wstring long_path_name(fs::path path) {
+    std::wstring name = path.make_preferred().wstring();
+    if (!name.starts_with(L"\\\\?\\"))
+        name = name.starts_with(L"\\\\") ? L"\\\\?\\UNC\\" + name.substr(2) : L"\\\\?\\" + name;
+    return name;
+}
+std::string file_stamp(const fs::path& path) {
+    const std::wstring name = long_path_name(path);
+    WIN32_FILE_ATTRIBUTE_DATA data{};
+    if (!GetFileAttributesExW(name.c_str(), GetFileExInfoStandard, &data)) return {};
+    if (data.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) return {};
+    return std::to_string(data.nFileSizeHigh) + ":" + std::to_string(data.nFileSizeLow) + ":" +
+           std::to_string(data.ftLastWriteTime.dwHighDateTime) + ":" + std::to_string(data.ftLastWriteTime.dwLowDateTime);
+}
+// Content roles (workspace_profile.hpp layer 3) by lower-case path, with the stamp their head was read under; a
+// changed stamp reads the head again. Process memory only; cleared when it reaches kMaxEntries.
+class RoleCache {
+public:
+    static constexpr size_t kMaxEntries = 500'000;
+    std::optional<FileRole> find(const std::string& key, const std::string& stamp) {
+        std::lock_guard lock(mutex_);
+        const auto found = roles_.find(key);
+        if (found == roles_.end() || found->second.first != stamp) return std::nullopt;
+        return found->second.second;
+    }
+    void store(const std::string& key, const std::string& stamp, FileRole role) {
+        std::lock_guard lock(mutex_);
+        if (roles_.size() >= kMaxEntries) roles_.clear();
+        roles_[key] = {stamp, role};
+    }
+private:
+    std::mutex mutex_;
+    std::unordered_map<std::string, std::pair<std::string, FileRole>> roles_;
+};
+RoleCache& role_cache() {
+    static auto* cache = new RoleCache;  // process lifetime, like symbol_index
+    return *cache;
+}
 std::string namespace_source_name(const J& item, const std::wstring& source, const std::string& supplied) {
     const int64_t kind = number(item, "kind", 0);
     const J* selection = item.get("selectionRange");
@@ -2943,6 +3361,9 @@ std::vector<Symbol> symbols(Session& session, const SourceText& source, const Co
         J::Object{{"textDocument", J::Object{{"uri", session.document_uri(source)}}}}, control);
     std::vector<Symbol> result;
     flatten(raw, "", 0, result, session.config.language, wide(source.text), control);
+    // An empty outline is kept only once the server's index has been ready: before that, empty can mean "not loaded".
+    if (!session.config.managed_projects && (!result.empty() || session.ever_ready()))
+        symbol_index().store(symbol_index_key(session.config, source.path), source.sha256, result);
     return result;
 }
 std::string_view symbol_kind_name(int64_t kind) {
@@ -3170,6 +3591,10 @@ private:
     }
 };
 std::string shown_path(const SourceText& source) {
+    // CONTRACT: a shown path reads back the same file. Relative paths resolve against the first root, so files of
+    //   other roots are shown absolute; otherwise two roots' src/Helper.cs would look alike and follow-ups would
+    //   open the first root's copy.
+    if (!source.first_root) return utf8(source.path.wstring());
     return utf8(source.path.lexically_relative(source.root).generic_wstring());
 }
 J coordinates(Range r) {
@@ -3392,26 +3817,34 @@ std::string diagnostic_severity(const J& diagnostic) {
 
 J query_file(const std::string& operation, const J& args, const SourceText& original,
              const Config& config, const SearchContext& context, const Control& control,
-             std::set<std::string>& synchronized, bool workspace_query = false) {
+             std::set<std::string>& synchronized, bool workspace_query = false,
+             const std::vector<Symbol>* cached = nullptr) {
+    // cached: this file's outline from the symbol index, for the bytes in `original` (symbols/overview only). The
+    //   answer is built from it alone: the server is not started, locked, synchronized or waited for.
+    if (cached && operation != "symbols" && operation != "overview") cached = nullptr;
     auto session = session_for(config);
     std::unique_lock<std::timed_mutex> lock(session->mutex, std::defer_lock);
-    while (!lock.try_lock_for(std::chrono::milliseconds(10))) control.check();
+    if (!cached) while (!lock.try_lock_for(std::chrono::milliseconds(10))) control.check();
     bool reusable = false;
     try {
         const bool reverse = operation == "references" || operation == "implementation";
-        if (workspace_query && synchronized.contains(config.key)) session->start(control);
-        else session->start(control, &context, &original, reverse, workspace_query);
-        if (session->project_syntax_only() && operation != "symbols" && operation != "overview" &&
-            operation != "status" && operation != "restart")
-            throw SymbolLookupFailure("the file's project is unavailable; only a partial syntax outline is available",
-                J::Object{{"code", "project_loading"}, {"reason", "project_not_loaded"}, {"project_loading", session->managed_project_status()}});
-        if (synchronized.insert(config.key).second) session->synchronize(&original, context, control);
-        else session->use(original, control);
-        if (reverse || operation == "definition" || operation == "declaration" || operation == "type_definition")
-            session->open_loose_scripts(original, context, control);
-        session->service_pending(control);
-        const SourceText source = read_source_text(context, utf8(original.path.wstring()));
-        session->assert_current(source);
+        bool first_for_server = false, loose_scripts_cut = false;
+        if (!cached) {
+            if (workspace_query && synchronized.contains(config.key)) session->start(control);
+            else session->start(control, &context, &original, reverse, workspace_query);
+            if (session->project_syntax_only() && operation != "symbols" && operation != "overview" &&
+                operation != "status" && operation != "restart")
+                throw SymbolLookupFailure("the file's project is unavailable; only a partial syntax outline is available",
+                    J::Object{{"code", "project_loading"}, {"reason", "project_not_loaded"}, {"project_loading", session->managed_project_status()}});
+            first_for_server = synchronized.insert(config.key).second;
+            if (first_for_server) session->synchronize(&original, context, control);
+            else session->use(original, control);
+            if (reverse || operation == "definition" || operation == "declaration" || operation == "type_definition")
+                loose_scripts_cut = !session->open_loose_scripts(original, context, control);
+            session->service_pending(control);
+        }
+        const SourceText source = cached ? original : read_source_text(context, utf8(original.path.wstring()));
+        if (!cached) session->assert_current(source);
         reusable = true;
         const std::string pattern = str(args, "name_path", str(args, "pattern"));
         const auto require_capability = [&](const char* capability) {
@@ -3423,6 +3856,7 @@ J query_file(const std::string& operation, const J& args, const SourceText& orig
             control.check();
         };
         const auto query_symbols = [&]() {
+            if (cached) return *cached;
             require_capability("documentSymbolProvider");
             return symbols(*session, source, control);
         };
@@ -3435,7 +3869,13 @@ J query_file(const std::string& operation, const J& args, const SourceText& orig
         const bool grouped_diagnostics = operation == "diagnostics" &&
             (flag(args, "group_by_symbol") || !pattern.empty());
         const bool partial_outline = config.managed_projects && (operation == "symbols" || operation == "overview");
-        if (!partial_outline && (operation != "diagnostics" || grouped_diagnostics)) session->wait_indexed(control, &source);
+        // A folder query opens its files one by one, and each didOpen restarts the 2 s quiet wait of servers without
+        // progress reports, so N files cost 2N seconds and time out. Document symbols come from the file itself: once
+        // this request saw the server's index ready, later files of the same folder query do not wait again.
+        const bool index_seen_this_request = workspace_query && !first_for_server &&
+                                             (operation == "symbols" || operation == "overview");
+        if (!cached && !partial_outline && !index_seen_this_request && (operation != "diagnostics" || grouped_diagnostics))
+            session->wait_indexed(control, &source);
         if (operation == "diagnostics") {
             J::Object report = session->diagnostics(source, control).object();
             const bool grouped = flag(args, "group_by_symbol");
@@ -3730,6 +4170,8 @@ J query_file(const std::string& operation, const J& args, const SourceText& orig
                     std::wstring line = decoded.text.substr(line_start, line_stop - line_start);
                     const size_t first = line.find_first_not_of(L" \t");
                     line = first == std::wstring::npos ? std::wstring() : line.substr(first, 240);
+                    // A cut between a surrogate pair would leave a lone high surrogate that utf8() rejects.
+                    if (line.size() == 240 && line.back() >= 0xD800 && line.back() <= 0xDBFF) line.pop_back();
                     result.emplace("line_text", utf8(line));
                 }
                 const bool owner_known = owners.contains(target.path.wstring());
@@ -3780,15 +4222,23 @@ J query_file(const std::string& operation, const J& args, const SourceText& orig
                     fail("navigation target changed during the request; retry");
             }
         }
-        if (read_source_text(context, utf8(source.path.wstring())).sha256 != source.sha256)
+        if (!cached && read_source_text(context, utf8(source.path.wstring())).sha256 != source.sha256)
             fail("source changed during LSP navigation; retry");
         if (context.record_user_reads && (operation == "symbols" || operation == "overview"))
             remember_read_snapshot(context, source.path, source.sha256);
         J::Object response{{"path", shown_path(source)}, {"sha256", source.sha256}, {"mtime", source.mtime}, {"results", std::move(results)},
                            {"outside_roots", outside}, {"stale_locations", stale}, {"ignored_locations", ignored}, {"backend", "lsp"}};
         if (owners_omitted) response.emplace("symbols_omitted", owners_omitted);  // enclosing symbol left out for these
+        if (cached) {
+            response.emplace("partial", false);
+            return response;
+        }
         const auto warming = session->warming_timeout(&source);
-        response.emplace("partial", static_cast<bool>(warming) || session->project_partial());
+        response.emplace("partial", static_cast<bool>(warming) || session->project_partial() || loose_scripts_cut);
+        if (loose_scripts_cut)
+            response.emplace("coverage_note", "only the first " + std::to_string(Session::kLooseScripts) +
+                " scripts of this package (no tsconfig.json or jsconfig.json) were opened; results can miss files. "
+                "Fix: add a jsconfig.json at the package root");
         if (config.managed_projects) {
             response.emplace("syntax_only", session->project_syntax_only() || static_cast<bool>(warming));
             if (session->project_partial()) response.emplace("project_loading", session->managed_project_status());
@@ -3796,10 +4246,13 @@ J query_file(const std::string& operation, const J& args, const SourceText& orig
         if (warming) response.emplace("index_warming", warming->details);
         return response;
     } catch (const IndexWarmingFailure&) {
+        // A cached answer never started, locked or used the server, so none of these failures are the server's.
+        if (cached) throw;
         if (!reusable || (control.cancelled && control.cancelled->load()) || Clock::now() >= control.deadline)
             session->stop();
         throw;
     } catch (const LspTimeoutFailure&) {
+        if (cached) throw;
         if (auto warming = session->warming_timeout(&original)) {
             if (!reusable) session->stop();
             throw *warming;
@@ -3808,16 +4261,21 @@ J query_file(const std::string& operation, const J& args, const SourceText& orig
             session->stop();
         throw;
     } catch (const RejectedLspRequest& error) {
+        if (cached) throw;
         // Session health and fallback eligibility are independent.
         if (!reusable || (control.cancelled && control.cancelled->load()) || Clock::now() >= control.deadline)
             session->stop();
         if (error.fallback_eligible) throw LspFailure(error.what());
         throw;
     } catch (const SymbolLookupFailure&) {
+        if (cached) throw;
         if (!reusable || (control.cancelled && control.cancelled->load()) || Clock::now() >= control.deadline)
             session->stop();
         throw;
+    } catch (const PositionMismatch&) {
+        throw;  // the server answered; the file's text and its positions disagree (see PositionMismatch)
     } catch (...) {
+        if (cached) throw;
         session->stop();
         throw;
     }
@@ -3841,6 +4299,7 @@ int64_t lsp_request_timeout_ms(const Json& arguments, const SearchContext& conte
             fail("top-level and arguments.timeout_ms must agree");
         return value;
     }
+    if (options && str(*options, "check", "lsp") != "lsp") return 300000;
     const Control control{request_deadline(Clock::now() + std::chrono::milliseconds(300000)), cancelled};
     control.check();
     if (!options || options->get("paths") || str(arguments, "method") == "lsp.restart_language_server")
@@ -3870,49 +4329,72 @@ std::shared_timed_mutex& workspace_operation_mutex() {
     return mutex;
 }
 
-// Whether an explicit server in the nearest .shgrep/lsp.json at or above path claims extension. Side-effect free: it
-// only reads that file (never through a link), cached by its write time and size.
-bool configured_extension(const fs::path& path, const std::string& extension) {
+// Whether an explicit server in root's .shgrep/lsp.json claims extension. That is the only file configs() loads for
+// files under root, so classification and server selection agree; nested lsp.json files are never consulted.
+// nullopt: the file exists but is a link, a directory, unreadable or invalid, so its claims are unknown. Side-effect
+// free: it only reads that file (never through a link), cached by its write time and size.
+std::optional<bool> configured_extension(const fs::path& root, const std::string& extension) {
+    if (root.empty()) return false;
     static std::mutex mutex;
-    static std::map<std::string, std::pair<std::string, std::set<std::string>>> cache;  // by lower-case UTF-8 path
-    for (fs::path parent = path.parent_path(); !parent.empty(); parent = parent.parent_path()) {
-        const fs::path config = parent / L".shgrep" / L"lsp.json";
-        WIN32_FILE_ATTRIBUTE_DATA data{};
-        if (GetFileAttributesExW(config.c_str(), GetFileExInfoStandard, &data)) {
-            if (data.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) return false;
-            const std::string stamp = std::to_string(data.ftLastWriteTime.dwHighDateTime) + ":" +
-                std::to_string(data.ftLastWriteTime.dwLowDateTime) + ":" + std::to_string(data.nFileSizeLow);
-            std::lock_guard lock(mutex);
-            auto& entry = cache[lower(utf8(config.wstring()))];
-            if (entry.first != stamp) {
-                std::set<std::string> claimed;
-                try {
-                    std::ifstream file(config, std::ios::binary);
-                    const std::string text((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
-                    const J json = J::parse(text);
-                    if (const J* servers = json.get("servers"))
-                        for (const auto& server : servers->array())
-                            if (const J* extensions = server.get("extensions"))
-                                for (const auto& item : extensions->array()) {
-                                    std::string ext = lower(item.string());
-                                    if (!ext.starts_with(".")) ext = "." + ext;
-                                    claimed.insert(ext);
-                                }
-                } catch (const std::exception&) {}  // a malformed file is reported when its servers are loaded
-                entry = {stamp, std::move(claimed)};
-            }
-            return entry.second.contains(extension);
-        }
-        if (parent == parent.parent_path()) break;
+    // By lower-case UTF-8 config path: write stamp, then the claimed extensions (nullopt: unreadable or invalid).
+    static std::map<std::string, std::pair<std::string, std::optional<std::set<std::string>>>> cache;
+    std::wstring config = (root / L".shgrep" / L"lsp.json").wstring();
+    if (!config.starts_with(L"\\\\?\\")) {  // same long-path spelling as configs_from_disk
+        if (config.starts_with(L"\\\\")) config = L"\\\\?\\UNC\\" + config.substr(2);
+        else config = L"\\\\?\\" + config;
     }
-    return false;
+    WIN32_FILE_ATTRIBUTE_DATA data{};
+    if (!GetFileAttributesExW(config.c_str(), GetFileExInfoStandard, &data)) {
+        const DWORD error = GetLastError();
+        if (error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND) return false;  // bundled defaults only
+        return std::nullopt;
+    }
+    // configs_from_disk refuses a linked or directory lsp.json, so its claims are unknown, not empty.
+    if (data.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) return std::nullopt;
+    const std::string stamp = std::to_string(data.ftLastWriteTime.dwHighDateTime) + ":" +
+        std::to_string(data.ftLastWriteTime.dwLowDateTime) + ":" + std::to_string(data.nFileSizeHigh) + ":" +
+        std::to_string(data.nFileSizeLow);
+    std::lock_guard lock(mutex);
+    auto& entry = cache[lower(utf8(config))];
+    if (entry.first != stamp) {
+        std::optional<std::set<std::string>> claimed;
+        try {
+            std::ifstream file(fs::path(config), std::ios::binary);
+            if (!file) throw std::runtime_error("unreadable");
+            const std::string text((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+            const J json = J::parse(text);
+            const J* servers = json.get("servers");
+            if (!servers) throw std::runtime_error("no servers array");
+            std::set<std::string> found;
+            for (const auto& server : servers->array())
+                if (const J* extensions = server.get("extensions"))
+                    for (const auto& item : extensions->array()) {
+                        std::string ext = lower(item.string());
+                        if (!ext.starts_with(".")) ext = "." + ext;
+                        found.insert(ext);
+                    }
+            claimed = std::move(found);
+        } catch (const std::exception&) {}  // the request that loads its servers reports the exact error
+        entry = {stamp, std::move(claimed)};
+    }
+    if (!entry.second) return std::nullopt;
+    return entry.second->contains(extension);
 }
 
-bool lsp_required(const std::filesystem::path& path) {
+// Markup and data formats: read as text even when a server handles them, and never assumed to need one.
+bool plain_text_format(const std::string& extension) {
+    static const std::set<std::string> formats{
+        ".xml", ".xsd", ".xsl", ".xslt", ".svg", ".json", ".jsonc", ".yaml", ".yml", ".toml", ".ini",
+        ".md", ".mdx", ".txt", ".csv", ".log"
+    };
+    return formats.contains(extension);
+}
+
+bool lsp_required(const std::filesystem::path& path, const std::filesystem::path& root) {
     const std::string name = lower(utf8(path.filename().wstring()));
     if (name == "cmakelists.txt" || name == "makefile" || name == "gnumakefile") return true;
     const std::string extension = lower(utf8(path.extension().wstring()));
-    if (extension == ".in") return lsp_required(path.stem());
+    if (extension == ".in") return lsp_required(path.stem(), root);
     for (const auto& server : bundled_servers())
         if (std::find(server.extensions.begin(), server.extensions.end(), extension) != server.extensions.end()) return true;
     static const std::set<std::string> programming{
@@ -3923,19 +4405,20 @@ bool lsp_required(const std::filesystem::path& path) {
         ".fs", ".fsi", ".fsx", ".scala", ".sc", ".clj", ".cljs", ".cljc", ".dart", ".zig", ".jl",
         ".groovy", ".gvy", ".lua", ".luau", ".v", ".sv", ".svh", ".vhd", ".vhdl"
     };
+    if (programming.contains(extension)) return true;
     // Extensions an explicit server is configured for get the same semantic routing and text-write rules.
-    return programming.contains(extension) || configured_extension(path, extension);
+    if (const auto claimed = configured_extension(root, extension)) return *claimed;
+    // An unusable root lsp.json may name a server for this extension; keep text edits behind the explicit fallback
+    // (its probe fails with the configuration error) rather than opening them. Docs, data and extensionless files
+    // stay plain text, so the configuration itself can still be repaired.
+    return !extension.empty() && !plain_text_format(extension);
 }
 
 // CONTRACT: a code file is read only through its language server. read_file text reads (operation=text, offset,
 //   limit) of such a file return the LSP outline; plain text needs allow_text_fallback=true and a failing server.
 //   Markup and data formats that a server may also cover (XML, SVG, JSON, YAML...) stay readable as text.
-bool lsp_read_required(const std::filesystem::path& path) {
-    static const std::set<std::string> text_formats{
-        ".xml", ".xsd", ".xsl", ".xslt", ".svg", ".json", ".jsonc", ".yaml", ".yml", ".toml", ".ini",
-        ".md", ".mdx", ".txt", ".csv", ".log"
-    };
-    return lsp_required(path) && !text_formats.contains(language_extension(path));
+bool lsp_read_required(const std::filesystem::path& path, const std::filesystem::path& root) {
+    return lsp_required(path, root) && !plain_text_format(language_extension(path));
 }
 
 std::string lsp_fallback_reason(const SourceText& source, const Json& arguments, const SearchContext& context,
@@ -3958,7 +4441,7 @@ std::string lsp_fallback_reason(const SourceText& source, const Json& arguments,
 std::string require_text_access(const SourceText& source, const Json& arguments, const SearchContext& context,
                                 const std::shared_ptr<std::atomic_bool>& cancelled) {
     const bool allow_fallback = flag(arguments, "allow_text_fallback");
-    if (!lsp_required(source.path)) return {};
+    if (!lsp_required(source.path, source.root)) return {};
     const std::string path = utf8(source.path.wstring());
     if (!allow_fallback)
         fail(path + ": Text edits require the direct lsp tool for programming files and XML. "
@@ -3971,27 +4454,131 @@ std::string require_text_access(const SourceText& source, const Json& arguments,
 bool lsp_configured(const SourceText& source, const SearchContext& context) {
     return configuration(source, context, nullptr).has_value();
 }
+std::string lsp_file_stamp(const fs::path& path) {
+    return file_stamp(path);
+}
+
+std::string lsp_index_fingerprint(const SearchContext& context, const std::filesystem::path& root,
+                                  const std::shared_ptr<std::atomic_bool>& cancelled) {
+    // Only `root`'s configuration: the meaning index covers one root, and setup prepared meanwhile for another root
+    // (a folder query there runs CMake setup) must not invalidate it.
+    std::vector<std::string> rows;
+    {
+        if (cancelled && cancelled->load()) throw std::runtime_error("meaning search cancelled");
+        for (const auto& config : configs(root, context, cancelled, false)) {
+            J::Array command, extensions, environment, roots, ignored;
+            J::Object languages;
+            for (const auto& argument : config.command) command.emplace_back(argument);
+            for (const auto& extension : config.extensions) extensions.emplace_back(extension);
+            for (const auto& path : config.ignored_paths) ignored.emplace_back(path);
+            for (const auto& [extension, language] : config.extension_languages) languages[extension] = language;
+            for (const auto& [name, value] : config.environment)
+                environment.emplace_back(J::Array{utf8(name), utf8(value)});
+            for (const auto& folder : config.workspace_roots) roots.emplace_back(utf8(folder.wstring()));
+            rows.push_back(J(J::Object{{"key", config.key}, {"command", std::move(command)},
+                {"extensions", std::move(extensions)}, {"environment", std::move(environment)},
+                {"roots", std::move(roots)}, {"ignored_paths", std::move(ignored)},
+                {"extension_languages", std::move(languages)}, {"root", utf8(config.root.wstring())},
+                {"working_directory", utf8(config.working_directory.wstring())}, {"dotnet", utf8(config.dotnet.wstring())},
+                {"initialization", config.initialization},
+                {"settings", config.settings}}).dump());
+        }
+    }
+    std::sort(rows.begin(), rows.end());
+    J::Array sorted;
+    for (auto& row : rows) sorted.emplace_back(std::move(row));
+    return source_text_digest(J(std::move(sorted)).dump());
+}
 
 std::string lsp_missing(const SourceText& source, const SearchContext& context) {
     return configuration(source, context, nullptr) ? std::string() : missing_bundled(source);
 }
 
-std::vector<std::string> lsp_health() {
-    std::vector<std::string> problems;
-    std::string missing;
-    const fs::path& base = bundled_directory();
-    for (const auto& server : bundled_servers()) {
+namespace {
+// Extensions of files the current request showed the model (list_dir, find_files, search). Per request thread.
+thread_local std::set<std::string> listed_extensions;
+std::mutex language_notice_mutex;
+std::set<std::string> language_noticed;  // bundled servers already warned about in this process
+}
+
+void lsp_note_listed_file(std::string_view path) {
+    if (path.empty() || listed_extensions.size() >= 256) return;
+    const std::string ext = language_extension(fs::path(wide(std::string(path))));
+    if (!ext.empty()) listed_extensions.insert(ext);
+}
+
+void lsp_clear_listed_files() { listed_extensions.clear(); }
+
+std::string lsp_language_notice(const SearchContext& context) {
+    // #101: nothing about language servers is said at session start. A missing bundled server (or its missing
+    // prerequisite, such as Roslyn's .NET) is named once per process, after a tool result first shows the model files
+    // that server would handle, unless the workspace's .shgrep/lsp.json gives those files its own server or turns the
+    // bundled defaults off. A Rust repository never hears about JavaScript or CMake. Nothing is started.
+    std::set<std::string> listed;
+    listed.swap(listed_extensions);
+    if (listed.empty()) return {};
+    std::vector<const BundledServer*> relevant;
+    for (const auto& server : bundled_servers())
+        if (std::any_of(server.extensions.begin(), server.extensions.end(),
+                        [&](const std::string& ext) { return listed.contains(ext); }))
+            relevant.push_back(&server);
+    if (relevant.empty()) return {};
+    {
+        std::lock_guard lock(language_notice_mutex);
+        std::erase_if(relevant, [&](const BundledServer* server) { return language_noticed.contains(server->name); });
+    }
+    if (relevant.empty()) return {};
+    std::set<std::string> owned;
+    bool bundled = true;
+    if (!context.allowed_roots.empty()) {
+        const fs::path config = context.allowed_roots.front() / L".shgrep" / L"lsp.json";
         std::error_code error;
-        if (base.empty() || !fs::is_regular_file(base / server.executable, error))
-            missing += (missing.empty() ? "" : ", ") + std::string(server.name) + " (" + server.language + ") at " +
-                       (base.empty() ? std::string("lsp\\ beside shgrep.exe") : utf8((base / server.executable).wstring()));
-        else if (const std::string problem = bundled_prerequisite(server.language); !problem.empty())
-            problems.push_back(std::string("the bundled ") + server.name + " (" + server.language + ") " + problem);
+        if (fs::exists(config, error)) {
+            try {
+                SearchContext quiet = context;
+                quiet.record_user_reads = false;  // not the user's read
+                const J json = J::parse(read_source_text(quiet, utf8(config.wstring())).text);
+                bundled = flag(json, "bundled", true);
+                if (const J* servers = json.get("servers"))
+                    for (const auto& server : servers->array())
+                        if (const J* extensions = server.get("extensions"))
+                            for (const auto& extension : extensions->array()) {
+                                std::string ext = lower(extension.string());
+                                owned.insert(ext.starts_with(".") ? ext : "." + ext);
+                            }
+            } catch (const std::exception&) {}  // an invalid lsp.json is reported by the request that loads it
+        }
+    }
+    if (!bundled) return {};
+    const fs::path& base = bundled_directory();
+    std::string missing;
+    std::vector<std::string> problems;
+    for (const BundledServer* server : relevant) {
+        std::string shown;  // the listed extensions this server would handle and no custom server owns
+        for (const auto& ext : server->extensions)
+            if (listed.contains(ext) && !owned.contains(ext)) shown += (shown.empty() ? "" : ", ") + ext;
+        if (shown.empty()) continue;
+        std::error_code error;
+        const bool installed = !base.empty() && fs::is_regular_file(base / server->executable, error);
+        const std::string problem = installed ? bundled_prerequisite(server->language) : std::string();
+        if (installed && problem.empty()) continue;
+        {
+            std::lock_guard lock(language_notice_mutex);
+            if (!language_noticed.insert(server->name).second) continue;  // another request just warned
+        }
+        if (!installed)
+            missing += (missing.empty() ? "" : "; ") + std::string(server->name) + " (" + server->language + ", for the " +
+                       shown + " files listed) at " +
+                       (base.empty() ? std::string("lsp\\ beside shgrep.exe") : utf8((base / server->executable).wstring()));
+        else
+            problems.push_back(std::string("the bundled ") + server->name + " for the " + shown + " files listed " + problem);
     }
     if (!missing.empty())
-        problems.insert(problems.begin(), "bundled language servers are missing; their files require explicit text fallback: shgrep "
-                        "expects " + missing + ". Download them there with: " + fetch_command());
-    return problems;
+        problems.insert(problems.begin(), "no language server is installed for files this result lists: " + missing +
+                        ". Semantic tools for those files need it; install with: " + fetch_command());
+    std::string notice;
+    for (const auto& problem : problems) notice += "[shgrep notice: " + problem + "]\n";
+    return notice;
 }
 
 namespace {
@@ -4027,19 +4614,34 @@ void start_language_servers(const SearchContext& context) {
         try {
             const Control control{Clock::now() + std::chrono::minutes(5), cancelled};
             const fs::path root = fs::absolute(context.allowed_roots.front()).lexically_normal();
+            // Workspace profile: a language whose files here are all data, generated or vendored gets no warm start
+            // (it still starts on first use).
+            const FolderProbe probe = file_system_probe(root);
             std::string started, skipped;
             for (const auto& config : configs(root, context, cancelled)) {
                 if (cancelled->load()) break;
                 try {
                     // Bundled servers start only for files in the workspace itself. worth_starting would also accept
                     //   files in any other root for workspace-wide servers (C#, TypeScript), which may never be queried.
-                    if (config.bundled && source_paths(context, utf8(root.wstring()), config.extensions, control.deadline,
-                                                       cancelled).empty()) {
-                        skipped += (skipped.empty() ? "" : ", ") + config.language;
-                        continue;
+                    std::vector<std::string> files;
+                    if (config.bundled) {
+                        files = source_paths(context, utf8(root.wstring()), config.extensions, control.deadline, cancelled);
+                        std::erase_if(files, [&](const std::string& file) {
+                            const fs::path native(wide(file));
+                            return file_path_role(root, native, language_extension(native), &probe) != FileRole::source;
+                        });
+                        if (files.empty()) {
+                            skipped += (skipped.empty() ? "" : ", ") + config.language;
+                            continue;
+                        }
                     }
+                    // Start the instance queries will use: workspace-wide servers run one per toolchain profile
+                    //   (TypeScript version, .NET SDK), and queries resolve that profile from the file. Starting the base
+                    //   configuration instead ran a second tsserver that no query ever reached.
+                    const Config profiled = files.empty() ? config
+                        : project_profile(config, source_descriptor(context, files.front()), context);
                     const auto began = Clock::now();
-                    auto session = session_for(config);
+                    auto session = session_for(profiled);
                     std::unique_lock<std::timed_mutex> session_lock(session->mutex, std::defer_lock);
                     while (!session_lock.try_lock_for(std::chrono::milliseconds(10))) control.check();
                     session->start(control, &context);
@@ -4055,7 +4657,8 @@ void start_language_servers(const SearchContext& context) {
             }
             if (!cancelled->load())
                 index_log(false, "language server warm-up done; started: " + (started.empty() ? std::string("none") : started) +
-                                     "; no files in the workspace for: " + (skipped.empty() ? std::string("none") : skipped));
+                                     "; no source files (only data, generated or vendored, or none) in the workspace for: " +
+                                     (skipped.empty() ? std::string("none") : skipped));
         } catch (const std::exception& e) {
             if (!cancelled->load()) index_log(true, std::string("language server warm-up failed: ") + e.what());
         }
@@ -4096,7 +4699,7 @@ Json lsp_query(const std::string& operation, const Json& arguments, const Search
             fail("diagnostics require 1-based start_line/end_line (1-2147483647); end_line=-1 means no upper bound");
         (void)flag(arguments, "group_by_symbol");
     } else {
-        for (const char* key : {"start_line", "end_line", "group_by_symbol"})
+        for (const char* key : {"start_line", "end_line", "group_by_symbol", "check"})
             if (arguments.get(key)) fail(std::string(key) + " requires operation=diagnostics");
     }
     if (operation == "files")
@@ -4114,12 +4717,88 @@ Json lsp_query(const std::string& operation, const Json& arguments, const Search
     if (operation != "symbols" && arguments.get("patterns")) fail("patterns is only supported for symbol search");
     if (operation != "symbols" && operation != "overview" && named &&
         (arguments.get("line") || arguments.get("column"))) fail("give a symbol name or line/column, not both");
+    const std::string diagnostic_check = str(arguments, "check", "lsp");
+    if (diagnostic_check != "lsp" && diagnostic_check != "compiler" &&
+        diagnostic_check != "build" && diagnostic_check != "all")
+        fail("check must be lsp, compiler, build, or all");
+    if (operation == "diagnostics" && diagnostic_check != "lsp") {
+        if (context.read_only) fail("external diagnostic commands are disabled by --read-only");
+        if (named || flag(arguments, "group_by_symbol") ||
+            number(arguments, "start_line", 1) != 1 || number(arguments, "end_line", -1) != -1)
+            fail("external checks do not accept symbol or line filters; use check=lsp for those filters");
+        J::Object report{{"items", J::Array{}}, {"path", str(arguments, "path", ".")}};
+        J::Object checks;
+        bool complete = true, successful = true;
+        if (diagnostic_check == "all") {
+            auto lsp_arguments = arguments.object();
+            lsp_arguments.erase("check");
+            try {
+                report = lsp_query(operation, J(std::move(lsp_arguments)), context, cancelled).object();
+                for (auto& item : std::get<J::Array>(report.at("items").value)) {
+                    auto& fields = std::get<J::Object>(item.value);
+                    fields["origin"] = "lsp";
+                    fields["position_encoding"] = "utf-16";
+                    fields["coordinate_base"] = 1;
+                    if (number(item, "severity", 1) == 1) successful = false;
+                }
+                const bool partial = report.contains("partial") && report.at("partial").boolean();
+                if (partial) { complete = false; successful = false; }
+                checks.emplace("lsp", J::Object{{"status", partial ? "partial" : "reported"}});
+                if (const auto coverage = report.find("coverage"); coverage != report.end())
+                    report["lsp_coverage"] = coverage->second;
+            } catch (const IndexWarmingFailure& error) {
+                control.check();
+                complete = false; successful = false;
+                checks.emplace("lsp", J::Object{{"status", "unavailable"}, {"error", error.what()},
+                    {"code", "index_warming"}, {"details", error.details}});
+            } catch (const SymbolLookupFailure& error) {
+                control.check();
+                complete = false; successful = false;
+                checks.emplace("lsp", J::Object{{"status", "unavailable"}, {"error", error.what()},
+                    {"code", "symbol_lookup"}, {"details", error.details}});
+            } catch (const std::exception& error) {
+                control.check();
+                complete = false; successful = false;
+                checks.emplace("lsp", J::Object{{"status", "unavailable"}, {"error", error.what()}});
+            }
+        }
+        for (const char* kind : {"compiler", "build"}) {
+            if (diagnostic_check != "all" && diagnostic_check != kind) continue;
+            if (cancelled && cancelled->load()) control.check();
+            // An earlier check that used up the deadline keeps its report; this one is reported as not run.
+            if (Clock::now() >= control.deadline) {
+                complete = false;
+                successful = false;
+                checks.emplace(kind, J::Object{{"source", kind}, {"status", "timed_out"}, {"successful", false},
+                    {"items", J::Array{}}, {"error", "not run: the request deadline expired during an earlier check"}});
+                continue;
+            }
+            J checked = external_diagnostics(kind, arguments, context, control.deadline, cancelled);
+            const auto status = str(checked, "status");
+            if (status != "completed" && status != "failed") complete = false;
+            if (status == "failed" && checked.get("error")) complete = false;
+            if (flag(checked, "output_truncated") || flag(checked, "items_truncated")) complete = false;
+            if (!flag(checked, "successful")) successful = false;
+            auto& items = std::get<J::Array>(report.at("items").value);
+            for (const auto& item : checked.get("items")->array()) items.push_back(item);
+            checks.emplace(kind, std::move(checked));
+        }
+        report["check"] = diagnostic_check;
+        report["checks"] = std::move(checks);
+        report["successful"] = successful;
+        report["partial"] = !complete;
+        report["coordinate_base"] = 1;
+        report["position_encoding"] = diagnostic_check == "all" ? "mixed" : "compiler";
+        report["coverage"] = J::Object{{"origin", diagnostic_check == "all" ? "lsp_and_external_commands" : "external_command"},
+            {"note", "Command status covers only the configured command and its scope. Compiler columns retain their native units; they are not LSP UTF-16 ranges."}};
+        return report;
+    }
     const std::string path = str(arguments, "path");
     std::optional<SourceText> scope;
     if (!path.empty()) {
         bool directory = false;
         scope = source_descriptor(context, path, &directory);
-        if (!directory && !lsp_required(scope->path))
+        if (!directory && !lsp_required(scope->path, scope->root))
             fail("LSP operations are only for programming files and XML; use text tools for this file");
         if (!directory && operation == "files") {
             const auto config = configuration(*scope, context, cancelled);
@@ -4149,22 +4828,76 @@ Json lsp_query(const std::string& operation, const Json& arguments, const Search
     std::vector<uint64_t> warming_counts;
     std::set<std::wstring, PathLess> scanned;
     bool any_server = false, partial = false;
+    // Folder symbol searches: how many files the symbol index answered, and why the walk stopped early, if it did.
+    bool folder_cut = false;
+    size_t from_index = 0, reads_skipped = 0;
+    std::string coverage_note;
+    // Workspace profile: files a folder symbol walk left out, by role (indexed by FileRole) and by top folder.
+    std::array<size_t, 4> skipped_by_role{};
+    std::map<std::string, size_t> skipped_areas;
+    // Files a server answered with positions that do not fit their text (PositionMismatch): left out and reported.
+    std::vector<std::string> unanswered;
+    size_t unanswered_count = 0;
+    std::string unanswered_reason;
+    // The names a folder symbol search asks for: a file whose indexed names hold none of them needs no read.
+    std::vector<std::string> wanted_patterns;
+    if (const J* list = arguments.get("patterns"); list && std::holds_alternative<J::Array>(list->value))
+        for (const auto& item : list->array())
+            if (std::holds_alternative<std::string>(item.value)) wanted_patterns.push_back(item.string());
+    if (wanted_patterns.empty())
+        if (std::string name = str(arguments, "name_path", str(arguments, "pattern")); !name.empty())
+            wanted_patterns.push_back(std::move(name));
+    // A pattern matches only symbols whose own name contains the pattern's last component (without a leading "/",
+    // "#kind", "[index]" or "<generic>" part), so a file none of whose names contain it cannot match: skipping it is
+    // safe. A file that might match is read and answered exactly; an empty component reads every file.
+    const bool wanted_substring = flag(arguments, "substring_matching");
+    std::vector<std::string> wanted_leaves;
+    for (const auto& item : wanted_patterns) {
+        std::string_view leaf = item;
+        if (const size_t slash = leaf.rfind('/'); slash != std::string_view::npos) leaf.remove_prefix(slash + 1);
+        if (const size_t cut = leaf.find_first_of("#[<("); cut != std::string_view::npos) leaf = leaf.substr(0, cut);
+        wanted_leaves.emplace_back(leaf);
+    }
+    const auto worth_reading = [&](const std::vector<std::string>& names) {
+        if (operation != "symbols" || wanted_leaves.empty()) return true;
+        for (const auto& leaf : wanted_leaves) {
+            if (leaf.empty()) return true;
+            for (const auto& name : names)
+                if (name.find(leaf) != std::string::npos ||
+                    (wanted_substring && lower(name).find(lower(leaf)) != std::string::npos)) return true;
+        }
+        return false;
+    };
     for (const auto& root : context.allowed_roots) {
         const fs::path absolute = fs::absolute(root).lexically_normal();
         if (scope && !below(scope->path, absolute) && !below(absolute, scope->path) &&
             PathLess{}(scope->path.wstring(), absolute.wstring()) != PathLess{}(absolute.wstring(), scope->path.wstring())) continue;
-        // Status is observational: it reports the last prepared C++ setup and never scans or configures.
+        // Status reports the last prepared C++ setup without configuring it.
+        const auto config_started = Clock::now();
         const auto configured = configs(absolute, context, cancelled, operation != "status");
         if (operation == "status") {
+            const auto log_delay = [&](const std::string& action, const Clock::time_point began) {
+                const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - began).count();
+                if (ms >= 500) index_log(false, "LSP status " + action + " took " + std::to_string(ms) + " ms");
+            };
+            const std::string root_name = utf8(absolute.wstring());
+            log_delay("configuration for " + root_name, config_started);
             for (const auto& config : configured) {
-                if (!worth_starting(config, context, control)) continue;
+                const auto scan_started = Clock::now();
+                const bool eligible = worth_starting(config, context, control);
+                log_delay("file scan for " + config.server + " in " + root_name, scan_started);
+                if (!eligible) continue;
                 auto sessions = existing_sessions_for(config);
                 if (sessions.empty()) sessions.push_back(std::make_shared<Session>(config));
                 for (auto& session : sessions) {
                     if (!synchronized.insert(session->config.key).second) continue;
+                    const auto lock_started = Clock::now();
                     std::unique_lock<std::timed_mutex> lock(session->mutex, std::defer_lock);
                     while (!lock.try_lock_for(std::chrono::milliseconds(10))) control.check();
+                    log_delay("waiting for " + config.server + " in " + root_name, lock_started);
+                    const auto status_started = Clock::now();
                     results.push_back(session->status(str(arguments, "detail", "summary") == "full"));
+                    log_delay("reading " + config.server + " in " + root_name, status_started);
                 }
             }
             continue;
@@ -4194,14 +4927,77 @@ Json lsp_query(const std::string& operation, const Json& arguments, const Search
             extensions.insert(extensions.end(), config.extensions.begin(), config.extensions.end());
         if (extensions.empty()) continue;
         any_server = true;
-        const auto paths = source_paths(context, utf8(absolute.wstring()), extensions, control.deadline, cancelled);
+        // Walk only the requested folder: walking the whole root and dropping files outside the scope afterwards read
+        // every file of the root first (42,241 for rust-experimental when old tools was asked) and ran out of time.
+        // source_paths walks from the configured root (its ignore rules start there); the filter keeps only the
+        // folders leading to the scope and everything inside it.
+        const bool scoped = scope && below(scope->path, absolute);
+        const fs::path walk = scoped ? scope->path : absolute;
+        std::function<bool(const std::string&, bool)> in_scope;
+        if (scoped) {
+            const std::string scope_relative = lower(utf8(scope->path.lexically_relative(absolute).generic_wstring()));
+            in_scope = [scope_relative](const std::string& child, bool folder) {
+                const std::string name = lower(child);
+                if (name == scope_relative || name.starts_with(scope_relative + "/")) return true;
+                return folder && scope_relative.starts_with(name + "/");
+            };
+        }
+        const auto paths = source_paths(context, utf8(absolute.wstring()), extensions, control.deadline, cancelled, in_scope);
+        // A folder query asks a server about each file in turn; the log shows its size, slow files and where it stopped.
+        const auto folder_started = Clock::now();
+        const std::string folder_name = utf8(walk.wstring());
+        if (operation != "files")
+            index_log(false, "folder " + operation + " over " + folder_name + ": " + std::to_string(paths.size()) +
+                             " source files");
+        // Workspace profile (workspace_profile.hpp): data, generated and vendored files stay out of a folder symbol
+        // walk (and of the meaning index's listing), so servers spend their time on source. A scope that holds nothing else is walked in full: a request
+        // aimed at such a folder asked for those files. Path roles need no I/O; content roles read a file's head.
+        const bool symbol_walk = operation == "symbols" || operation == "overview";
+        std::vector<FileRole> roles(paths.size(), FileRole::source);
+        bool profile_filter = false;
+        // The meaning index lists its files with source_only, so it embeds no data, generated or vendored file.
+        const bool profile_walk = symbol_walk || (operation == "files" && flag(arguments, "source_only"));
+        if (profile_walk) {
+            // Layer 3 build evidence, asked of the file system once per folder and file name in this walk.
+            const FolderProbe probe = file_system_probe(absolute);
+            size_t source_files = 0;
+            for (size_t i = 0; i < paths.size(); ++i) {
+                const fs::path native(wide(paths[i]));
+                roles[i] = file_path_role(absolute, native, language_extension(native), &probe);
+                if (roles[i] == FileRole::source) ++source_files;
+            }
+            profile_filter = source_files > 0;
+        }
+        // Symbol searches stop at 90% of the request's time and answer with what they have, marked partial: every
+        // outline fetched so far stays in the symbol index, so a repeated call goes further instead of starting over.
+        const auto budget = control.deadline - folder_started;
+        const auto soft_stop = budget > std::chrono::hours(1) ? Clock::time_point::max() : folder_started + budget * 9 / 10;
+        // Server configuration depends only on a file's folder and extension (project_profile looks upward from the
+        // folder), so it is resolved once per folder and extension instead of once per file.
+        std::map<std::string, std::optional<Config>> profiles;
         for (const auto& file : paths) {
-            control.check();
+            if (symbol_walk && Clock::now() >= soft_stop) {
+                folder_cut = true;
+                coverage_note = "the walk stopped after " + std::to_string(scanned.size()) + " of " +
+                                std::to_string(paths.size()) + " files in " + folder_name +
+                                " to answer within timeout_ms; outlines fetched so far are kept, so repeating the call "
+                                "goes further, or narrow relative_path";
+                index_log(true, "folder " + operation + ": " + coverage_note);
+                break;
+            }
+            try { control.check(); }
+            catch (const std::exception& e) {
+                if (operation != "files")
+                    index_log(true, "folder " + operation + " over " + folder_name + " stopped after " +
+                                    std::to_string(scanned.size()) + " of " + std::to_string(paths.size()) + " files (" +
+                                    std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                        Clock::now() - folder_started).count()) + " ms): " + e.what());
+                throw;
+            }
             SourceText source;
             try {
                 source = source_descriptor(context, file);
-                if (!lsp_required(source.path)) continue;
-                if (operation != "files") source = read_source_text(context, file);
+                if (!lsp_required(source.path, source.root)) continue;
             }
             catch (const std::exception& e) {
                 // Same rule as Session::synchronize: legacy-encoded files stay out of LSP results.
@@ -4211,7 +5007,33 @@ Json lsp_query(const std::string& operation, const Json& arguments, const Search
             if (scope && !below(source.path, scope->path) &&
                 (PathLess{}(source.path.wstring(), scope->path.wstring()) || PathLess{}(scope->path.wstring(), source.path.wstring()))) continue;
             if (!scanned.insert(source.path.wstring()).second) continue;
-            const auto config = configuration(source, context, cancelled);
+            if (profile_filter) {
+                FileRole role = roles[static_cast<size_t>(&file - paths.data())];
+                if (role == FileRole::source && language_kind(language_extension(source.path)) == LanguageKind::programming) {
+                    const std::string role_key = lower(utf8(source.path.wstring()));
+                    const std::string role_stamp = file_stamp(source.path);
+                    if (const auto known = role_stamp.empty() ? std::nullopt : role_cache().find(role_key, role_stamp))
+                        role = *known;
+                    else {
+                        // An unreadable head stays source: the full read below reports the real problem.
+                        try { role = content_role(read_source_head(context, file, profile_head_bytes)); }
+                        catch (const std::exception&) { role = FileRole::source; }
+                        if (!role_stamp.empty()) role_cache().store(role_key, role_stamp, role);
+                    }
+                }
+                if (role != FileRole::source) {
+                    ++skipped_by_role[static_cast<size_t>(role)];
+                    const std::wstring below_walk = source.path.lexically_relative(walk).generic_wstring();
+                    const size_t slash = below_walk.find(L'/');
+                    ++skipped_areas[slash == std::wstring::npos ? std::string(".") : utf8(below_walk.substr(0, slash))];
+                    continue;
+                }
+            }
+            const std::string profile_key = lower(utf8(source.path.parent_path().wstring())) + "|" +
+                                            language_extension(source.path);
+            auto profile = profiles.find(profile_key);
+            if (profile == profiles.end()) profile = profiles.emplace(profile_key, configuration(source, context, cancelled)).first;
+            const std::optional<Config>& config = profile->second;
             if (!config || path_excluded(*config, source.path)) continue;
             if (operation == "files") {
                 results.push_back(J::Object{{"path", shown_path(source)}, {"root", utf8(source.root.wstring())}, {"language_id", document_language_id(*config, source.path)}});
@@ -4219,7 +5041,72 @@ Json lsp_query(const std::string& operation, const Json& arguments, const Search
             }
             J::Object per_file = arguments.object();
             per_file["path"] = file;
-            const J response = query_file(operation, per_file, source, *config, context, control, synchronized, true);
+            const auto file_started = Clock::now();
+            // The symbol index answers unchanged files without the server; hover info still needs it.
+            const bool indexable = symbol_walk && !config->managed_projects && !flag(arguments, "include_info") &&
+                                   !flag(arguments, "require_unique") && !flag(arguments, "require_match");
+            const std::string index_key = indexable ? symbol_index_key(*config, source.path) : std::string();
+            // The stamp is taken before the read, so a change during the read can only cause a later re-read.
+            const std::string stamp = indexable ? file_stamp(source.path) : std::string();
+            if (!stamp.empty())
+                if (const auto names = symbol_index().names_stamped(index_key, stamp); names && !worth_reading(*names)) {
+                    ++from_index;
+                    ++reads_skipped;
+                    continue;
+                }
+            try { source = read_source_text(context, file); }
+            catch (const std::exception& e) {
+                // Same rule as Session::synchronize: legacy-encoded files stay out of LSP results.
+                if (std::string(e.what()).ends_with(" is not valid Unicode source text")) continue;
+                throw;
+            }
+            std::optional<std::vector<Symbol>> cached;
+            if (indexable) cached = symbol_index().find(index_key, source.sha256);
+            if (cached) ++from_index;
+            J response;
+            try {
+                // A single slow server call must not consume the response's reserved time.
+                const Control file_control{symbol_walk ? soft_stop : control.deadline, cancelled};
+                response = query_file(operation, per_file, source, *config, context, file_control, synchronized, true,
+                                      cached ? &*cached : nullptr);
+            } catch (const LspTimeoutFailure&) {
+                if (!symbol_walk || Clock::now() < soft_stop || (cancelled && cancelled->load())) throw;
+                folder_cut = true;
+                coverage_note = "the walk stopped while reading " + file + " after attempting " +
+                    std::to_string(scanned.size()) + " of " + std::to_string(paths.size()) +
+                    " files; results are incomplete. Repeat the call or narrow relative_path";
+                index_log(true, "folder " + operation + ": " + coverage_note);
+                break;
+            } catch (const IndexWarmingFailure& e) {
+                const std::string reason = str(e.details, "reason");
+                if (!symbol_walk || Clock::now() < soft_stop - std::chrono::seconds(2) ||
+                    (cancelled && cancelled->load()) ||
+                    (reason != "index_in_progress" && reason != "server_start_timeout")) throw;
+                folder_cut = true;
+                coverage_note = "the walk stopped while waiting for " + config->server + " at " + file +
+                    "; results are incomplete. Repeat the call or narrow relative_path";
+                index_log(true, "folder " + operation + ": " + coverage_note);
+                break;
+            } catch (const PositionMismatch& e) {
+                // One file whose server positions do not fit its text must not end a folder walk.
+                if (unanswered.size() < 5) unanswered.push_back(utf8(source.path.wstring()) + " (" + config->server + ")");
+                ++unanswered_count;
+                if (unanswered_reason.empty()) unanswered_reason = e.what();
+                index_log(true, "folder " + operation + " over " + folder_name + " left out " +
+                                utf8(source.path.wstring()) + " (" + config->server + "): " + e.what());
+                continue;
+            } catch (const std::exception& e) {
+                index_log(true, "folder " + operation + " over " + folder_name + " stopped at " +
+                                utf8(source.path.wstring()) + " (" + config->server + ", " +
+                                std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                    Clock::now() - folder_started).count()) + " ms in): " + e.what());
+                throw;
+            }
+            if (!stamp.empty()) symbol_index().attach_stamp(index_key, source.sha256, stamp);
+            if (const auto took = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - file_started).count();
+                took >= 2000)
+                index_log(false, "slow folder " + operation + ": " + config->server + " took " + std::to_string(took) +
+                                 " ms for " + utf8(source.path.wstring()));
             if (const J* flag_value = response.get("partial"); flag_value && flag_value->boolean()) {
                 partial = true;
                 if (const J* details = response.get("index_warming")) {
@@ -4241,9 +5128,18 @@ Json lsp_query(const std::string& operation, const Json& arguments, const Search
                 results.push_back(std::move(item));
             }
         }
+        if (operation != "files")
+            index_log(false, "folder " + operation + " over " + folder_name + " done in " +
+                             std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                 Clock::now() - folder_started).count()) + " ms; " + std::to_string(from_index) +
+                             " outlines from the symbol index, " + std::to_string(reads_skipped) + " without reading the file; " +
+                             std::to_string(skipped_by_role[1]) + " data, " + std::to_string(skipped_by_role[2]) + " generated, " +
+                             std::to_string(skipped_by_role[3]) + " vendored files left out");
+        if (folder_cut) break;
     }
+    if (operation == "symbols" || operation == "overview") symbol_index().save_if_due();
     // A scoped folder may hold no source files, but with no server at all an empty answer would hide the gap.
-    if (operation != "files" && operation != "status" && synchronized.empty() && (!scope || !any_server)) server_fail("no LSP source files found; install the bundled servers with tools/fetch_lsp.py, or add one to .shgrep/lsp.json. This semantic request has no fallback; for plain text matches make a separate search call with operation=text");
+    if (operation != "files" && operation != "status" && synchronized.empty() && from_index == 0 && (!scope || !any_server)) server_fail("no LSP source files found; install the bundled servers with tools/fetch_lsp.py, or add one to .shgrep/lsp.json. This semantic request has no fallback; for plain text matches make a separate search call with operation=text");
     J::Object response{{"results", std::move(results)}, {"backend", "lsp"}};
     if ((operation == "status" || operation == "restart") && str(arguments, "detail", "summary") == "full") {
         J::Array capability_sets;
@@ -4261,7 +5157,38 @@ Json lsp_query(const std::string& operation, const Json& arguments, const Search
         if (!capability_sets.empty()) response.emplace("capability_sets", std::move(capability_sets));
     }
     if (operation == "symbols" || operation == "overview") {
-        response.emplace("partial", partial);
+        response.emplace("partial", partial || folder_cut);
+        if (folder_cut) response.emplace("coverage_note", coverage_note);
+        // Say what the workspace profile left out and how to get it, so a skipped file is never a silent miss.
+        if (const size_t skipped = skipped_by_role[1] + skipped_by_role[2] + skipped_by_role[3]) {
+            J::Object counts;
+            std::string kinds;
+            for (const FileRole role : {FileRole::data, FileRole::generated, FileRole::vendored}) {
+                const size_t count = skipped_by_role[static_cast<size_t>(role)];
+                if (!count) continue;
+                counts.emplace(std::string(role_name(role)), static_cast<int64_t>(count));
+                kinds += (kinds.empty() ? "" : ", ") + std::to_string(count) + " " + std::string(role_name(role));
+            }
+            std::vector<std::pair<size_t, std::string>> areas;
+            for (const auto& [area, count] : skipped_areas) areas.emplace_back(count, area);
+            std::sort(areas.begin(), areas.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+            std::string largest;
+            for (size_t i = 0; i < areas.size() && i < 3; ++i)
+                largest += (largest.empty() ? "" : ", ") + areas[i].second + " " + std::to_string(areas[i].first);
+            response.emplace("skipped_files", std::move(counts));
+            response.emplace("skipped_note", std::to_string(skipped) + " files left out as not source (" + kinds +
+                "; largest folders: " + largest + "); point relative_path at one of those folders or files to include them");
+        }
+        if (unanswered_count) {
+            std::string list;
+            for (const auto& item : unanswered) list += (list.empty() ? "" : "; ") + item;
+            if (unanswered_count > unanswered.size()) list += "; ...";
+            response.emplace("unanswered_files", static_cast<int64_t>(unanswered_count));
+            response.emplace("unanswered_note", std::to_string(unanswered_count) +
+                " file(s) left out because the server's positions do not fit their text: " + list + ". First reason: " +
+                unanswered_reason);
+        }
+        if (from_index) response.emplace("from_symbol_index", static_cast<int64_t>(from_index));
         for (size_t i = 0; i < warming_details.size(); ++i)
             std::get<J::Object>(warming_details[i].value)["file_count"] = warming_counts[i];
         if (partial) response.emplace("index_warming", std::move(warming_details));
@@ -4286,7 +5213,7 @@ Json lsp_outlines(const std::vector<std::string>& paths, const SearchContext& co
         control.check();
         try {
             sources[i] = read_source_text(context, paths[i]);
-            if (!lsp_required(sources[i].path)) { errors[i] = "not a language-server file"; continue; }
+            if (!lsp_required(sources[i].path, sources[i].root)) { errors[i] = "not a language-server file"; continue; }
             const auto config = configuration(sources[i], context, cancelled);
             if (!config || path_excluded(*config, sources[i].path)) { errors[i] = "no language server for this file"; continue; }
             groups.try_emplace(config->key, Group{*config, {}}).first->second.items.push_back(i);
@@ -4314,10 +5241,22 @@ Json lsp_outlines(const std::vector<std::string>& paths, const SearchContext& co
             }
             continue;
         }
+        // Unchanged files are answered from the symbol index; only the rest go to the server.
+        std::vector<size_t> pending;
+        for (const size_t i : group.items) {
+            control.check();
+            if (auto cached = symbol_index().find(symbol_index_key(group.config, sources[i].path), sources[i].sha256)) {
+                J::Array rows;
+                rows.reserve(cached->size());
+                for (const auto& symbol : *cached) rows.push_back(symbol_json(symbol, sources[i], false, false));
+                outlines[i] = J::Object{{"results", std::move(rows)}};
+            } else pending.push_back(i);
+        }
+        if (pending.empty()) continue;
         auto session = session_for(group.config);
         std::unique_lock<std::timed_mutex> lock(session->mutex, std::defer_lock);
         while (!lock.try_lock_for(std::chrono::milliseconds(10))) control.check();
-        const SourceText& first = sources[group.items.front()];
+        const SourceText& first = sources[pending.front()];
         try {
             session->start(control, &context, &first, false, true);
             if (synchronized.insert(group.config.key).second) session->synchronize(&first, context, control);
@@ -4327,22 +5266,25 @@ Json lsp_outlines(const std::vector<std::string>& paths, const SearchContext& co
             throw;
         }
         std::vector<SourceText> batch;
-        batch.reserve(group.items.size());
-        for (const size_t i : group.items) batch.push_back(sources[i]);
+        batch.reserve(pending.size());
+        for (const size_t i : pending) batch.push_back(sources[i]);
         std::vector<J> raw;
         std::vector<std::string> failed;
         session->outline_batch(batch, window, raw, failed, control);
-        for (size_t n = 0; n < group.items.size(); ++n) {
-            const size_t i = group.items[n];
+        for (size_t n = 0; n < pending.size(); ++n) {
+            const size_t i = pending[n];
             if (!failed[n].empty()) { errors[i] = failed[n]; continue; }
             std::vector<Symbol> found;
             flatten(raw[n], "", 0, found, group.config.language, wide(sources[i].text), control);
+            if (!found.empty() || session->ever_ready())
+                symbol_index().store(symbol_index_key(group.config, sources[i].path), sources[i].sha256, found);
             J::Array rows;
             rows.reserve(found.size());
             for (const auto& symbol : found) rows.push_back(symbol_json(symbol, sources[i], false, false));
             outlines[i] = J::Object{{"results", std::move(rows)}};
         }
     }
+    symbol_index().save_if_due();
     J::Array files;
     files.reserve(paths.size());
     for (size_t i = 0; i < paths.size(); ++i) {
@@ -4374,8 +5316,8 @@ std::string newlines(const std::string& text, const std::string& reference) {
 }
 
 // Byte spans [begin, end) of comments and string literals, found by a conservative per-family lexer. nullopt when the
-// extension has no lexer here; callers then leave that file untouched. Template-literal substitutions (${...}) stay
-// code, so identifiers there are never treated as text.
+// extension has no lexer here, or when a JavaScript/TypeScript template cannot be classified safely; callers then leave
+// that file untouched. Template-literal substitutions (${...}) stay code, so identifiers there are never treated as text.
 std::optional<std::vector<std::pair<size_t, size_t>>> comment_string_spans(const fs::path& path, std::string_view text) {
     const std::string ext = language_extension(path);
     static const std::set<std::string> c_like{".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".hxx", ".inl", ".ipp",
@@ -4484,24 +5426,95 @@ std::optional<std::vector<std::pair<size_t, size_t>>> comment_string_spans(const
             if (i + 1 + hashes < n && text[i + 1 + hashes] == '"')
                 end = until(i + 2 + hashes, "\"" + std::string(hashes, '#'));
         } else if (templates.contains(ext) && ch == '`') {
-            // Template literal: text pieces around ${...} substitutions, which remain code.
-            size_t j = i + 1, piece = j;
-            while (j < n && text[j] != '`') {
-                if (text[j] == '\\' && j + 1 < n) { j += 2; continue; }
-                if (text[j] == '$' && j + 1 < n && text[j + 1] == '{') {
-                    spans.emplace_back(piece, j);
-                    size_t depth = 1;
-                    for (j += 2; j < n && depth; ++j) {
-                        if (text[j] == '{') ++depth;
-                        else if (text[j] == '}') --depth;
+            // Template literal: text pieces around ${...} substitutions, which remain code. A substitution is lexed as
+            // code (quotes, comments, regex literals and nested templates), so a brace inside a string there cannot end
+            // it early. Only the outermost template's text is emitted. Text that cannot be classified (an unterminated
+            // template, string, comment or regex) makes the whole file unsupported, so the optional rewrite skips it.
+            struct Frame { bool expression; size_t depth; };
+            std::vector<Frame> stack{{false, 0}};
+            const auto closed_quote = [&](size_t start, char quote) -> size_t {
+                for (size_t k = start + 1; k < n && text[k] != '\r' && text[k] != '\n'; ++k) {
+                    if (text[k] == '\\') {  // an escape, including a CRLF line continuation
+                        ++k;
+                        if (k + 1 < n && text[k] == '\r' && text[k + 1] == '\n') ++k;
+                        continue;
                     }
-                    piece = j;
+                    if (text[k] == quote) return k + 1;
+                }
+                return std::string_view::npos;
+            };
+            // A '/' after one of these starts a regex literal; after a value it divides.
+            const auto regex_follows = [](char previous) {
+                return std::string_view("(,=:[!&|?{};+-*%<>~^").find(previous) != std::string_view::npos;
+            };
+            size_t j = i + 1, piece = j;
+            char last = '{';  // last significant code byte in the current substitution
+            while (j < n && !stack.empty()) {
+                Frame& top = stack.back();
+                const char at = text[j], after = j + 1 < n ? text[j + 1] : '\0';
+                if (!top.expression) {
+                    if (at == '\\' && j + 1 < n) { j += 2; continue; }
+                    if (at == '`') {
+                        if (stack.size() == 1) spans.emplace_back(piece, j);
+                        stack.pop_back();
+                        ++j;
+                        last = ')';
+                        continue;
+                    }
+                    if (at == '$' && after == '{') {
+                        if (stack.size() == 1) spans.emplace_back(piece, j);
+                        stack.push_back({true, 1});
+                        j += 2;
+                        last = '{';
+                        continue;
+                    }
+                    ++j;
                     continue;
                 }
-                ++j;
+                if (at == '\'' || at == '"') {
+                    const size_t close = closed_quote(j, at);
+                    if (close == std::string_view::npos) return std::nullopt;
+                    j = close;
+                    last = ')';
+                } else if (at == '/' && after == '/') {
+                    j = line_end(j);
+                } else if (at == '/' && after == '*') {
+                    const size_t close = text.find("*/", j + 2);
+                    if (close == std::string_view::npos) return std::nullopt;
+                    j = close + 2;
+                } else if (at == '/' && regex_follows(last)) {
+                    size_t k = j + 1;
+                    bool in_class = false;
+                    for (; k < n && text[k] != '\r' && text[k] != '\n'; ++k) {
+                        if (text[k] == '\\') { ++k; continue; }
+                        if (text[k] == '[') in_class = true;
+                        else if (text[k] == ']') in_class = false;
+                        else if (text[k] == '/' && !in_class) break;
+                    }
+                    if (k >= n || text[k] != '/') return std::nullopt;
+                    for (j = k + 1; j < n && ident(text[j]); ++j) {}
+                    last = ')';
+                } else if (at == '`') {
+                    stack.push_back({false, 0});
+                    ++j;
+                } else if (at == '{') {
+                    ++top.depth;
+                    last = '{';
+                    ++j;
+                } else if (at == '}') {
+                    ++j;
+                    last = '}';
+                    if (--top.depth == 0) {
+                        stack.pop_back();
+                        if (stack.size() == 1) piece = j;
+                    }
+                } else {
+                    if (!std::isspace(static_cast<unsigned char>(at))) last = at;
+                    ++j;
+                }
             }
-            spans.emplace_back(piece, j);
-            i = j < n ? j + 1 : n;
+            if (!stack.empty()) return std::nullopt;
+            i = j;
             continue;
         } else if (ch == '"') end = quoted(i, '"', true);
         else if (ch == '\'') {
@@ -4566,7 +5579,8 @@ std::string rewrite_rename_text_mentions(const std::string& old_name, const std:
                old_name + " in " + std::to_string(files) + " file" + (files == 1 ? "" : "s") + " the rename already edits]\n";
     if (!unsupported.empty()) {
         note += "[comment/string rewrite skipped for " + std::to_string(unsupported.size()) + " file" +
-                (unsupported.size() == 1 ? "" : "s") + " with no lexer for its language:";
+                (unsupported.size() == 1 ? "" : "s") +
+                " with no lexer for its language or text it could not classify safely (e.g. an unterminated template):";
         for (size_t i = 0; i < std::min<size_t>(5, unsupported.size()); ++i) note += " " + unsupported[i];
         if (unsupported.size() > 5) note += " ...";
         note += "]\n";
@@ -4733,6 +5747,16 @@ std::vector<SourceChange> workspace_changes(Session& session, const J& edit, con
         struct Replacement { size_t start, end, order; std::wstring text; };
         std::vector<Replacement> replacements;
         std::wstring text = wide(entry.source.text);
+        // F4: a replacement keeps the endings of the lines it matches in the range it replaces; new lines take the
+        // ending next to the edit, not one style chosen for the whole (possibly mixed) file.
+        const std::string file_ending = newlines("\n", entry.source.text);
+        const auto nearby = [&](size_t at) -> std::string {
+            const size_t before = at ? text.find_last_of(L"\r\n", at - 1) : std::wstring::npos;
+            const size_t found = before == std::wstring::npos ? text.find_first_of(L"\r\n", at) : before;
+            if (found == std::wstring::npos) return file_ending;
+            if (text[found] == L'\n') return found && text[found - 1] == L'\r' ? "\r\n" : "\n";
+            return found + 1 < text.size() && text[found + 1] == L'\n' ? "\r\n" : "\r";
+        };
         for (const auto& item : entry.edits) {
             const J* extent = item.get("range"), *replacement = item.get("newText");
             if (!extent || !replacement) server_fail("invalid LSP TextEdit");
@@ -4741,8 +5765,12 @@ std::vector<SourceChange> workspace_changes(Session& session, const J& edit, con
                 text.substr(offset(text, r.start), offset(text, r.end) - offset(text, r.start)) != wide(old_name))
                 fail("the language server's index is out of date for " + utf8(entry.source.path.wstring()) +
                      "; nothing written, retry once it has caught up");
-            replacements.push_back({offset(text, r.start), offset(text, r.end), replacements.size(),
-                                    wide(newlines(replacement->string(), entry.source.text))});
+            const size_t start = offset(text, r.start), stop = offset(text, r.end);
+            const std::string& inserted = replacement->string();
+            replacements.push_back({start, stop, replacements.size(),
+                inserted.find_first_of("\r\n") == std::string::npos ? wide(inserted)
+                    : wide(preserve_line_endings(utf8(text.substr(start, stop - start)), inserted, nearby(start),
+                                                 control.cancelled))});
         }
         // SolidLSP applies edits from the end; same-position inserts retain protocol array order.
         std::sort(replacements.begin(), replacements.end(), [](const auto& a, const auto& b) {
@@ -5518,12 +6546,15 @@ std::string inserted_member_text(const SourceText& source, const Symbol& symbol,
             }
         }
     }
+    const size_t byte_point = utf8(text.substr(0, point)).size();
+    replacement = wide(preserve_line_endings({}, utf8(replacement),
+        nearby_line_ending(source.text, byte_point, "\n"), control.cancelled));
     text.insert(point, replacement);
     return utf8(text);
 }
 
 std::string edited_symbol_text(const SourceText& source, const Symbol& symbol,
-                               const std::string& operation, const Json& arguments) {
+                               const std::string& operation, const Json& arguments, const Control& control) {
     std::wstring text = wide(source.text);
     size_t begin = offset(text, symbol.extent.start), end = offset(text, symbol.extent.end);
     const auto only_indent = [&](size_t from, size_t to) {
@@ -5558,6 +6589,12 @@ std::string edited_symbol_text(const SourceText& source, const Symbol& symbol,
         trim_end();
         const auto first = std::find_if_not(replacement.begin(), replacement.end(), edit_space);
         replacement.erase(replacement.begin(), first);
+        // COMPAT: clangd ranges for declarations (prototypes, fields, `struct X {...};`) stop before the ';'. A body
+        //   that brings its own ';' replaces the old one too, instead of leaving "...;;".
+        if (!replacement.empty() && replacement.back() == L';') {
+            const size_t after = text.find_first_not_of(L" \t", end);
+            if (after < text.size() && text[after] == L';') end = after + 1;
+        }
     } else if (operation == "insert_before") {
         if (!only_indent(line_start, begin))
             fail("insert_before cannot split an inline definition; replace the containing symbol instead");
@@ -5588,6 +6625,9 @@ std::string edited_symbol_text(const SourceText& source, const Symbol& symbol,
         }
         end = begin;
     } else fail("unknown symbol edit operation");
+    const size_t byte_begin = utf8(text.substr(0, begin)).size();
+    replacement = wide(preserve_line_endings(utf8(text.substr(begin, end - begin)), utf8(replacement),
+        nearby_line_ending(source.text, byte_begin, "\n"), control.cancelled));
     text.replace(begin, end - begin, replacement);
     return utf8(text);
 }
@@ -5602,6 +6642,22 @@ std::vector<std::pair<size_t, size_t>> outside_symbol_ranges(
     const std::wstring text = wide(source.text);
     std::vector<std::pair<size_t, size_t>> ranges;
     const auto byte = [&](size_t position) { return utf8(text.substr(0, position)).size(); };
+    // Servers differ on whether a range takes the line break after the symbol (Python and Lua ranges often end at the
+    // next line's column 0) or blank lines before it. Those bytes are not code: whole whitespace-only lines at the start
+    // and trailing spaces/line breaks at the end stay outside the protected range, so a blank line next to a symbol can
+    // be edited without the match "crossing" the symbol. Indentation before the first code byte stays protected.
+    const std::string& bytes = source.text;
+    const auto protect = [&](size_t begin, size_t end) {
+        while (begin < end) {
+            size_t at = begin;
+            while (at < end && (bytes[at] == ' ' || bytes[at] == '\t')) ++at;
+            if (at == end || (bytes[at] != '\n' && bytes[at] != '\r')) break;
+            begin = at + (bytes[at] == '\r' && at + 1 < end && bytes[at + 1] == '\n' ? 2 : 1);
+        }
+        while (end > begin && (bytes[end - 1] == ' ' || bytes[end - 1] == '\t' || bytes[end - 1] == '\r' ||
+                               bytes[end - 1] == '\n')) --end;
+        ranges.emplace_back(begin, end);
+    };
     for (const auto& symbol : found) {
         control.check();
         if (!symbol.has_body) fail("language server did not provide complete document symbol ranges; nothing written");
@@ -5611,7 +6667,7 @@ std::vector<std::pair<size_t, size_t>> outside_symbol_ranges(
         const bool container = (symbol.kind == 2 || symbol.kind == 3 || symbol.kind == 4) &&
             (language == "cpp" || language == "csharp" || language == "javascript" || language == "rust");
         if (!container) {
-            ranges.emplace_back(byte(first), byte(last));
+            protect(byte(first), byte(last));
             continue;
         }
         const size_t selection_end = offset(text, symbol.selection.end);
@@ -5623,13 +6679,13 @@ std::vector<std::pair<size_t, size_t>> outside_symbol_ranges(
         }
         // A C# file-scoped namespace (`namespace X;`) guards only its header; its members follow to the end of file.
         if (open < last && mask[open] == L';' && language == "csharp") {
-            ranges.emplace_back(byte(first), byte(open + 1));
+            protect(byte(first), byte(open + 1));
             continue;
         }
         // COMPAT: clangd gives using-declarations (`using std::x;`) and namespace aliases the namespace kind, with a
         //   range that stops before the ';'. They have no body, so, like a Rust `mod x;`, the whole range is guarded.
         if (open == last || mask[open] == L';') {
-            ranges.emplace_back(byte(first), byte(last));
+            protect(byte(first), byte(last));
             continue;
         }
         size_t depth = 1, close = open + 1;
@@ -5639,8 +6695,8 @@ std::vector<std::pair<size_t, size_t>> outside_symbol_ranges(
             else if (mask[close] == L'}') --depth;
         }
         if (depth) fail("cannot determine namespace or module body; nothing written");
-        ranges.emplace_back(byte(first), byte(open + 1));
-        ranges.emplace_back(byte(close - 1), byte(last));
+        protect(byte(first), byte(open + 1));
+        protect(byte(close - 1), byte(last));
     }
     return ranges;
 }
@@ -5945,7 +7001,7 @@ Json lsp_edit(const Json& arguments, const SearchContext& context,
     if (timeout < 1 || timeout > 300000) fail("timeout_ms must be 1-300000");
     const Control control{request_deadline(Clock::now() + std::chrono::milliseconds(timeout)), cancelled};
     const SourceText descriptor = source_descriptor(context, str(arguments, "path"));
-    if (!lsp_required(descriptor.path)) fail("LSP edits are only for programming files and XML; use text edits for this file");
+    if (!lsp_required(descriptor.path, descriptor.root)) fail("LSP edits are only for programming files and XML; use text edits for this file");
     const SourceText source = read_source_text(context, str(arguments, "path"));
     if (const J* expected = arguments.get("expected_sha256"))
         if (source.sha256 != lower(expected->string())) fail("expected_sha256 does not match current file");
@@ -5964,7 +7020,11 @@ Json lsp_edit(const Json& arguments, const SearchContext& context,
             throw SymbolLookupFailure("the source project is unavailable; semantic writes are blocked",
                 J::Object{{"code", "project_loading"}, {"reason", "project_not_loaded"}, {"project_loading", session->managed_project_status()}});
         session->synchronize(&source, context, control);
-        if (needs_reverse_closure) session->open_loose_scripts(source, context, control);
+        // SAFETY (F10): rename and safe_delete need every reference; with loose scripts cut short they would miss some.
+        if (needs_reverse_closure && !session->open_loose_scripts(source, context, control))
+            fail("this package has more than " + std::to_string(Session::kLooseScripts) + " scripts and no "
+                 "tsconfig.json or jsconfig.json, so references cannot be complete; " + planned_operation +
+                 " was refused and nothing was written. Fix: add a jsconfig.json at the package root");
         session->service_pending(control);
         session->assert_current(source);
         reusable = true;
@@ -6161,9 +7221,14 @@ Json lsp_edit(const Json& arguments, const SearchContext& context,
                     }
                     editable.extent.start = text_end(utf8(original.substr(0, start)));
                 }
-                changes.push_back({source, edited_symbol_text(source, editable, operation, arguments)});
+                changes.push_back({source, edited_symbol_text(source, editable, operation, arguments, control)});
             }
         }
+        // A literal needle/old_text was matched in the bytes just read, which proves the caller knew the replaced text;
+        // such edits need no earlier session read. Regex, whole-body, insert, rename and delete edits still do.
+        if ((operation == "replace_in_symbol" || operation == "replace_outside_symbols") &&
+            str(arguments, "mode", "literal") == "literal")
+            for (auto& change : changes) change.anchored = true;
         control.check();
         const auto current = read_source_text(context, utf8(source.path.wstring()));
         if (current.sha256 != source.sha256 || (arguments.get("expected_mtime") && current.mtime != source.mtime))
@@ -6225,13 +7290,21 @@ Json lsp_move(const Json& arguments, const SearchContext& context,
     bool destination_exists = false;
     const SourceText destination = source_descriptor(context, str(arguments, "destination"), nullptr, true, &destination_exists);
     if (source.path == source.root || destination.path == destination.root) fail("cannot move a configured root");
-    if (!PathLess{}(source.path.wstring(), destination.path.wstring()) && !PathLess{}(destination.path.wstring(), source.path.wstring()))
-        fail("source and destination are the same path");
+    // Paths equal but for letter case name the same entry on Windows: a case-only rename of the last component (#95).
+    // It moves like any other path (auto/refactor still ask the server for import edits naming the new spelling); its
+    // destination "exists" only as the source itself, so it needs no overwrite.
+    const bool case_only = !PathLess{}(source.path.wstring(), destination.path.wstring()) &&
+                           !PathLess{}(destination.path.wstring(), source.path.wstring());
+    if (case_only && source.path.wstring() == destination.path.wstring()) fail("source and destination are the same path");
+    if (case_only && source.path.parent_path().wstring() != destination.path.parent_path().wstring())
+        fail("only the last path component's letter case can change in one move; move the folder whose case changes "
+             "itself; nothing written");
     const std::wstring prefix = source.path.wstring() + L"\\";
     const std::wstring dest = destination.path.wstring();
     if (dest.size() > prefix.size() && CompareStringOrdinal(dest.data(), static_cast<int>(prefix.size()),
             prefix.data(), static_cast<int>(prefix.size()), TRUE) == CSTR_EQUAL) fail("cannot move a directory into itself");
-    if (destination_exists && !flag(arguments, "overwrite")) fail("move destination already exists; nothing written");
+    if (destination_exists && !case_only && !flag(arguments, "overwrite"))
+        fail("move destination already exists; nothing written");
     std::vector<SourceChange> changes;
     bool supported = false;
     std::vector<Config> move_configs;

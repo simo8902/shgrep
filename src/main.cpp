@@ -24,6 +24,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <vector>
 #include <version>
@@ -141,8 +142,10 @@ std::shared_ptr<const Continuation> find_continuation(const std::string& key) {
 // ("1200", "true"), so whole numbers and booleans are also accepted in that form; anything else is a clear error.
 int64_t integer_argument(const Json& value, const char* name) {
     if (const auto* number = std::get_if<int64_t>(&value.value)) return *number;
+    // Range first: casting a double outside int64_t is undefined. Same bound as Json::integer; NaN fails both tests.
     if (const auto* real = std::get_if<double>(&value.value);
-        real && *real == static_cast<double>(static_cast<int64_t>(*real))) return static_cast<int64_t>(*real);
+        real && *real > -9.0e15 && *real < 9.0e15 && *real == static_cast<double>(static_cast<int64_t>(*real)))
+        return static_cast<int64_t>(*real);
     if (const auto* text = std::get_if<std::string>(&value.value); text && !text->empty() && text->size() <= 18 &&
         text->find_first_not_of("0123456789") == std::string::npos) return std::stoll(*text);
     throw std::runtime_error(std::string(name) + " must be an integer");
@@ -783,10 +786,28 @@ int wmain(int argc, wchar_t** argv) {
                                 object.erase("offload_output");
                                 if (tool_name == "lsp") object["timeout_ms"] = timeout;
                             }
-                            result = shgrep::run_tool(tool_name, tool_arguments, context, flag,
+                            shgrep::lsp_clear_listed_files();
+                            // read_file pages its text below the offload size instead of having it copied to a
+                            // saved output: the file is already on disk, so a copy only costs a second read.
+                            std::optional<shgrep::SearchContext> paged_context;
+                            if (tool_name == "read_file" && offload_output) {
+                                paged_context = context;
+                                paged_context->text_page_bytes = shgrep::offload_text_bytes;
+                            }
+                            result = shgrep::run_tool(tool_name, tool_arguments, paged_context ? *paged_context : context, flag,
                                                   (uncapped || offload_output) ? &stream : nullptr,
                                                   (uncapped || offload_output) ? 0 : max_continuation_bytes);
                             has_result = true;
+                            // A missing language server is named only once a result has shown files it would handle
+                            // (#101); nothing about unrelated languages is said at session start.
+                            try {
+                                const std::string languages = shgrep::lsp_language_notice(context);
+                                if (!languages.empty())
+                                    notice += std::string(notice.empty() || notice.ends_with('\n') ? "" : "\n") + languages;
+                            } catch (const std::exception& e) {
+                                logs.write(LogLevel::warning, std::string("language-server notice skipped: ") + e.what(),
+                                           tool_name, key);
+                            }
                             completed_writes = shgrep::is_write_tool(tool_name) &&
                                 (!arguments.get("dry_run") || !std::holds_alternative<bool>(arguments.get("dry_run")->value) ||
                                  !arguments.get("dry_run")->boolean());
@@ -806,9 +827,13 @@ int wmain(int argc, wchar_t** argv) {
                             if (status && status->string() == "timeout") {
                                 partial_timeout = true;
                                 encoding_deadline = std::max(deadline, ResponseClock::now() + std::chrono::seconds(1));
+                            } else if (ResponseClock::now() >= deadline) {
+                                // A result that exists past the deadline (a compiler check that timed out keeps its
+                                // captured output) is encoded within a bounded allowance, not replaced by a timeout.
+                                encoding_deadline = std::max(deadline, ResponseClock::now() + std::chrono::seconds(2));
                             }
                             const Json* output = result.get("text");
-                            if (offload_output && (stream || (output && output->string().size() > 8000))) {
+                            if (offload_output && (stream || (output && output->string().size() > shgrep::offload_text_bytes))) {
                                 try {
                                     if (stream) stream->retain_for_replay();
                                     size_t at = 0;
@@ -904,7 +929,12 @@ int wmain(int argc, wchar_t** argv) {
             std::fprintf(stderr, "worker: %s\n", e.what());
         }
     }
+    // F5: the meaning builder uses LSP sessions and logs; it stops before anything it uses is destroyed.
+    shgrep::stop_meaning_index();
     shgrep::stop_language_server_warmup();
+    // A model load still running when the client disconnects keeps its thread inside the GPU runtime, and exiting
+    // under it never finishes; a load takes seconds, so wait for it (bounded) instead.
+    shgrep::embed_finish_loading(std::chrono::minutes(2));
     health.wait();
     logs.write(LogLevel::info, "MCP server stopped");
     return 0;

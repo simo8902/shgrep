@@ -1,5 +1,6 @@
 // Editing algorithms adapted from Serena 2.0.0; see third_party/solidlsp-LICENSE.txt.
 #include "edit.hpp"
+#include <unordered_map>
 #include "lsp.hpp"
 #include "path_match.hpp"
 
@@ -84,39 +85,7 @@ bool glob(const std::string& pattern, const std::string& value) {
 }
 
 // Serena's editor works on logical LF text. Keep a sparse map back to disk so mixed endings outside an edit survive.
-struct LogicalText {
-    std::string text, eol = "\n";
-    std::vector<uint32_t> crlf;
-    explicit LogicalText(const std::string& original) {
-        if (original.find("\r\n") != std::string::npos) eol = "\r\n";
-        else if (original.find('\n') == std::string::npos && original.find('\r') != std::string::npos) eol = "\r";
-        text.reserve(original.size());
-        for (size_t i = 0; i < original.size(); ++i) {
-            if (original[i] == '\r') {
-                if (i + 1 < original.size() && original[i + 1] == '\n') { crlf.push_back(static_cast<uint32_t>(text.size())); ++i; }
-                text.push_back('\n');
-            } else text.push_back(original[i]);
-        }
-    }
-    size_t raw(size_t offset) const {
-        return offset + static_cast<size_t>(std::lower_bound(crlf.begin(), crlf.end(), offset) - crlf.begin());
-    }
-    size_t logical(size_t raw_offset) const {
-        size_t first = 0, last = crlf.size();
-        while (first < last) {
-            const size_t middle = first + (last - first) / 2;
-            if (static_cast<size_t>(crlf[middle]) + middle < raw_offset) first = middle + 1;
-            else last = middle;
-        }
-        return raw_offset - first;
-    }
-    std::string ending(const std::string& replacement) const {
-        if (eol == "\n") return replacement;
-        std::string out;
-        for (char c : replacement) { if (c == '\n') out += eol; else out += c; }
-        return out;
-    }
-};
+
 
 struct Occurrence {
     size_t start, end;
@@ -314,8 +283,10 @@ std::string line_edit(const SourceText& source, const Json& args, const std::str
         if (insertion && begin == logical.text.size() && begin && logical.text.back() != '\n')
             replacement.insert(replacement.begin(), '\n');
     }
-    const std::string raw_replacement = logical.ending(replacement);
     const size_t raw_begin = logical.raw(begin), raw_end = logical.raw(end);
+    const std::string raw_replacement = preserve_line_endings(
+        std::string_view(source.text).substr(raw_begin, raw_end - raw_begin), replacement,
+        nearby_line_ending(source.text, raw_begin, logical.eol), control.cancelled);
     if (raw_replacement.size() > max_file || source.text.size() - (raw_end - raw_begin) > max_file - raw_replacement.size())
         fail("edited file exceeds 64 MiB");
     std::string result = source.text;
@@ -324,6 +295,201 @@ std::string line_edit(const SourceText& source, const Json& args, const std::str
     return result;
 }
 } // namespace
+
+std::string preserve_line_endings(std::string_view reference, std::string_view replacement,
+                                  std::string_view fallback,
+                                  const std::shared_ptr<std::atomic_bool>& cancelled) {
+    if (cancelled && cancelled->load()) throw std::runtime_error("edit cancelled");
+    if (replacement.empty()) return {};
+    struct Line { std::string_view content, ending; size_t first = 0, next = 0; };
+    size_t steps = 0;
+    const auto deadline = request_deadline(Clock::time_point::max());
+    const auto check = [&] {
+        if ((++steps & 1023) != 0) return;
+        if (cancelled && cancelled->load()) throw std::runtime_error("edit cancelled");
+        if (Clock::now() >= deadline) throw std::runtime_error("edit timed out; nothing written");
+    };
+    const auto take = [&](std::string_view text, size_t at) {
+        check();
+        const size_t stop = text.find_first_of("\r\n", at);
+        if (stop == std::string_view::npos) return Line{text.substr(at), {}, at, text.size()};
+        const size_t size = text[stop] == '\r' && stop + 1 < text.size() && text[stop + 1] == '\n' ? 2 : 1;
+        return Line{text.substr(at, stop - at), text.substr(stop, size), at, stop + size};
+    };
+    const auto back = [&](std::string_view text, size_t end) {
+        check();
+        size_t content_end = end;
+        if (text[content_end - 1] == '\n') {
+            --content_end;
+            if (content_end && text[content_end - 1] == '\r') --content_end;
+        } else if (text[content_end - 1] == '\r') --content_end;
+        const size_t previous = content_end ? text.find_last_of("\r\n", content_end - 1) : std::string_view::npos;
+        const size_t first = previous == std::string_view::npos ? 0 : previous + 1;
+        return Line{text.substr(first, content_end - first), text.substr(content_end, end - content_end), first, end};
+    };
+    // Count without allocating one object per file line. CRLF wins ties, as in lcfix.ps1.
+    size_t crlf = 0, lf = 0, cr = 0;
+    for (size_t at = 0; at < reference.size();) {
+        const Line line = take(reference, at);
+        if (line.ending == "\r\n") ++crlf;
+        else if (line.ending == "\n") ++lf;
+        else if (line.ending == "\r") ++cr;
+        at = line.next;
+    }
+    std::string_view carried = fallback.empty() ? std::string_view("\n") : fallback;
+    if (crlf && crlf >= lf && crlf >= cr) carried = "\r\n";
+    else if (lf && lf >= cr) carried = "\n";
+    else if (cr) carried = "\r";
+    std::string out;
+    out.reserve(replacement.size());
+    const auto emit = [&](const Line& line, const Line* matched) {
+        check();
+        if (!line.ending.empty() && matched && !matched->ending.empty()) carried = matched->ending;
+        const std::string_view ending = line.ending.empty() ? std::string_view{} : carried;
+        if (line.content.size() > max_file || ending.size() > max_file - line.content.size() ||
+            out.size() > max_file - line.content.size() - ending.size())
+            throw std::runtime_error("edited text exceeds 64 MiB");
+        out.append(line.content);
+        out.append(ending);
+    };
+    size_t old_first = 0, new_first = 0;
+    while (old_first < reference.size() && new_first < replacement.size()) {
+        const Line old_line = take(reference, old_first), new_line = take(replacement, new_first);
+        if (old_line.content != new_line.content) break;
+        emit(new_line, &old_line);
+        old_first = old_line.next;
+        new_first = new_line.next;
+    }
+    size_t old_last = reference.size(), new_last = replacement.size();
+    while (old_last > old_first && new_last > new_first) {
+        const Line old_line = back(reference, old_last), new_line = back(replacement, new_last);
+        if (old_line.first < old_first || new_line.first < new_first || old_line.content != new_line.content) break;
+        old_last = old_line.first;
+        new_last = new_line.first;
+    }
+    // Keep compact offsets, then align unique anchors before using linear-space LCS for repeats.
+    std::vector<size_t> old_lines, new_lines;
+    for (size_t at = old_first; at < old_last;) {
+        old_lines.push_back(at);
+        at = take(reference, at).next;
+    }
+    for (size_t at = new_first; at < new_last;) {
+        new_lines.push_back(at);
+        at = take(replacement, at).next;
+    }
+    const size_t missing = std::string_view::npos;
+    std::vector<size_t> alignment(new_lines.size(), missing);
+    const auto old_line = [&](size_t index) { return take(reference, old_lines[index]); };
+    const auto new_line = [&](size_t index) { return take(replacement, new_lines[index]); };
+    const auto same = [&](size_t a, size_t b) { return new_line(a).content == old_line(b).content; };
+    const auto scores = [&](size_t a0, size_t a1, size_t b0, size_t b1, bool reverse) {
+        std::vector<uint32_t> row(b1 - b0 + 1, 0);
+        for (size_t i = 0; i < a1 - a0; ++i) {
+            const auto content = new_line(reverse ? a1 - i - 1 : a0 + i).content;
+            uint32_t diagonal = 0;
+            for (size_t j = 1; j < row.size(); ++j) {
+                const uint32_t above = row[j];
+                if (content == old_line(reverse ? b1 - j : b0 + j - 1).content)
+                    row[j] = diagonal + 1;
+                else row[j] = std::max(row[j], row[j - 1]);
+                diagonal = above;
+            }
+        }
+        return row;
+    };
+    struct Job { size_t a0, a1, b0, b1; };
+    std::vector<Job> jobs{{0, new_lines.size(), 0, old_lines.size()}};
+    while (!jobs.empty()) {
+        check();
+        auto [a0, a1, b0, b1] = jobs.back();
+        jobs.pop_back();
+        while (a0 < a1 && b0 < b1 && same(a0, b0)) alignment[a0++] = b0++;
+        while (a0 < a1 && b0 < b1 && same(a1 - 1, b1 - 1)) alignment[--a1] = --b1;
+        if (a0 == a1 || b0 == b1) continue;
+        if (a1 - a0 == 1) {
+            for (size_t b = b0; b < b1; ++b)
+                if (same(a0, b)) { alignment[a0] = b; break; }
+            continue;
+        }
+        if (b1 - b0 == 1) {
+            for (size_t a = a0; a < a1; ++a)
+                if (same(a, b0)) { alignment[a] = b0; break; }
+            continue;
+        }
+        std::unordered_map<std::string_view, size_t> old_index, new_index;
+        for (size_t b = b0; b < b1; ++b) {
+            auto [at, inserted] = old_index.emplace(old_line(b).content, b);
+            if (!inserted) at->second = missing;
+        }
+        for (size_t a = a0; a < a1; ++a) {
+            auto [at, inserted] = new_index.emplace(new_line(a).content, a);
+            if (!inserted) at->second = missing;
+        }
+        std::vector<std::pair<size_t, size_t>> pairs;
+        bool shared = false;
+        for (size_t a = a0; a < a1; ++a) {
+            const auto content = new_line(a).content;
+            const auto found = old_index.find(content);
+            if (found == old_index.end()) continue;
+            shared = true;
+            if (found->second != missing && new_index.at(content) != missing) pairs.emplace_back(a, found->second);
+        }
+        if (!shared) continue;
+        if (!pairs.empty()) {
+            std::vector<size_t> tails, previous(pairs.size(), missing);
+            for (size_t i = 0; i < pairs.size(); ++i) {
+                const auto at = std::lower_bound(tails.begin(), tails.end(), pairs[i].second,
+                    [&](size_t tail, size_t value) { return pairs[tail].second < value; });
+                const size_t position = static_cast<size_t>(at - tails.begin());
+                if (position) previous[i] = tails[position - 1];
+                if (at == tails.end()) tails.push_back(i);
+                else *at = i;
+            }
+            std::vector<size_t> anchors;
+            for (size_t at = tails.back(); at != missing; at = previous[at]) anchors.push_back(at);
+            std::reverse(anchors.begin(), anchors.end());
+            size_t left_a = a0, left_b = b0;
+            for (const size_t at : anchors) {
+                const auto [a, b] = pairs[at];
+                jobs.push_back({left_a, a, left_b, b});
+                alignment[a] = b;
+                left_a = a + 1; left_b = b + 1;
+            }
+            jobs.push_back({left_a, a1, left_b, b1});
+            continue;
+        }
+        const size_t middle = a0 + (a1 - a0) / 2;
+        const auto forward = scores(a0, middle, b0, b1, false);
+        const auto backward = scores(middle, a1, b0, b1, true);
+        size_t split = 0;
+        uint32_t best = 0;
+        for (size_t b = 0; b <= b1 - b0; ++b) {
+            check();
+            const uint32_t score = forward[b] + backward[b1 - b0 - b];
+            if (score > best) { best = score; split = b; }
+        }
+        if (best) {
+            jobs.push_back({a0, middle, b0, b0 + split});
+            jobs.push_back({middle, a1, b0 + split, b1});
+        }
+    }
+    for (size_t a = 0; a < new_lines.size(); ++a) {
+        const Line line = new_line(a);
+        if (alignment[a] == missing) emit(line, nullptr);
+        else {
+            const Line matched = old_line(alignment[a]);
+            emit(line, &matched);
+        }
+    }
+    while (new_last < replacement.size()) {
+        const Line old_line = take(reference, old_last), new_line = take(replacement, new_last);
+        emit(new_line, &old_line);
+        old_last = old_line.next;
+        new_last = new_line.next;
+    }
+    if (cancelled && cancelled->load()) throw std::runtime_error("edit cancelled");
+    return out;
+}
 
 std::string scoped_content_edit(const SourceText& source, size_t begin, size_t end,
                                 const Json& args, const std::shared_ptr<std::atomic_bool>& cancelled) {
@@ -402,7 +568,9 @@ std::string scoped_content_edit(const SourceText& source, size_t begin, size_t e
         if (occurrence.ambiguous) fail("ambiguous multiline match inside symbol; refine needle; nothing written");
         const size_t first = logical.raw(occurrence.start), last = logical.raw(occurrence.end);
         if (first < cursor) fail("overlapping symbol edit ranges");
-        const std::string inserted = logical.ending(occurrence.replacement);
+        const std::string inserted = preserve_line_endings(
+            std::string_view(original).substr(first, last - first), occurrence.replacement,
+            nearby_line_ending(source.text, begin + first, logical.eol), cancelled);
         if (replacement.size() + first - cursor + inserted.size() > max_file)
             fail("edited symbol exceeds 64 MiB");
         replacement.append(original, cursor, first - cursor);
@@ -469,7 +637,29 @@ std::string outside_content_edit(const SourceText& source,
                     contained = true;
                     break;
                 }
-            if (!contained) fail("match crosses a protected symbol boundary; nothing written");
+            if (!contained) {
+                // Name where, so the next attempt can narrow the needle instead of guessing.
+                const auto line_of = [&](size_t at) {
+                    uint64_t line = 1;
+                    for (size_t k = 0; k < at && k < source.text.size(); ++k) {
+                        if ((k & 1023) == 0) control.check();
+                        const char c = source.text[k];
+                        if (c == '\n' || (c == '\r' && (k + 1 == source.text.size() || source.text[k + 1] != '\n'))) ++line;
+                    }
+                    return line;
+                };
+                std::string symbol_lines;
+                for (const auto& [start, end] : protected_ranges)
+                    if (first < end && start < last) {
+                        symbol_lines = " (symbol lines " + std::to_string(line_of(start)) + "-" +
+                                       std::to_string(line_of(end ? end - 1 : end)) + ")";
+                        break;
+                    }
+                fail("match" + occurrence_lines(logical.text, {match}, 1, control) + " crosses a protected symbol" +
+                     symbol_lines + "; every match is checked, so narrow the needle to text outside symbols only "
+                     "(for a blank line, the line breaks around it), or edit inside the symbol with replace_in_symbol; "
+                     "nothing written");
+            }
             continue;
         }
         eligible.push_back(match);
@@ -486,7 +676,9 @@ std::string outside_content_edit(const SourceText& source,
         if (match.ambiguous) fail("ambiguous multiline match; refine needle; nothing written");
         const size_t first = logical.raw(match.start), last = logical.raw(match.end);
         if (first < cursor) fail("overlapping edit ranges");
-        const std::string replacement = logical.ending(match.replacement);
+        const std::string replacement = preserve_line_endings(
+            std::string_view(source.text).substr(first, last - first), match.replacement,
+            nearby_line_ending(source.text, first, logical.eol), cancelled);
         if (result.size() + first - cursor + replacement.size() > max_file) fail("edited file exceeds 64 MiB");
         result.append(source.text, cursor, first - cursor);
         result += replacement;
@@ -570,7 +762,7 @@ Json content_edit(const Json& args, const SearchContext& context,
             if (!directory) throw;
             control.check(); ++skipped; continue;
         }
-        if (lsp_required(descriptor.path)) {
+        if (lsp_required(descriptor.path, descriptor.root)) {
             if (!directory) fallback_notice += require_text_access(descriptor, args, context, cancelled);
             else if (!flag(args, "allow_text_fallback")) { ++skipped_lsp; continue; }
             else {
@@ -597,7 +789,9 @@ Json content_edit(const Json& args, const SearchContext& context,
             auto& occurrence = occurrences[i];
             const size_t begin = logical.raw(occurrence.start), end = logical.raw(occurrence.end);
             occurrence.start = begin; occurrence.end = end;
-            occurrence.replacement = logical.ending(occurrence.replacement);
+            occurrence.replacement = preserve_line_endings(
+                std::string_view(source.text).substr(begin, end - begin), occurrence.replacement,
+                nearby_line_ending(source.text, begin, logical.eol), cancelled);
             occurrence.id = shown + ":" + std::to_string(i) + "@" +
                 source_text_digest(path_text(source.path) + ":" + source.sha256 + ":" + binding + ":" +
                                    std::to_string(begin) + ":" + std::to_string(end)).substr(0, 16);
@@ -713,7 +907,8 @@ Json content_edit(const Json& args, const SearchContext& context,
         after.append(plan.before.text, cursor, std::string::npos);
         plan_bytes += after.size();
         if (plan_bytes > max_plan) fail("edit planning exceeds 256 MiB; narrow the scope");
-        changes.push_back({std::move(plan.before), std::move(after)});
+        // A literal needle matched in the current bytes needs no earlier session read; regex edits still do.
+        changes.push_back({std::move(plan.before), std::move(after), arg(args, "mode", "literal") == "literal"});
     }
     control.check();
     Json result = apply_source_changes(changes, args, context, cancelled);

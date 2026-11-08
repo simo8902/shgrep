@@ -65,6 +65,10 @@ private:
     std::map<std::wstring, std::pair<std::string, std::list<std::wstring>::iterator>> hashes_;
 };
 
+// MCP text results over this many bytes are saved under .shgrep-output with a preview (offload_output), and
+// read_file pages stop below it (SearchContext::text_page_bytes). arXiv 2603.05344 uses the same 8,000.
+inline constexpr size_t offload_text_bytes = 8000;
+
 struct SearchContext {
     std::vector<std::filesystem::path> allowed_roots;
     // --read-only: the write tools (edit_file, write_file, move_file, create_directory) are neither listed nor run, and
@@ -74,12 +78,17 @@ struct SearchContext {
     // searches there use it unless they pass index: false; other roots are walked. False for the one-shot CLI,
     // which checks a snapshot against the tree instead.
     bool live_index = false;
-    // Native backend intent policy; the REPL and plain MCP adapters allow explicit patterns without intent.
+    // Native backend intent policy (the lsp tool's search). The plain MCP search tool and REPL text search ask for
+    // intent or exhaustive=true only when the search can reach code files (gate_plain_text_search).
     // Supplying intent still enables ranking through the native backend.
     bool require_intent = false;
     // Shared by direct tools and the default REPL; named REPL sessions use their own state.
     std::shared_ptr<ReadSnapshots> read_snapshots = std::make_shared<ReadSnapshots>();
     bool record_user_reads = false;
+    // Set per MCP read_file call while offloading is on: a text page ends at the last whole line that keeps the
+    // response under this many bytes, with a continue offset, so the file is paged instead of copied to
+    // .shgrep-output. 0 (REPL, CLI, offload_output=false): the requested lines are returned whole.
+    size_t text_page_bytes = 0;
     // Process-local REPL values belong to this server context and are never used as search caches.
     std::shared_ptr<ReplState> repl_state = make_repl_state();
 };
@@ -121,6 +130,9 @@ int64_t default_request_timeout_ms(const std::string& name, const Json& argument
 Json run_tool(const std::string& name, const Json& arguments,
               const SearchContext& context, const std::shared_ptr<std::atomic_bool>& cancelled,
               std::shared_ptr<TextStream>* stream = nullptr, uint64_t text_limit = 0);
+// Plain search tool and REPL text search: the intent rule for searches that can reach code files (CONTRACT at its
+// definition). Returns the arguments without exhaustive, or throws std::runtime_error naming intent/exhaustive.
+Json gate_plain_text_search(Json arguments, const SearchContext& context);
 // Internal facade dispatch: retains semantic operations, workspace locking and native validation.
 Json run_backend_tool(const std::string& name, const Json& arguments,
                       const SearchContext& context, const std::shared_ptr<std::atomic_bool>& cancelled,

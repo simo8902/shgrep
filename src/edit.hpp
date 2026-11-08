@@ -1,5 +1,6 @@
 #pragma once
 #include "files.hpp"
+#include "line_endings.hpp"
 #include <cstddef>
 #include <utility>
 #include <vector>

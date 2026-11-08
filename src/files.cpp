@@ -1,7 +1,9 @@
 #include "files.hpp"
+#include "tool_contracts.generated.hpp"
 #include "lsp.hpp"
 #include "edit.hpp"
 #include "rank.hpp"
+#include "meaning.hpp"
 #include "ignore.hpp"
 #include "winfs.hpp"
 
@@ -295,6 +297,7 @@ std::vector<Root> configured_roots(const SearchContext& context) {
 struct Target {
     std::wstring root;
     std::vector<std::wstring> parts;
+    bool first_root = false;  // root is the first configured root (SourceText::first_root)
 
     std::wstring full(size_t count) const {
         std::wstring out = root;
@@ -379,6 +382,7 @@ Target resolve(const SearchContext& context, const std::string& text) {
         } else target.parts.push_back(part);
     }
     for (const auto& part : target.parts) check_name(part, text);
+    target.first_root = target.root == roots.front().lexical;
     return target;
 }
 
@@ -651,26 +655,42 @@ size_t max_output_arg(const Json& args) {
     return static_cast<size_t>(int_arg(args, "max_output_bytes", 65536, 512, 1048576));
 }
 
+// CONTRACT: the read header names only what the reader acts on: path, line count, line endings, and the encoding
+//   and final-newline state when they are unusual. Byte size, mtime and sha256 come only with metadata=true (and
+//   from file_info): every read repeated about 250 bytes of them, and edits are guarded by the server's read
+//   snapshot, not by the header. metadata=true keeps the earlier full header for clients that pin expected_sha256.
 std::string file_header(const std::string& path, uint64_t bytes, const std::string& sha256, const TextFile& text,
-                        const FILE_BASIC_INFO& basic) {
-    std::string header = "[file " + path + " | " + std::to_string(text.lines) + " lines, " + std::to_string(bytes) +
-                         " bytes | " + encoding_name(text.encoding) + ", " + eol_name(text) + ", " +
-                         (text.final_newline ? "final newline" : "no final newline");
+                        const FILE_BASIC_INFO& basic, bool metadata) {
+    if (metadata) {
+        std::string header = "[file " + path + " | " + std::to_string(text.lines) + " lines, " + std::to_string(bytes) +
+                             " bytes | " + encoding_name(text.encoding) + ", " + eol_name(text) + ", " +
+                             (text.final_newline ? "final newline" : "no final newline");
+        if (text.invalid)
+            header += ", " + std::to_string(text.invalid) + " invalid byte sequences shown as U+FFFD (edit_file refuses "
+                      "this file)";
+        return header + " | mtime " + format_mtime(basic.LastWriteTime.QuadPart) + " | sha256 " + sha256 + " | source: text]\n";
+    }
+    std::string header = "[file " + path + " | " + std::to_string(text.lines) + " lines | " + eol_name(text);
+    if (const std::string encoding = encoding_name(text.encoding); encoding != "utf-8") header += ", " + encoding;
+    if (!text.final_newline && text.lines) header += ", no final newline";
     if (text.invalid)
         header += ", " + std::to_string(text.invalid) + " invalid byte sequences shown as U+FFFD (edit_file refuses "
                   "this file)";
-    return header + " | mtime " + format_mtime(basic.LastWriteTime.QuadPart) + " | sha256 " + sha256 + " | source: text]\n";
+    return header + "]\n";
 }
 std::string file_header(const std::string& path, const std::string& raw, const TextFile& text,
-                        const FILE_BASIC_INFO& basic) {
-    return file_header(path, raw.size(), sha256_hex(raw), text, basic);
+                        const FILE_BASIC_INFO& basic, bool metadata) {
+    return file_header(path, raw.size(), metadata ? sha256_hex(raw) : std::string(), text, basic, metadata);
 }
 
 // ---- read_file ----
 
 struct ReadOptions {
     uint64_t offset = 1, limit = UINT64_MAX;
+    // Whole lines are added only while the output stays at or under this size; the first line always shows.
+    size_t max_out = SIZE_MAX;
     bool numbers = true;
+    bool metadata = false;  // full header: size, mtime, sha256 (file_header)
     CancelFlag cancelled;
 };
 
@@ -762,7 +782,7 @@ std::string render_large_file(std::string& out, const std::string& path, HANDLE 
     counts.lines = decoded_size == 0 ? 0 : counts.lf + counts.crlf + (last == '\n' ? 0 : 1);
     counts.final_newline = decoded_size != 0 && (last == '\n' || last == '\r');
     const std::string digest = hash.hex();
-    out += file_header(header_path, bytes, digest, counts, basic);
+    out += file_header(header_path, bytes, digest, counts, basic, options.metadata);
     if (options.offset > counts.lines && !(counts.lines == 0 && options.offset == 1)) {
         out += "[offset " + std::to_string(options.offset) + " is past the end: the file has " + std::to_string(counts.lines) + " lines]\n";
         return digest;
@@ -800,7 +820,7 @@ void render_file(std::string& out, const Target& target, const ReadOptions& opti
     if (text.binary) fail(path + " is binary; use search_bytes");
     if (context.record_user_reads)
         remember_read_snapshot(context, fs::path(target.full(target.parts.size())), sha256_hex(raw));
-    out += file_header(header_path, raw, text, basic);
+    out += file_header(header_path, raw, text, basic, options.metadata);
     if (options.offset > text.lines && !(text.lines == 0 && options.offset == 1)) {
         out += "[offset " + std::to_string(options.offset) + " is past the end: the file has " + std::to_string(text.lines) + " lines]\n";
         return;
@@ -814,20 +834,147 @@ void render_file(std::string& out, const Target& target, const ReadOptions& opti
         ++number;
     }
     const uint64_t first = number;
+    bool page_full = false;
     while (pos < t.size() && shown < options.limit) {
         const size_t newline = t.find('\n', pos);
         size_t end = newline == std::string::npos ? t.size() : newline;
         if (newline != std::string::npos && end > pos && t[end - 1] == '\r') --end;
-        if (options.numbers) out += std::to_string(number) + " | ";
+        const std::string prefix = options.numbers ? std::to_string(number) + " | " : std::string();
+        // Pages end between lines: a line is never split, and the next page starts with it.
+        if (shown && out.size() + prefix.size() + (end - pos) + 1 > options.max_out) { page_full = true; break; }
+        out += prefix;
         out.append(t, pos, end - pos);
         out.push_back('\n');
         ++shown; ++number;
         pos = newline == std::string::npos ? t.size() : newline + 1;
     }
-    if (pos < t.size())
-        out += "[status limit: showed lines " + std::to_string(first) + "-" + std::to_string(first + shown - 1) +
-               " of " + std::to_string(text.lines) + " (limit=" + std::to_string(options.limit) +
-               "); continue with offset=" + std::to_string(first + shown) + "]\n";
+    if (pos < t.size()) {
+        const std::string shown_lines = "showed lines " + std::to_string(first) + "-" + std::to_string(first + shown - 1) +
+                                        " of " + std::to_string(text.lines);
+        if (page_full)
+            out += "[status page: " + shown_lines + "; the next line would pass this response's " +
+                   std::to_string(offload_text_bytes) + "-byte page; continue with offset=" +
+                   std::to_string(first + shown) + "]\n";
+        else
+            out += "[status limit: " + shown_lines + " (limit=" + std::to_string(options.limit) +
+                   "); continue with offset=" + std::to_string(first + shown) + "]\n";
+    }
+}
+
+// CONTRACT (task-conditioned reads): read_file with intent returns only the lines of one file that best match the
+//   task, verbatim with line numbers, at most intent_read_lines (72) in total from at most intent_max_windows (3)
+//   windows, and marks the skipped stretches. File
+//   reads are most of a coding agent's tokens; returning the task's lines instead of whole windows keeps recall at a
+//   fraction of the size (SWE-Pruner, arXiv 2601.16746; Squeez, arXiv 2604.04979). Windows of intent_window_lines
+//   lines every intent_window_step lines are ranked by the search Ranker: BM25 over the window text and, in the GPU
+//   build, the meaning score of the closest indexed chunk (meaning_weight()), as ranked text search does.
+//   Gaps of up to two lines between picked lines are shown rather than marked.
+void render_intent_lines(std::string& out, const Target& target, const std::string& intent, const std::string& header_path,
+                         bool metadata, const SearchContext& context, const std::shared_ptr<std::atomic_bool>& cancelled) {
+    // Three windows: a measured read of a 187-line file with six took 96 lines although one window held the answer.
+    constexpr uint64_t intent_read_lines = 72, intent_window_lines = 24, intent_window_step = 12;
+    constexpr size_t intent_max_windows = 3;
+    const std::string path = target.display();
+    if (target.parts.empty()) fail(path + " is a configured root directory; use list_dir");
+    std::string raw;
+    FILE_BASIC_INFO basic{};
+    {
+        Handle directory = open_parent(target, false);
+        Handle file = open_file(directory.h, target, share_all);
+        basic = basic_info(file.h, path);
+        if (!read_all(file.h, path, max_text_bytes, raw))
+            fail(path + " is larger than 64 MiB; read it with offset/limit or search it");
+    }
+    const TextFile text = decode(raw);
+    if (text.binary) fail(path + " is binary; use search_bytes");
+    if (context.record_user_reads)
+        remember_read_snapshot(context, fs::path(target.full(target.parts.size())), sha256_hex(raw));
+    out += file_header(header_path, raw, text, basic, metadata);
+    std::vector<std::string_view> lines;
+    {
+        const std::string_view all = text.text;
+        size_t pos = 0;
+        while (pos < all.size()) {
+            const size_t newline = all.find('\n', pos);
+            size_t end = newline == std::string_view::npos ? all.size() : newline;
+            if (newline != std::string_view::npos && end > pos && all[end - 1] == '\r') --end;
+            lines.push_back(all.substr(pos, end - pos));
+            pos = newline == std::string_view::npos ? all.size() : newline + 1;
+        }
+    }
+    if (lines.empty()) { out += "[empty file]\n"; return; }
+    // Window texts are built first: the candidates view them, so the vector must not move afterwards.
+    struct Window { uint64_t first = 0, last = 0; std::string code; };  // 0-based [first, last)
+    std::vector<Window> windows;
+    for (uint64_t first = 0; first < lines.size(); first += intent_window_step) {
+        Window window{first, std::min<uint64_t>(lines.size(), first + intent_window_lines), {}};
+        for (uint64_t i = window.first; i < window.last; ++i) {
+            window.code.append(lines[i]);
+            window.code.push_back('\n');
+        }
+        windows.push_back(std::move(window));
+        if (windows.back().last == lines.size()) break;
+    }
+    const std::string absolute = utf8(target.full(target.parts.size()));  // the meaning index keys files by full path
+    std::vector<RankCandidate> candidates;
+    candidates.reserve(windows.size());
+    for (const Window& window : windows)
+        candidates.push_back(RankCandidate{absolute, window.first + 1, window.last, window.code});
+    Ranker ranker(intent);
+    ranker.set_per_file(0);  // every window is the same file; the line budget below bounds the output
+    // The meaning index holds LSP code files only; other files rank by BM25 alone.
+    const bool dense = embed_built() && lsp_read_required(fs::path(target.full(target.parts.size())), {});
+    if (dense) ranker.set_dense(meaning_hunk_scorer(intent, context, request_deadline(Clock::time_point::max())), meaning_weight());
+    const std::vector<Ranked> ranked = ranker.rank(candidates, cancelled);
+    if (ranked.empty() || (!dense && std::none_of(ranked.begin(), ranked.end(), [](const Ranked& pick) { return pick.score > 0; }))) {
+        out += "[intent: no line of this file contains the intent's words; read without intent for the outline, or "
+               "pass offset/limit for a raw window]\n";
+        return;
+    }
+    std::vector<char> picked(lines.size(), 0);
+    uint64_t used = 0;
+    size_t windows_used = 0;
+    for (const Ranked& pick : ranked) {
+        if (used >= intent_read_lines || windows_used == intent_max_windows) break;
+        const Window& window = windows[pick.index];
+        uint64_t added = 0;
+        for (uint64_t i = window.first; i < window.last && used < intent_read_lines; ++i)
+            if (!picked[i]) { picked[i] = 1; ++used; ++added; }
+        if (added) ++windows_used;
+    }
+    // Short gaps cost less shown than marked.
+    for (uint64_t i = 0; i < lines.size();) {
+        if (picked[i]) { ++i; continue; }
+        uint64_t end = i;
+        while (end < lines.size() && !picked[end]) ++end;
+        if (i > 0 && end < lines.size() && end - i <= 2)
+            for (uint64_t g = i; g < end; ++g) picked[g] = 1;
+        i = end;
+    }
+    uint64_t shown = 0;
+    for (uint64_t i = 0; i < lines.size();) {
+        if (cancelled && cancelled->load()) fail("read_file cancelled");
+        uint64_t end = i;
+        while (end < lines.size() && picked[end] == picked[i]) ++end;
+        if (picked[i]) {
+            for (uint64_t k = i; k < end; ++k) {
+                out += std::to_string(k + 1) + " | ";
+                out.append(lines[k]);
+                out.push_back('\n');
+            }
+            shown += end - i;
+        } else {
+            out += end - i == 1 ? "... line " + std::to_string(i + 1) + " skipped\n"
+                                : "... lines " + std::to_string(i + 1) + "-" + std::to_string(end) + " skipped\n";
+        }
+        i = end;
+    }
+    const Window& best = windows[ranked.front().index];
+    out += "[intent: showed " + std::to_string(shown) + " of " + std::to_string(lines.size()) + " lines in " +
+           std::to_string(windows_used) + (windows_used == 1 ? " window" : " windows") + ", ranked by " +
+           (dense ? "meaning + BM25" : "BM25") + "; best match lines " + std::to_string(best.first + 1) + "-" +
+           std::to_string(best.last) + ". For more, pass offset/limit for a raw window or read a symbol with "
+           "lsp method=lsp.read_symbol]\n";
 }
 
 // "json" (default) or "compact"/"outline": how a symbol overview is shown.
@@ -853,8 +1000,36 @@ Json semantic_file_result(const Json& result, const Json& file) {
 
 std::string semantic_read_notes(const Json& result) {
     std::string out;
-    if (const Json* partial = result.get("partial"); partial && partial->boolean())
-        out += "[partial results: the language server is still indexing]\n";
+    if (const Json* partial = result.get("partial"); partial && partial->boolean()) {
+        // A folder walk cut short names how far it got; otherwise partial means a server still indexing.
+        const Json* note = result.get("coverage_note");
+        out += note && std::holds_alternative<std::string>(note->value)
+            ? "[partial results: " + note->string() + "]\n"
+            : std::string("[partial results: the language server is still indexing]\n");
+    }
+    if (const Json* warming = result.get("index_warming")) {
+        const auto show = [&](const Json& details) {
+            if (!std::holds_alternative<Json::Object>(details.value)) return;
+            const auto text = [&](const char* key) {
+                const Json* item = details.get(key);
+                return item && std::holds_alternative<std::string>(item->value) ? item->string() : std::string{};
+            };
+            std::string line = text("server");
+            if (line.empty()) line = "language server";
+            const std::string busy = text("indexing");
+            line += busy.empty() ? ": indexing progress unavailable" : ": " + busy;
+            if (const Json* count = details.get("file_count"); count && std::holds_alternative<int64_t>(count->value))
+                line += " (" + std::to_string(count->integer()) + " files affected)";
+            out += "[index progress: " + line + "]\n";
+        };
+        if (std::holds_alternative<Json::Array>(warming->value))
+            for (const auto& details : warming->array()) show(details);
+        else show(*warming);
+    }
+    if (const Json* skipped = result.get("skipped_note"); skipped && std::holds_alternative<std::string>(skipped->value))
+        out += "[skipped: " + skipped->string() + "]\n";
+    if (const Json* unanswered = result.get("unanswered_note"); unanswered && std::holds_alternative<std::string>(unanswered->value))
+        out += "[unanswered: " + unanswered->string() + "]\n";
     if (const Json* errors = result.get("errors"))
         for (const auto& error : errors->array())
             out += "[error " + error.get("path")->string() + ": " + error.get("error")->string() + "]\n";
@@ -1013,12 +1188,15 @@ void slice_symbol_bodies(Json& result, uint64_t first, uint64_t limit,
 }
 
 Json read_file(const Json& args, const SearchContext& context, const std::shared_ptr<std::atomic_bool>& cancelled) {
+    // Default page of a text file, and the largest raw window of a code file (see the CONTRACT below).
+    constexpr uint64_t text_page_lines = 100, code_window_lines = 100;
     const std::vector<std::string> paths = path_args(args);
     ReadOptions options;
     options.cancelled = cancelled;
     options.offset = static_cast<uint64_t>(int_arg(args, "offset", 1, 1, INT64_MAX));
     options.limit = args.get("limit") ? static_cast<uint64_t>(int_arg(args, "limit", 1, 1, INT64_MAX)) : UINT64_MAX;
     options.numbers = bool_arg(args, "line_numbers", false);
+    options.metadata = bool_arg(args, "metadata", false);
     const std::string operation = args.get("operation") ? string_arg(args, "operation") : "auto";
     if (operation != "auto" && operation != "text" && operation != "overview" && operation != "symbol")
         fail("read_file operation must be auto, text, overview, or symbol");
@@ -1037,6 +1215,16 @@ Json read_file(const Json& args, const SearchContext& context, const std::shared
         fail("depth/include_kinds/exclude_kinds require a symbol read");
     if ((args.get("offset") || args.get("limit")) && operation == "overview")
         fail("offset/limit require text or symbol reads");
+    // intent: a task-conditioned read (render_intent_lines) that picks the file's lines itself.
+    std::string intent = args.get("intent") ? string_arg(args, "intent") : std::string();
+    if (intent.find_first_not_of(" \t\r\n") == std::string::npos) intent.clear();
+    if (!intent.empty()) {
+        if (symbol_read) fail("intent reads the lines of a whole file; drop name_path, or drop intent to read the symbol");
+        if (args.get("offset") || args.get("limit"))
+            fail("intent picks the lines itself (at most 72); drop offset/limit, or drop intent for a raw window");
+        if (operation == "overview") fail("operation=overview takes no intent");
+        if (args.get("format")) fail("format is only for symbol reads and overviews");
+    }
     std::string out, access_note, common_folder;
     if (paths.size() > 1) {
         try {
@@ -1065,11 +1253,27 @@ Json read_file(const Json& args, const SearchContext& context, const std::shared
             const bool allow_fallback = bool_arg(args, "allow_text_fallback", false);
             bool directory = false;
             const SourceText descriptor = source_descriptor(context, path, &directory);
-            // CONTRACT: a code file is read only through LSP. A text read of one (operation=text, offset, limit) gets
-            //   its outline; plain text needs allow_text_fallback=true and a failing server (see lsp_read_required).
-            const bool redirected = text_mode && !symbol_read && !directory && lsp_read_required(descriptor.path);
+            if (!intent.empty()) {
+                if (directory) fail(path + " is a folder; intent reads one file");
+                const Target target = resolve(context, path);
+                std::string header_path = target.display();
+                std::string basename;
+                if (!common_folder.empty() && !target.parts.empty() && try_utf8(target.name(), basename)) {
+                    if (!folder_shown) { out += "[folder " + common_folder + "]\n"; folder_shown = true; }
+                    header_path = std::move(basename);
+                }
+                render_intent_lines(out, target, intent, header_path, options.metadata, context, cancelled);
+                return;
+            }
+            // CONTRACT: a code file without offset/limit (auto or operation=text) returns its LSP outline. offset/limit
+            //   select a window of its raw lines, at most code_window_lines per call: 100-line windows beat whole
+            //   files for agents (SWE-agent, arXiv 2405.15793), and a sanctioned window removes the reason to dump
+            //   code through search ".*". The whole text still needs allow_text_fallback=true and a failing server.
+            const bool code = !symbol_read && !directory && lsp_read_required(descriptor.path, descriptor.root);
+            const bool window = code && (args.get("offset") || args.get("limit"));
+            const bool redirected = text_mode && code && !window;
             const bool semantic = redirected || (!text_mode && (directory || operation != "auto" ||
-                                                  args.get("name_path") || lsp_required(descriptor.path)));
+                                                  args.get("name_path") || lsp_required(descriptor.path, descriptor.root)));
             if (semantic) {
                 path_semantic = true;
                 semantic_attempted = true;
@@ -1079,6 +1283,7 @@ Json read_file(const Json& args, const SearchContext& context, const std::shared
                 Json::Object query = args.object();
                 query.erase("paths"); query.erase("format"); query.erase("allow_text_fallback"); query["path"] = path;
                 query.erase("offset"); query.erase("limit"); query.erase("outline_first");
+                query.erase("intent"); query.erase("metadata");  // read_file presentation options, not LSP query fields
                 if (redirected || symbol_read) query.erase("line_numbers");
                 query["include_body"] = symbol_read;
                 if (symbol_read && !directory) query["require_match"] = true;
@@ -1095,9 +1300,10 @@ Json read_file(const Json& args, const SearchContext& context, const std::shared
                         metadata.erase("results");
                         semantic_files.emplace_back(std::move(metadata));
                     } else {
-                        if (redirected && (args.get("offset") || args.get("limit")))
-                            out += "[" + path + ": code files are read through LSP, so offset/limit were not applied; "
-                                   "read one symbol with lsp method=lsp.read_symbol]\n";
+                        if (redirected)
+                            out += "[" + path + ": a code file returns its outline; pass offset/limit for up to " +
+                                   std::to_string(code_window_lines) + " raw lines, or read one symbol with lsp "
+                                   "method=lsp.read_symbol]\n";
                         out += compact_outline(result);
                     }
                     return;
@@ -1110,7 +1316,16 @@ Json read_file(const Json& args, const SearchContext& context, const std::shared
                 }
             }
             ReadOptions text_options = options;
-            if (!args.get("limit")) text_options.limit = 100;
+            if (!args.get("limit")) text_options.limit = window ? code_window_lines : text_page_lines;
+            else if (window && text_options.limit > code_window_lines) {
+                text_options.limit = code_window_lines;
+                out += "[" + path + ": code windows show at most " + std::to_string(code_window_lines) +
+                       " lines per call; continue with the offset in the status line]\n";
+            }
+            // Room for the status line, so a paged response stays under the offload threshold and is not copied.
+            constexpr size_t status_reserve = 256;
+            if (context.text_page_bytes)
+                text_options.max_out = context.text_page_bytes > status_reserve ? context.text_page_bytes - status_reserve : 0;
             const Target target = resolve(context, path);
             std::string header_path = target.display();
             std::string basename;
@@ -1307,6 +1522,8 @@ void list_tree(Listing& s, HANDLE directory, const std::wstring& path, const std
         s.budget.take(line);
         s.out += line;
         ++s.entries;
+        // Shown to the model; a missing language server for this file type is named after the call (#101).
+        if (!is_directory && !link) lsp_note_listed_file(name);
         if (!is_directory || link || depth <= 1) continue;
         bool denied = false;
         Handle sub(open_relative(directory, entry.name, true, denied));
@@ -1522,15 +1739,7 @@ std::unique_ptr<StagedWrite> stage_write(HANDLE directory, const Target& target,
     }
     return staged;
 }
-bool same_file(HANDLE a, HANDLE b) {
-    FILE_ID_INFO x{}, y{};
-    if (GetFileInformationByHandleEx(a, FileIdInfo, &x, sizeof(x)) && GetFileInformationByHandleEx(b, FileIdInfo, &y, sizeof(y)))
-        return x.VolumeSerialNumber == y.VolumeSerialNumber && std::memcmp(&x.FileId, &y.FileId, sizeof(x.FileId)) == 0;
-    BY_HANDLE_FILE_INFORMATION p{}, q{};  // volumes without 128-bit file ids
-    return GetFileInformationByHandle(a, &p) && GetFileInformationByHandle(b, &q) &&
-           p.dwVolumeSerialNumber == q.dwVolumeSerialNumber && p.nFileIndexHigh == q.nFileIndexHigh &&
-           p.nFileIndexLow == q.nFileIndexLow;
-}
+bool same_file(HANDLE a, HANDLE b) { return same_file_object(a, b); }
 // SAFETY: the original stays open with share-delete, so another program can rename a new file over its path, as an
 //   editor's atomic save does. The commit goes ahead only while the path still names the file whose bytes were
 //   checked; otherwise that save would be silently overwritten.
@@ -1912,36 +2121,20 @@ void apply_edit(std::string& content, const Edit& edit, Eol eol, size_t index, s
     const std::string where = total > 1 ? "edit " + std::to_string(index + 1) + " of " + std::to_string(total) : "the edit";
     if (edit.old_text.empty()) fail(where + ": old_text is empty");
     if (edit.old_text == edit.new_text) fail(where + ": old_text and new_text are identical");
-    std::vector<std::pair<std::string, std::string>> forms;
-    if (eol == Eol::lf || eol == Eol::crlf || eol == Eol::cr) {
-        forms.emplace_back(replace_newlines(edit.old_text, eol_text(eol)), replace_newlines(edit.new_text, eol_text(eol)));
-    } else {
-        forms.emplace_back(edit.old_text, edit.new_text);
-        if (eol == Eol::mixed) {
-            for (std::string_view ending : {std::string_view("\n"), std::string_view("\r\n")}) {
-                std::pair<std::string, std::string> form{replace_newlines(edit.old_text, ending),
-                                                         replace_newlines(edit.new_text, ending)};
-                if (std::find(forms.begin(), forms.end(), form) == forms.end()) forms.push_back(std::move(form));
-            }
-        }
-    }
-    const std::pair<std::string, std::string>* chosen = nullptr;
-    size_t count = 0;
-    for (const auto& form : forms) {
-        if ((count = count_matches(content, form.first, cancelled)) != 0) { chosen = &form; break; }
-    }
-    if (!chosen) {
+    const LogicalText logical(content);
+    const std::string needle = LogicalText(edit.old_text).text;
+    const size_t count = count_matches(logical.text, needle, cancelled);
+    if (!count) {
         std::string message = where + ": old_text was not found";
         if (index > 0) message += " (in the text produced by the earlier edits)";
-        // A hint for the common near miss: the first line matches but whitespace further on does not.
-        std::string_view first = edit.old_text;
+        std::string_view first = needle;
         first = first.substr(0, first.find('\n'));
         while (!first.empty() && std::isspace(static_cast<unsigned char>(first.front()))) first.remove_prefix(1);
         while (!first.empty() && std::isspace(static_cast<unsigned char>(first.back()))) first.remove_suffix(1);
-        if (first.size() >= 4 && first.size() < edit.old_text.size()) {
-            const size_t at = content.find(first);
+        if (first.size() >= 4 && first.size() < needle.size()) {
+            const size_t at = logical.text.find(first);
             if (at != std::string::npos)
-                message += "; its first line occurs at line " + std::to_string(line_at(content, at)) +
+                message += "; its first line occurs at line " + std::to_string(line_at(logical.text, at)) +
                            ", so compare the rest, including indentation and trailing spaces";
         }
         fail(message + ". Nothing was written.");
@@ -1949,25 +2142,32 @@ void apply_edit(std::string& content, const Edit& edit, Eol eol, size_t index, s
     if (count > 1 && !edit.replace_all) {
         std::string lines;
         size_t shown = 0;
-        for (size_t pos = content.find(chosen->first); pos != std::string::npos && shown < 5;
-             pos = content.find(chosen->first, pos + chosen->first.size()), ++shown)
-            lines += (lines.empty() ? "" : ", ") + std::to_string(line_at(content, pos));
+        for (size_t pos = logical.text.find(needle); pos != std::string::npos && shown < 5;
+             pos = logical.text.find(needle, pos + needle.size()), ++shown)
+            lines += (lines.empty() ? "" : ", ") + std::to_string(line_at(logical.text, pos));
         fail(where + ": old_text matches " + std::to_string(count) + " times (at lines " + lines +
              (count > 5 ? ", ..." : "") + "); include more surrounding text to make it unique, or set replace_all. "
              "Nothing was written.");
     }
     std::string next;
-    next.reserve(content.size() + (chosen->second.size() > chosen->first.size()
-                                       ? (chosen->second.size() - chosen->first.size()) * count : 0));
-    size_t pos = 0;
-    for (size_t at = content.find(chosen->first); at != std::string::npos;
-         at = edit.replace_all ? content.find(chosen->first, at + chosen->first.size()) : std::string::npos) {
+    next.reserve(content.size());
+    size_t cursor = 0;
+    for (size_t at = logical.text.find(needle); at != std::string::npos;
+         at = edit.replace_all ? logical.text.find(needle, at + needle.size()) : std::string::npos) {
         check_cancelled(cancelled);
-        next.append(content, pos, at - pos);
-        next += chosen->second;
-        pos = at + chosen->first.size();
+        const size_t first = logical.raw(at), last = logical.raw(at + needle.size());
+        const std::string replacement = preserve_line_endings(
+            std::string_view(content).substr(first, last - first), edit.new_text,
+            nearby_line_ending(content, first, eol == Eol::none ? std::string_view(logical.eol) : eol_text(eol)), cancelled);
+        if (first - cursor > max_text_bytes || replacement.size() > max_text_bytes - (first - cursor) ||
+            next.size() > max_text_bytes - (first - cursor) - replacement.size()) fail("edited text exceeds 64 MiB");
+        next.append(content, cursor, first - cursor);
+        next += replacement;
+        cursor = last;
     }
-    next.append(content, pos, std::string::npos);
+    if (content.size() - cursor > max_text_bytes || next.size() > max_text_bytes - (content.size() - cursor))
+        fail("edited text exceeds 64 MiB");
+    next.append(content, cursor, std::string::npos);
     content = std::move(next);
     replacements += edit.replace_all ? count : 1;
 }
@@ -1991,7 +2191,8 @@ Json edit_file(const Json& args, const SearchContext& context, const CancelFlag&
     check_guards(args, path, raw, basic);
     const fs::path snapshot_path(target.full(target.parts.size()));
     const std::string before_digest = sha256_hex(raw);
-    if (!dry_run) require_read_snapshot(context, snapshot_path, before_digest, args.get("expected_sha256") != nullptr);
+    // Every edit here is an exact old_text that must match the current bytes, which proves the caller knew the replaced
+    // text; no earlier session read is required (the expected_sha256/mtime guards above still apply when given).
     const TextFile text = decode(raw);
     if (text.binary) fail(path + " is binary (NUL byte at offset " + std::to_string(text.nul_offset) + "); edit_file edits text only");
     if (text.invalid)
@@ -2597,13 +2798,16 @@ Json write_file(const Json& args, const SearchContext& context, const CancelFlag
     const bool exists = status >= 0;
     DWORD attributes = 0;
     uint64_t old_lines = 0;
+    // A replaced file with mixed endings keeps each matched line's own ending (F4); old_text is its decoded text.
+    bool preserve_mixed = false;
+    std::string old_text;
     if (status == status_is_directory) fail(path + " is a directory");
     if (!exists && static_cast<uint32_t>(status) != 0xC0000034)
         fail(path + ": " + status_text(status));
     if (exists) {
         refuse_link(existing.h, path);
         if (!overwrite) fail(path + " already exists; pass overwrite: true to replace it. Nothing was written.");
-        if (!checked_exists && !hash_guarded && lsp_required(descriptor.path))
+        if (!checked_exists && !hash_guarded && lsp_required(descriptor.path, descriptor.root))
             fail(path + " appeared during creation; retry through LSP. Nothing was written.");
         const FILE_BASIC_INFO basic = basic_info(existing.h, path);
         if (basic.FileAttributes & FILE_ATTRIBUTE_READONLY) fail(path + " is read-only; nothing was written");
@@ -2627,8 +2831,17 @@ Json write_file(const Json& args, const SearchContext& context, const CancelFlag
             if (!encoding_given) encoding = old.encoding;
             if (endings.empty()) {
                 const Eol style = eol_style(old);
-                if (style == Eol::crlf || (style == Eol::mixed && old.crlf >= old.lf)) endings = "crlf";
-                else if (style == Eol::lf || style == Eol::mixed) endings = "lf";
+                if (style == Eol::mixed) {
+                    // SAFETY (F4): flattening every ending would rewrite lines the caller did not change. Only an
+                    // explicit line_endings/eol normalizes; otherwise matched lines keep theirs, new ones follow the
+                    // line before (as edit_file does).
+                    if (raw.empty())
+                        fail(path + " has mixed line endings and is too large to keep them line by line; pass "
+                             "line_endings (lf, crlf or cr) to normalize the whole file. Nothing was written.");
+                    preserve_mixed = true;
+                    old_text = std::move(old.text);
+                } else if (style == Eol::crlf) endings = "crlf";
+                else if (style == Eol::lf) endings = "lf";
                 else if (style == Eol::cr) endings = "cr";
             }
         }
@@ -2642,7 +2855,9 @@ Json write_file(const Json& args, const SearchContext& context, const CancelFlag
     if (!exists && endings.empty() && content.find_first_of("\r\n") != std::string::npos)
         endings = eol_for_new_file(directory.h, target, content, cancelled);
     std::string text;
-    if (endings.empty()) {
+    if (preserve_mixed) {
+        text = preserve_line_endings(old_text, content, "\n", cancelled);
+    } else if (endings.empty()) {
         text = content;
     } else {
         const std::string_view eol = endings == "crlf" ? "\r\n" : endings == "cr" ? "\r" : "\n";
@@ -2901,7 +3116,7 @@ SourceText source_descriptor(const SearchContext& context, const std::string& pa
     }
     if (exists) *exists = present;
     if (directory) *directory = item && (attributes_of(item.h, target.display()) & FILE_ATTRIBUTE_DIRECTORY);
-    return {fs::path(target.full(target.parts.size())), fs::path(target.root), {}, {}};
+    return {fs::path(target.full(target.parts.size())), fs::path(target.root), {}, {}, {}, target.first_root};
 }
 
 namespace {
@@ -2924,9 +3139,12 @@ RequestDeadline::~RequestDeadline() {
 std::string render_semantic_text(const Json& result, bool outline,
                                  const std::shared_ptr<std::atomic_bool>& cancelled, bool line_numbers,
                                  bool symbol_text) {
+    // A result that exists is rendered even when producing it used the whole request deadline (a compiler check that
+    // timed out still returns its captured output); rendering itself gets a bounded allowance past that deadline.
+    const auto finish_by = std::max(request_deadline(Clock::time_point::max()), Clock::now() + std::chrono::seconds(2));
     const auto check = [&] {
         if (cancelled && cancelled->load()) fail("response rendering cancelled");
-        if (Clock::now() >= request_deadline(Clock::time_point::max())) fail("response rendering timed out");
+        if (Clock::now() >= finish_by) fail("response rendering timed out");
     };
     check();
     if (const auto* text = std::get_if<std::string>(&result.value)) return *text;
@@ -3088,7 +3306,8 @@ Json apply_source_changes(const std::vector<SourceChange>& changes, const Json& 
         const fs::path snapshot_path(p->target.full(p->target.parts.size()));
         const std::string digest = sha256_hex(p->old_bytes);
         if (dry) preview_snapshots.emplace_back(snapshot_path, digest);
-        else require_read_snapshot(context, snapshot_path, digest, is_primary && arguments.get("expected_sha256"));
+        else if (!change.anchored)
+            require_read_snapshot(context, snapshot_path, digest, is_primary && arguments.get("expected_sha256"));
         const TextFile text = decode(p->old_bytes);
         if (text.binary || text.invalid || text.text != change.before.text) fail("workspace edit snapshot mismatch");
         if (!dry && (p->basic.FileAttributes & FILE_ATTRIBUTE_READONLY)) fail(p->target.display() + " is read-only; nothing was written");
@@ -3220,6 +3439,29 @@ void create_workspace_metadata_directory(const SearchContext& context, const fs:
     refuse_link(directory.h, target.display());
 }
 
+// SAFETY (#93): the folder `path` and its missing parents, made one component at a time from the configured root with
+// no link or junction followed (as create_workspace_metadata_directory). Every component stays open without delete
+// sharing while the returned pin lives, so none can be renamed, removed or replaced by a junction while a child
+// process uses the path. shgrep's own state, so --read-only does not refuse it.
+std::shared_ptr<void> pin_workspace_metadata_directory(const SearchContext& context, const fs::path& path) {
+    const Target target = resolve(context, utf8(path.wstring()));
+    if (target.parts.empty()) fail("metadata path names a configured root");
+    std::lock_guard lock(write_mutex());
+    auto pins = std::make_shared<std::vector<Handle>>();
+    Handle root = open_root(target);
+    constexpr ULONG share_no_delete = FILE_SHARE_READ | FILE_SHARE_WRITE;
+    for (size_t i = 0; i < target.parts.size(); ++i) {
+        Handle child;
+        const NTSTATUS status = nt_open(pins->empty() ? root.h : pins->back().h, target.parts[i], directory_access,
+                                        share_no_delete, disposition_open_if, option_directory | option_open_reparse_point,
+                                        0, child);
+        if (status < 0) fail(target.display(i + 1) + ": " + status_text(status));
+        refuse_link(child.h, target.display(i + 1));
+        pins->push_back(std::move(child));
+    }
+    return pins;
+}
+
 // Opens the metadata file `path` emptied for writing, through the same no-link handles; inheritable, for a child
 // process's output. Others may read it meanwhile.
 HANDLE create_workspace_metadata_log(const SearchContext& context, const fs::path& path) {
@@ -3298,6 +3540,23 @@ Json save_output_artifact(const SearchContext& context, const std::function<bool
 
 std::string source_text_digest(std::string_view text) { return sha256_hex(text); }
 
+// SHA-256 of a whole file's bytes, read sequentially in 1 MiB blocks (for large files such as model weights).
+std::string file_sha256(const fs::path& path) {
+    Handle file(CreateFileW(long_path(path.wstring()).c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                            FILE_FLAG_SEQUENTIAL_SCAN, nullptr));
+    if (!file) fail(utf8(path.wstring()) + ": cannot open it to fingerprint (" + win32_text(GetLastError()) + ")");
+    Sha256 hash;
+    std::string buffer(size_t{1} << 20, '\0');
+    for (;;) {
+        DWORD got = 0;
+        if (!ReadFile(file.h, buffer.data(), static_cast<DWORD>(buffer.size()), &got, nullptr))
+            fail(utf8(path.wstring()) + ": read failed while fingerprinting (" + win32_text(GetLastError()) + ")");
+        if (!got) break;
+        hash.add(std::string_view(buffer.data(), got));
+    }
+    return hash.hex();
+}
+
 static std::wstring snapshot_key(const fs::path& path) {
     // Windows directories can be case-sensitive. Different spellings must never share a guard.
     return path.lexically_normal().wstring();
@@ -3329,6 +3588,19 @@ void require_read_snapshot(const SearchContext& context, const fs::path& path,
         fail("file changed since it was read in this session; read it again; nothing was written");
 }
 
+// The first max_bytes of a file, through the same guarded open as read_source_text; no decoding, no snapshot.
+std::string read_source_head(const SearchContext& context, const std::string& path, size_t max_bytes) {
+    const Target target = resolve(context, path);
+    if (target.parts.empty()) fail("expected a file: " + path);
+    Handle parent = open_parent(target, false);
+    Handle file = open_file(parent.h, target, share_all);
+    std::string head(max_bytes, '\0');
+    DWORD read = 0;
+    if (!ReadFile(file.h, head.data(), static_cast<DWORD>(head.size()), &read, nullptr)) fail(path + ": cannot read its first bytes");
+    head.resize(read);
+    return head;
+}
+
 SourceText read_source_text(const SearchContext& context, const std::string& path) {
     const Target target = resolve(context, path);
     if (target.parts.empty()) fail("expected a file: " + path);
@@ -3339,7 +3611,8 @@ SourceText read_source_text(const SearchContext& context, const std::string& pat
     TextFile text = decode(raw);
     if (text.binary || text.invalid) fail(path + " is not valid Unicode source text");
     return {std::filesystem::path(target.full(target.parts.size())), std::filesystem::path(target.root),
-            std::move(text.text), sha256_hex(raw), format_mtime(basic_info(file.h, path).LastWriteTime.QuadPart)};
+            std::move(text.text), sha256_hex(raw), format_mtime(basic_info(file.h, path).LastWriteTime.QuadPart),
+            target.first_root};
 }
 
 std::filesystem::path executable_directory() {
@@ -3433,8 +3706,8 @@ Json file_lsp_availability(const Json& arguments, const SearchContext& context, 
     const SourceText source = source_descriptor(context, path, &directory);
     if (directory) fail("availability requires a file, not a directory");
     Json::Object result{{"path", path}, {"fallback_eligible", false},
-                        {"requires_text_fallback", lsp_required(source.path)}};
-    if (!lsp_required(source.path)) {
+                        {"requires_text_fallback", lsp_required(source.path, source.root)}};
+    if (!lsp_required(source.path, source.root)) {
         result["state"] = "not_applicable";
         result["reason"] = "This file does not require LSP for text edits.";
         return result;
@@ -3518,8 +3791,10 @@ Json run_file_tool(const std::string& name, const Json& arguments, const SearchC
         catch (const LspFailure&) { throw; }
     }
     if (name == "file_info") {
+        if (arguments.get("check") && string_arg(arguments, "check") != "lsp" && arguments.get("paths"))
+            fail("external checks require one path; paths is not supported");
         if (operation != "diagnostics")
-            for (const char* key : {"start_line", "end_line", "group_by_symbol"})
+            for (const char* key : {"start_line", "end_line", "group_by_symbol", "check"})
                 if (arguments.get(key)) fail(std::string(key) + " requires operation=diagnostics");
         if (arguments.get("detail") && operation != "lsp" && operation != "restart")
             fail("detail is only for LSP status or restart");
@@ -3581,7 +3856,7 @@ Json run_file_tool(const std::string& name, const Json& arguments, const SearchC
     if (rollback) {
         const std::string path = string_arg(arguments, "path");
         const SourceText descriptor = source_descriptor(context, path, nullptr, true, &baseline.existed);
-        baseline.applies = lsp_required(descriptor.path);
+        baseline.applies = lsp_required(descriptor.path, descriptor.root);
         if (baseline.applies) {
             try {
                 if (baseline.existed) {
@@ -3677,7 +3952,8 @@ Json run_file_tool(const std::string& name, const Json& arguments, const SearchC
             Json::Array reports;
             for (const auto& path : diagnostic_paths) {
                 try {
-                    if (!lsp_required(source_descriptor(context, path).path)) continue;
+                    const SourceText checked = source_descriptor(context, path);
+                    if (!lsp_required(checked.path, checked.root)) continue;
                     const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - Clock::now()).count();
                     if (remaining < 1) fail("diagnostics time budget exhausted");
                     Json::Object query{{"path", path}, {"severity", 1}, {"timeout_ms", static_cast<int64_t>(remaining)}};
@@ -3771,148 +4047,6 @@ Json run_file_tool(const std::string& name, const Json& arguments, const SearchC
 // CONTRACT: these descriptions are the model's only documentation of the tools; every statement must match the
 // implementation. Update them with any behavior change.
 Json file_tool_definitions(bool read_only) {
-    // PERF: sent to the model with every session; keep only what an agent needs to call correctly.
-    auto schema = [](Json::Object properties, Json::Array required = {}) -> Json {
-        Json::Object out{{"type", "object"}, {"properties", std::move(properties)}, {"additionalProperties", false}};
-        if (!required.empty()) out.emplace("required", std::move(required));
-        return out;
-    };
-    auto field = [](const char* type, const char* description) -> Json {
-        return Json::Object{{"type", type}, {"description", description}};
-    };
-    auto choice = [](Json::Array values, const char* description) -> Json {
-        return Json::Object{{"type", "string"}, {"enum", std::move(values)}, {"description", description}};
-    };
-    const char* path_text = "Relative to the first root, or absolute inside a root.";
-    const Json path = field("string", path_text);
-    const Json paths = Json::Object{{"type", "array"}, {"items", Json::Object{{"type", "string"}}},
-        {"description", "Up to 32 paths instead of path."}};
-    const Json max_output = field("integer", "Optional byte cap, 512-1048576. Default unlimited.");
-    const Json expected_sha256 = field("string", "Expected SHA-256 from read_file or file_info. Without it, existing files must match this session's latest file/symbol read or dry-run preview; multi-file edits require a snapshot for each file. Direct tools share history with the default REPL; named sessions have separate history. Use the same path spelling for reads and edits. Text search does not establish a snapshot.");
-    const Json expected_mtime = field("string", "Fail if the file's mtime (from read_file) changed.");
-    const Json text_fallback = field("boolean", "Semantic fallback and unrestricted text writes only: require unavailable/failing LSP. Read-only text access needs no fallback permission.");
-    const std::string common_paths = " Links are never followed.";
-
-    Json::Array tools;
-    tools.push_back(Json::Object{{"name", "read_file"}, {"description",
-        "Read non-code files as text with operation=text, or use LSP overviews and symbol bodies. A text read of a code file returns its LSP outline. "
-        "Symbol offset/limit selects lines relative to its definition; format=outline shows kind, name and line range. "
-        "Plain text of a code file requires allow_text_fallback=true and a failing or missing language server. "
-        "No output byte cap. Every header ends with its source: lsp (a language server) or text (plain file text). Text headers include encoding, mtime and sha256; multi-file reads with a common parent show that folder once. Binary and ordinary files >256 MiB refused (UTF-16 >64 MiB); saved UTF-8 outputs under .shgrep-output can be paged without that size cap." + common_paths},
-        {"inputSchema", schema(Json::Object{{"path", path}, {"paths", paths},
-            {"allow_text_fallback", field("boolean", "Permit a plain text read of a code file, honoring offset/limit, only when its language server fails or is missing. Unavailable for directories or symbol reads with offset/limit. Non-code text reads need no permission. Default false.")},
-            {"outline_first", field("boolean", "Accepted for compatibility; code files always return their LSP outline instead of text.")},
-            {"offset", field("integer", "First line, from 1. Non-code text files and symbol bodies only.")},
-            {"limit", field("integer", "Line limit per non-code text file or selected symbol; ignored for a code file, which returns its outline. Text reads default to 100 lines; symbol reads default to all remaining lines.")},
-            {"operation", choice(Json::Array{"auto", "overview", "symbol", "text"}, "Default auto: LSP for programming/XML; text for other formats. No automatic fallback.")},
-            {"name_path", field("string", "Read this symbol; offset/limit selects a body slice. Type/method accepts Rust impl wrappers; append #kind (e.g. ClassName#ctor). A plain generic type name resolves when unique; multiple generic matches return candidates. Other ambiguities return candidates; overloads take an index such as Name[0]. No parent is selected.")},
-            {"full_lines", field("boolean", "Symbol reads: include complete touched source lines and return body_range; inline lines may contain neighboring code. Default false.")},
-            {"include_kinds", Json::Object{{"type", "array"}, {"items", Json::Object{{"type", "integer"}}}, {"description", "LSP kinds 1-26 to include."}}},
-            {"exclude_kinds", Json::Object{{"type", "array"}, {"items", Json::Object{{"type", "integer"}}}, {"description", "LSP kinds to exclude."}}},
-            {"depth", field("integer", "Overview child depth; default -1 (all).")},
-            {"format", choice(Json::Array{"json", "compact", "outline"}, "Overview defaults to json with numeric kind and kind_name; compact/outline shows named kinds and line ranges.")},
-            {"timeout_ms", field("integer", "LSP deadline, 1-300000; default 180000 for semantic operations and 30000 for text/filesystem operations.")},
-            {"line_numbers", field("boolean", "Text and symbol text presentation: include line prefixes; default false. Structured symbol bodies are unchanged.")}})}});
-    tools.push_back(Json::Object{{"name", "list_dir"}, {"description",
-        "List files and folders: \"d sub/\", \"f name SIZE\", \"l link\"." + common_paths},
-        {"inputSchema", schema(Json::Object{
-            {"path", field("string", "Folder; default the first root.")},
-            {"operation", choice(Json::Array{"filesystem", "overview"}, "Default filesystem; overview returns live LSP symbols by file.")},
-            {"depth", field("integer", "Filesystem: 1-32, default 1. Overview: child depth, default -1 (all).")},
-            {"format", choice(Json::Array{"json", "compact", "outline"}, "Overview defaults to json with numeric kind and kind_name; compact/outline shows named kinds and line ranges.")},
-            {"hidden", field("boolean", "Include hidden entries.")},
-            {"no_ignore", field("boolean", "Include .gitignore/.ignore/.shignore'd entries.")},
-            {"max_results", field("integer", "Optional entry limit, 1-10000; default unlimited.")},
-            {"timeout_ms", field("integer", "Filesystem deadline default 30000; operation=overview uses the LSP default of 180000.")},
-            {"max_output_bytes", max_output}})}});
-    tools.push_back(Json::Object{{"name", "file_info"}, {"description",
-        "Disk metadata; availability probes the current per-file text-fallback decision without editing; lsp reports server readiness, diagnostics includes coverage metadata, and restart recovers an LSP server." + common_paths},
-        {"inputSchema", schema(Json::Object{{"path", path}, {"paths", paths},
-            {"operation", choice(Json::Array{"metadata", "availability", "lsp", "diagnostics", "restart"}, "Default metadata. availability requires one file path and returns state, fallback_eligible, requires_text_fallback and reason from a live probe; lsp/restart may omit path to address all servers.")},
-            {"detail", choice(Json::Array{"summary", "full"}, "lsp/restart: default summary; full includes capabilities and configuration details.")},
-            {"name_path", field("string", "diagnostics: restrict to a symbol; append #kind (e.g. ClassName#ctor). A plain generic type name resolves when unique; multiple generic matches return candidates. Other ambiguities return candidates; overloads take an index such as Name[0]. No parent is selected.")},
-            {"severity", field("integer", "diagnostics: highest numeric severity to include, 1-4; default 4.")},
-            {"start_line", field("integer", "diagnostics: first 1-based line, inclusive; default 1. Includes diagnostics overlapping the requested lines.")},
-            {"end_line", field("integer", "diagnostics: last 1-based line, inclusive; -1 or omitted means no upper bound.")},
-            {"group_by_symbol", field("boolean", "diagnostics: add grouped results by file, severity and enclosing symbol (<file> if none); flat items remain. Default false.")},
-            {"timeout_ms", field("integer", "LSP deadline, 1-300000; default 180000 for semantic operations and 30000 for text/filesystem operations.")},
-            {"max_output_bytes", max_output}})}});
-    if (read_only) return tools;
-
-    const Json edit_item = Json::Object{{"type", "object"}, {"additionalProperties", false},
-        {"required", Json::Array{"old_text", "new_text"}},
-        {"properties", Json::Object{
-            {"old_text", field("string", "Exact text; must match once unless replace_all.")},
-            {"new_text", field("string", "Replacement.")},
-            {"replace_all", field("boolean", "Replace every match.")}}}};
-    tools.push_back(Json::Object{{"name", "edit_file"}, {"description",
-        "Live LSP symbol replace, replace_in_symbol/insert_in_symbol, replace_outside_symbols/insert_outside_symbols, insert_before/insert_after, rename across files (listing same-name mentions it leaves, e.g. other languages), or safe_delete with reference and method/property contract checks. Deletion is blocked when checks find relationships or cannot be completed; dry_run shows blockers and the proposed diff. "
-        "Text replacements and line edits are for other formats; programming/XML require symbol or outside-symbol edits unless allow_text_fallback=true and LSP fails. Bulk text edits skip files requiring working LSP. "
-        "Snapshot guards, encoding preservation, dry-run diffs and rollback on commit failure; atomic per file." + common_paths},
-        {"inputSchema", schema(Json::Object{{"path", path},
-            {"allow_text_fallback", text_fallback},
-            {"edits", Json::Object{{"type", "array"}, {"items", edit_item}, {"description", "1-256 edits."}}},
-            {"operation", choice(Json::Array{"auto", "symbol", "replace_in_symbol", "insert_in_symbol", "replace_outside_symbols", "insert_outside_symbols", "insert_before", "insert_after", "rename", "safe_delete", "text", "replace_content", "replace_in_files", "insert_at_line", "replace_lines", "delete_lines"}, "Default auto: name_path selects symbol replacement; edits selects text. insert_before/after target complete field or property declarations; names in one declaration stay together.")},
-            {"name_path", field("string", "Symbol path; overload [i] supported; append #kind (e.g. ClassName#ctor). A plain generic type name resolves when unique; multiple generic matches return candidates. Other ambiguities return candidates; overloads take an index such as Name[0]. No parent is selected.")},
-            {"new_name", field("string", "rename: new identifier; language server computes all affected files.")},
-            {"rename_text_occurrences", field("boolean", "rename: also rewrite whole-word mentions of the old name inside comments and string literals of the files the rename already edits (C-family, C#, Java, Go, Rust, JS/TS, Python, shell, PowerShell, Lua, YAML/TOML). Interpolated expressions stay code. Other files are only listed as leftovers. Default false.")},
-            {"line", field("integer", "rename: 1-based line instead of name_path; insert_at_line: insertion line (EOF allowed); insert_in_symbol: absolute source line inside the selected symbol; insert_outside_symbols: absolute source line outside protected symbols.")},
-            {"start_line", field("integer", "replace_lines/delete_lines: first 1-based line, inclusive.")},
-            {"end_line", field("integer", "replace_lines/delete_lines: last 1-based line, inclusive.")},
-            {"needle", field("string", "replace_content/replace_in_files/replace_in_symbol/replace_outside_symbols: nonempty literal or PCRE2 regex; DOTALL and MULTILINE enabled.")},
-            {"repl", field("string", "Replacement template; regex capture references use $!1, $!2, etc.; literal mode is verbatim.")},
-            {"mode", choice(Json::Array{"literal", "regex"}, "Content replacement syntax; default literal. Regex uses PCRE2, not Python re.")},
-            {"allow_multiple_occurrences", field("boolean", "replace_content/replace_in_symbol/replace_outside_symbols: default false; reject nonunique matches.")},
-            {"indent", choice(Json::Array{"verbatim", "match"}, "insert_in_symbol only. Default verbatim keeps supplied indentation. match prefixes the target line whitespace to each nonblank line, preserving supplied relative indentation.")},
-            {"paths_include_glob", field("string", "replace_in_files: root-relative glob with *, ** and ?; default all nonignored visible files.")},
-            {"paths_exclude_glob", field("string", "replace_in_files: exclude root-relative files/directories before reading; takes precedence.")},
-            {"occurrence_ids", Json::Object{{"type", "array"}, {"items", field("string", "Current preview occurrence ID.")}, {"description", "replace_in_files: select preview IDs; unknown/stale IDs abort all changes."}}},
-            {"expected_count", field("integer", "replace_in_files: abort if match count differs; -1 disables (default). Mutually exclusive with occurrence_ids.")},
-            {"column", field("integer", "rename: 1-based UTF-16 column with line.")},
-            {"diagnostics", field("boolean", "After writing source files, request up to 20 error diagnostics per file within a shared 3-second budget. Errors and unavailable checks produce warnings; writes remain applied unless on_new_errors=rollback. External compiler checks may be unverified. Default true; set false to skip.")},
-            {"on_new_errors", choice(Json::Array{"warn", "rollback"}, "Default warn keeps the write and reports errors. rollback (single-file edits; not rename or replace_in_files) also reads error diagnostics before and after the write, waiting up to 60 seconds each, and restores the previous text, then fails, when the write adds errors matched by source, code and message. Unavailable diagnostics keep the write with a warning.")},
-            {"new_text", field("string", "Complete symbol replacement or inserted code. insert_before/after use complete field or property declarations, including inline members; unresolvable boundaries such as complex interpolation or JSX fail. LF/CRLF is converted to file endings; symbol insertion preserves supplied code indentation.")},
-            {"timeout_ms", field("integer", "Semantic LSP edits default 180000; text and line edits default 30000, within the 1-300000 ms range.")},
-            {"dry_run", field("boolean", "Diff only, write nothing.")},
-            {"expected_sha256", expected_sha256}, {"expected_mtime", expected_mtime},
-            {"max_output_bytes", field("integer", "Optional diff byte cap; no cap by default.")}}, Json::Array{"path"})}});
-    tools.push_back(Json::Object{{"name", "write_file"}, {"description",
-        "Create files atomically; creates parent folders. To replace an existing programming/XML file, use overwrite=true with expected_sha256, symbol edits, or explicit fallback after LSP failure." + common_paths},
-        {"inputSchema", schema(Json::Object{{"path", path},
-            {"allow_text_fallback", text_fallback},
-            {"content", field("string", "Full contents.")},
-            {"diagnostics", field("boolean", "After writing source files, request error diagnostics within a shared 3-second budget. Errors or unavailable checks produce warnings; writes remain applied unless on_new_errors=rollback. Default true; set false to skip.")},
-            {"on_new_errors", choice(Json::Array{"warn", "rollback"}, "Default warn keeps the write and reports errors. rollback also reads error diagnostics before the write; when the write adds errors it restores the previous text (or removes a new file) and fails. Unavailable diagnostics keep the write with a warning.")},
-            {"timeout_ms", field("integer", "Diagnostic deadline, 1-300000; default 180000 when diagnostics=true.")},
-            {"overwrite", field("boolean", "Replace an existing file.")},
-            {"line_endings", choice(Json::Array{"lf", "crlf", "cr"}, "Default: the replaced file's, or for new files EditorConfig, Git attributes, then sibling files; otherwise as given. Alias: eol.")},
-            {"eol", choice(Json::Array{"lf", "crlf", "cr"}, "Alias for line_endings; both must agree if provided.")},
-            {"encoding", choice(Json::Array{"utf-8", "utf-8-bom", "utf-16le", "utf-16be"},
-                                "Default: the replaced file's; for new files, matching EditorConfig charset, then a unique majority among same-extension siblings, then utf-8. Unsupported configured charsets require an explicit encoding.")},
-            {"expected_sha256", expected_sha256}, {"expected_mtime", expected_mtime}},
-            Json::Array{"path", "content"})}});
-    tools.push_back(Json::Object{{"name", "delete_file"}, {"description",
-        "Delete one file within configured roots. No links or directories; requires a matching session read, dry-run preview, or explicit SHA-256 guard. "
-        "Source-file deletion does not check references or rewrite imports. Active language servers refresh after deletion." + common_paths},
-        {"inputSchema", schema(Json::Object{{"path", path}, {"expected_sha256", expected_sha256},
-            {"dry_run", field("boolean", "Preview and verify the target without deleting it.")},
-            {"timeout_ms", field("integer", "Whole-request deadline, 1-300000 ms; default 30000.")}},
-            Json::Array{"path"})}});
-    tools.push_back(Json::Object{{"name", "move_file"}, {"description",
-        "Move a file/folder; auto asks configured LSP servers for import edits when supported. Refactor requires that support; filesystem moves paths. File sources and overwritten destinations require a matching session read, preview, or explicit hash. Directory moves preserve content and invalidate path history. Active servers refresh after success." + common_paths},
-        {"inputSchema", schema(Json::Object{{"source", field("string", path_text)},
-            {"destination", field("string", path_text)},
-            {"operation", choice(Json::Array{"auto", "refactor", "filesystem"}, "Default auto. refactor requires willRenameFiles; filesystem bypasses semantic import edits.")},
-            {"dry_run", field("boolean", "Preview import edits and move without writing.")},
-            {"timeout_ms", field("integer", "LSP deadline, 1-300000; default 180000 for semantic operations and 30000 for text/filesystem operations.")},
-            {"expected_sha256", field("string", "Expected source-file SHA-256; otherwise require this session's read or move preview.")},
-            {"expected_mtime", expected_mtime},
-            {"expected_destination_sha256", field("string", "Expected overwritten file SHA-256; otherwise require this session's destination read or move preview. Requires overwrite=true.")},
-            {"overwrite", field("boolean", "Replace an existing file; requires operation=filesystem.")}},
-            Json::Array{"source", "destination"})}});
-    tools.push_back(Json::Object{{"name", "create_directory"}, {"description",
-        "Create a folder and its parents (mkdir -p)." + common_paths},
-        {"inputSchema", schema(Json::Object{{"path", path}}, Json::Array{"path"})}});
-    return tools;
+    return contracts::tool_definitions(1, read_only);
 }
 }

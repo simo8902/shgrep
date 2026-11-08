@@ -61,6 +61,27 @@ inline std::wstring final_path(HANDLE h) {
     out.resize(written);
     return out;
 }
+
+// The volume and file id naming a file system object, whatever path opened it.
+inline bool file_object_id(HANDLE h, FILE_ID_INFO& id) {
+    id = {};
+    if (GetFileInformationByHandleEx(h, FileIdInfo, &id, sizeof(id))) return true;
+    BY_HANDLE_FILE_INFORMATION info{};  // volumes without 128-bit file ids
+    if (!GetFileInformationByHandle(h, &info)) return false;
+    id = {};
+    id.VolumeSerialNumber = info.dwVolumeSerialNumber;
+    const uint64_t index = (static_cast<uint64_t>(info.nFileIndexHigh) << 32) | info.nFileIndexLow;
+    std::memcpy(id.FileId.Identifier, &index, sizeof(index));
+    return true;
+}
+inline bool same_file_id(const FILE_ID_INFO& x, const FILE_ID_INFO& y) {
+    return x.VolumeSerialNumber == y.VolumeSerialNumber && std::memcmp(&x.FileId, &y.FileId, sizeof(x.FileId)) == 0;
+}
+// True when both handles name the same file system object (volume and file id), whatever paths opened them.
+inline bool same_file_object(HANDLE a, HANDLE b) {
+    FILE_ID_INFO x{}, y{};
+    return file_object_id(a, x) && file_object_id(b, y) && same_file_id(x, y);
+}
 inline bool inside(const std::wstring& path, const std::wstring& root) {
     if (path.size() < root.size() || CompareStringOrdinal(path.data(), static_cast<int>(root.size()),
          root.data(), static_cast<int>(root.size()), TRUE) != CSTR_EQUAL) return false;

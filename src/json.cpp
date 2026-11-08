@@ -401,6 +401,23 @@ struct RowPack {
         if (inserted) order.push_back(key);
         ++it->second.count;
     }
+    // Prefix candidates are optional (a name without a shared prefix stays inline), so discovery stops adding new
+    // ones once their distinct keys reach kPrefixBudget bytes; memory stays proportional to the input.
+    static constexpr size_t kMaxPrefixName = 1024, kMaxPrefixCuts = 32, kPrefixBudget = size_t{8} << 20;
+    size_t prefix_bytes = 0;
+    void remember_prefix(std::string text) {
+        checkpoint();
+        Json value(std::move(text));
+        std::string key = value.dump(check);
+        auto it = prefix_candidates.find(key);
+        if (it == prefix_candidates.end()) {
+            if (key.size() > kPrefixBudget - prefix_bytes) return;
+            prefix_bytes += key.size();
+            prefix_order.push_back(key);
+            it = prefix_candidates.emplace(std::move(key), Candidate{std::move(value), 0}).first;
+        }
+        ++it->second.count;
+    }
     void collect(const Json& value) {
         checkpoint();
         if (const auto* object = std::get_if<RowObject>(&value.value)) {
@@ -410,13 +427,19 @@ struct RowPack {
                 if (row_qname(key) && std::holds_alternative<std::string>(item.value)) {
                     const auto& name = item.string();
                     // Lexical boundaries only: no language-specific qualified-name rewriting.
-                    for (size_t i = 0; i < name.size(); ++i) {
-                        if ((i & 1023) == 0) checkpoint();
-                        if (name[i] == '/' || name[i] == '.' ||
-                            (name[i] == ':' && i && name[i - 1] == ':'))
-                            remember(prefix_candidates, prefix_order, name.substr(0, i + 1));
+                    // SAFETY (F2): every prefix is a copy of the name's start, so a long, delimiter-dense name would
+                    // materialize quadratic bytes. Only names up to kMaxPrefixName bytes are cut, at their first
+                    // kMaxPrefixCuts boundaries; real qualified names are far shorter.
+                    if (name.size() <= kMaxPrefixName) {
+                        size_t cuts = 0;
+                        for (size_t i = 0; i < name.size() && cuts < kMaxPrefixCuts; ++i) {
+                            if (name[i] == '/' || name[i] == '.' || (name[i] == ':' && i && name[i - 1] == ':')) {
+                                remember_prefix(name.substr(0, i + 1));
+                                ++cuts;
+                            }
+                        }
                     }
-                    remember(prefix_candidates, prefix_order, name);
+                    remember_prefix(name);
                 }
                 collect(item);
             }

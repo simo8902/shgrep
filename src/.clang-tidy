@@ -1,0 +1,6 @@
+---
+Checks: '-*,cppcoreguidelines-*,bugprone-*'
+WarningsAsErrors: ''
+HeaderFilterRegex: '[\\/]src[\\/]'
+SystemHeaders: false
+...

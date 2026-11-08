@@ -1,5 +1,7 @@
 // Serena-style facade/session/result behavior adapted to native C++; see third_party/solidlsp-LICENSE.txt.
 #include "repl.hpp"
+#include "tool_contracts.generated.hpp"
+#include "thread_safety.hpp"
 #include "files.hpp"
 #include "lsp.hpp"
 #include "embed.hpp"
@@ -100,14 +102,14 @@ J fallback_definition(const std::string& name) {
         erase_properties(definition, {"name_path", "include_body", "full_lines", "include_info", "depth", "include_kinds", "exclude_kinds",
             "substring_matching", "line", "column", "include_declaration", "allow_text_fallback"});
         if (embed_built())
-            operations(definition, {"text", "meaning"}, "Search any file, including source code, by literal or regex patterns without requiring LSP. Omit intent for exhaustive grep-style results; explicit limits can truncate results. Nonblank intent returns ranked hunks: 90% meaning from the GPU embedding model plus 10% BM25. operation=meaning with intent (a question in words, no pattern) returns the best-matching LSP symbols (path, line range, name_path) for lsp.read_symbol; optional path scope and max_results. Use the lsp tool for semantic navigation and symbol edits.");
+            operations(definition, {"text", "meaning"}, "Search any file, including source code, by literal or regex patterns without requiring LSP. Searches that can reach code files need intent (the task in words): ranked hunks keep exact pattern matching, 90% meaning from the GPU embedding model plus 10% BM25, best 10 with at most 3 per file and a count of the rest. For every match (renames, impact checks) pass exhaustive=true instead; large results are saved to a file with an inline preview. Non-code scopes (md, json, yaml, txt, xml by path, include, extensions or types) and output=count need neither. operation=meaning with intent (a question in words, no pattern) returns the best-matching LSP symbols (path, line range, name_path) for lsp.read_symbol; optional path scope and max_results. Use the lsp tool for semantic navigation and symbol edits.");
         else
-            operations(definition, {"text"}, "Search any file, including source code, by literal or regex patterns without requiring LSP. Omit intent for exhaustive grep-style results; explicit limits can truncate results. Nonblank intent returns ranked hunks using built-in BM25 and an optional local reranker. Use the lsp tool for semantic navigation and symbol edits.");
+            operations(definition, {"text"}, "Search any file, including source code, by literal or regex patterns without requiring LSP. Searches that can reach code files need intent (the task in words): ranked hunks keep exact pattern matching, built-in BM25 and an optional local reranker, best 10 with at most 3 per file and a count of the rest. For every match (renames, impact checks) pass exhaustive=true instead; large results are saved to a file with an inline preview. Non-code scopes (md, json, yaml, txt, xml by path, include, extensions or types) and output=count need neither. Use the lsp tool for semantic navigation and symbol edits.");
         auto& props = std::get<J::Object>(std::get<J::Object>(std::get<J::Object>(definition.value).at("inputSchema").value).at("properties").value);
         props["pattern"] = J::Object{{"type", "string"}, {"description", "One literal or regex pattern."}};
         props["patterns"] = J::Object{{"type", "array"}, {"items", J::Object{{"type", "string"}}},
                                       {"description", "Up to 1000 text patterns in one filesystem pass."}};
-        props["intent"] = J::Object{{"type", "string"}, {"description", "Optional. Nonblank intent ranks results with built-in BM25 (an optional reranker, when running, reorders the top ones). Omit for regular exhaustive search."}};
+        props["intent"] = J::Object{{"type", "string"}, {"description", "The task in words; required when the search can reach code files, unless exhaustive=true. Ranks the exact matches and returns the best 10 hunks."}};
     } else if (name == "search_bytes") {
         std::get<J::Object>(definition.value)["description"] =
             "Search raw file bytes using hex literals or byte regex, with exact byte offsets and optional hex context. "
@@ -118,12 +120,12 @@ J fallback_definition(const std::string& name) {
         operations(definition, {"filesystem"}, "Find files by filename, path substring, glob, type or extension without reading contents. Default operation=filesystem; output=lines or json. Visibility and ignore filters apply. Use the lsp tool or repl s.lsp for symbol-based discovery.");
     } else if (name == "read_file") {
         erase_properties(definition, {"name_path", "full_lines", "include_kinds", "exclude_kinds", "depth", "format"});
-        operations(definition, {"text"}, "Read text, docs, config, data and logs with optional 1-based offset and line limit. Code files (Python, C/C++, C#, Rust, JS/TS, Lua, shell, PowerShell and more) are never read as text: any read of one returns its LSP symbol outline, and offset/limit are ignored. Read one symbol's code with lsp method=lsp.read_symbol. Plain text of a code file needs allow_text_fallback=true and works only when its language server fails or is missing. XML/SVG stay text. Text headers include encoding, mtime and sha256 for guarded edits. Links are not followed.");
+        operations(definition, {"text"}, "Read text, docs, config, data and logs with optional 1-based offset and line limit. Code files (Python, C/C++, C#, Rust, JS/TS, Lua, shell, PowerShell and more) return their LSP symbol outline when read without offset/limit; offset/limit return a window of raw lines, at most 100 per call. intent (the task in words, no offset/limit) returns only the best-matching lines of any file, at most 72, with skipped stretches marked. Read one symbol's code with lsp method=lsp.read_symbol. Plain text of a code file needs allow_text_fallback=true and works only when its language server fails or is missing. XML/SVG stay text. Text pages end at the last whole line under 8000 bytes, naming the next offset, unless offload_output=false. Text headers name the line count and line endings; metadata=true adds size, mtime and sha256 (file_info shows them too). Links are not followed.");
     } else if (name == "list_dir") {
         erase_properties(definition, {"format"});
         operations(definition, {"filesystem"}, "List filesystem entries with optional depth, visibility filters and explicit limits. Default operation=filesystem and depth=1. Entries distinguish files, directories and links; links are not followed. Use lsp method=lsp.list_symbols or repl s.lsp.list_symbols for code overviews.");
     } else if (name == "file_info") {
-        erase_properties(definition, {"name_path", "severity", "start_line", "end_line", "group_by_symbol", "detail"});
+        erase_properties(definition, {"name_path", "severity", "start_line", "end_line", "group_by_symbol", "detail", "check"});
         operations(definition, {"metadata", "availability"}, "Inspect filesystem metadata, or use availability with one file path to probe the current LSP text-fallback decision. The probe may start a server; it reports available, unavailable, warming or not_applicable and whether fallback is eligible. Default operation=metadata. Links are not followed.");
     } else if (name == "edit_file") {
         erase_properties(definition, {"name_path", "new_name", "rename_text_occurrences", "column", "diagnostics", "on_new_errors", "indent"});
@@ -151,7 +153,7 @@ J fallback_definition(const std::string& name) {
     if (name == "search") {
         describe("path", "File or directory scope for text search, in any configured root; omit for the workspace (first root).");
         describe("mode", "Text pattern syntax; default regex. multiline controls whether matches may span lines.");
-        describe("intent", "Optional task description. Nonblank intent ranks hunks with built-in BM25 (an optional local reranker, when running, reorders the top ones); omit for exhaustive grep-style results.");
+        describe("intent", "The task in words; required when the search can reach code files, unless exhaustive=true. Ranks the exact matches (built-in BM25, plus meaning in the GPU build) and returns the best 10 hunks, at most 3 per file.");
     } else if (name == "search_bytes") {
         describe("pattern", "One hex literal or byte regex, according to mode.");
         describe("patterns", "Up to 1000 byte patterns in one pass, using the same mode.");
@@ -183,6 +185,7 @@ const std::vector<Method>& methods() {
         };
         add("lsp.get_symbols_overview", "read_file", "overview", {"relative_path", "depth"}).defaults = {{"format", "json"}};
         add("lsp.find_symbol", "search", "symbols", {"name_path_pattern", "depth", "relative_path", "include_body", "include_info"});
+        add("lsp.search_by_meaning", "search", "meaning", {"intent", "relative_path", "max_results"});
         add("lsp.find_referencing_symbols", "search", "references", {"name_path", "relative_path"});
         add("lsp.find_implementations", "search", "implementation", {"name_path", "relative_path"});
         add("lsp.find_declaration", "search", "declaration", {"relative_path", "name_path"});
@@ -302,11 +305,54 @@ std::string render_locations(const J& value) {
         out += "[partial results: the language server is still indexing]\n";
     return out;
 }
+
+// Hover as text: a header with the file and the hovered position, then the server's own text (markdown or plain,
+// code blocks kept). format=json keeps the raw LSP Hover object.
+std::string render_hover(const J& value) {
+    const J* hover = value.get("hover");
+    std::string header = "[hover";
+    if (const J* path = value.get("path"); path && std::holds_alternative<std::string>(path->value)) header += " " + path->string();
+    if (hover && std::holds_alternative<J::Object>(hover->value))
+        if (const J* range = hover->get("range"))
+            if (const J* start = range->get("start"))
+                if (const J* line = start->get("line"); line && std::holds_alternative<int64_t>(line->value)) {
+                    header += ":" + std::to_string(line->integer() + 1);
+                    if (const J* column = start->get("character"); column && std::holds_alternative<int64_t>(column->value))
+                        header += ":" + std::to_string(column->integer() + 1);
+                }
+    header += " | source: lsp]\n";
+    if (!hover || !std::holds_alternative<J::Object>(hover->value)) return header + "(no information at this position)\n";
+    std::string text;
+    // contents: MarkupContent {kind, value}, a MarkedString (string or {language, value}), or an array of those.
+    const auto append = [&](const J& part) {
+        if (std::holds_alternative<std::string>(part.value)) text += part.string();
+        else if (const J* body = part.get("value"); body && std::holds_alternative<std::string>(body->value)) {
+            const J* language = part.get("language");
+            if (language && std::holds_alternative<std::string>(language->value))
+                text += "```" + language->string() + "\n" + body->string() + "\n```";
+            else text += body->string();
+        }
+        text += "\n";
+    };
+    if (const J* contents = hover->get("contents")) {
+        if (std::holds_alternative<J::Array>(contents->value)) for (const auto& part : contents->array()) append(part);
+        else append(*contents);
+    }
+    const size_t first = text.find_first_not_of("\r\n");
+    if (first == std::string::npos) return header + "(no information at this position)\n";
+    const size_t last = text.find_last_not_of("\r\n");
+    return header + text.substr(first, last - first + 1) + "\n";
+}
 J::Object method_properties(const Method& method) {
     const auto& original = backend_definitions().at(method.tool).get("inputSchema")->get("properties")->object();
     J::Object properties = original;
     properties.erase("operation");
-    if (method.tool == "search" && method.operation != "text") {
+    if (method.tool == "search" && method.operation == "meaning") {
+        const std::set<std::string> allowed{"intent", "path", "max_results", "timeout_ms", "max_output_bytes"};
+        for (auto it = properties.begin(); it != properties.end();)
+            if (!allowed.contains(it->first)) it = properties.erase(it); else ++it;
+        properties["max_results"] = J::Object{{"type", "integer"}, {"minimum", 1}, {"maximum", 1000}, {"default", 10}};
+    } else if (method.tool == "search" && method.operation != "text") {
         const std::set<std::string> allowed{"path", "name_path", "pattern", "patterns", "include_body", "full_lines", "substring_matching",
             "line", "column", "include_declaration", "timeout_ms", "include_info", "include_kinds", "exclude_kinds", "depth", "allow_text_fallback"};
         for (auto it = properties.begin(); it != properties.end();)
@@ -321,7 +367,7 @@ J::Object method_properties(const Method& method) {
         for (auto it = properties.begin(); it != properties.end();) {
             const bool keep = it->first == "path" || it->first == "paths" || it->first == "timeout_ms" ||
                 (method.operation == "diagnostics" && (it->first == "name_path" || it->first == "severity" ||
-                 it->first == "start_line" || it->first == "end_line" || it->first == "group_by_symbol"));
+                 it->first == "start_line" || it->first == "end_line" || it->first == "group_by_symbol" || it->first == "check"));
             if (!keep) it = properties.erase(it); else ++it;
         }
         if (method.operation == "availability") properties.erase("paths");
@@ -366,7 +412,7 @@ J::Object method_properties(const Method& method) {
             std::get<J::Object>(properties.at("needle").value)["description"] =
                 "Literal or PCRE2 regex matched only inside the selected symbol. Requires one unambiguous match unless allow_multiple_occurrences=true.";
             std::get<J::Object>(properties.at("repl").value)["description"] =
-                "Replacement text; regex captures use $!1 etc. Newlines follow the file's style. Content outside matched spans is preserved.";
+                "Replacement text; regex captures use $!1 etc. Unchanged lines keep their endings; new lines inherit the nearby style. Content outside matched spans is preserved.";
         }
         if (method.operation == "insert_in_symbol")
             std::get<J::Object>(properties.at("line").value)["description"] =
@@ -378,7 +424,7 @@ J::Object method_properties(const Method& method) {
                 "Inside a REPL cell the smallest requested limit applies to the final response; facade Values remain complete.";
         if (properties.contains("new_text"))
             std::get<J::Object>(properties.at("new_text").value)["description"] =
-                "Replacement or inserted code. Newlines are converted to the file's line endings; "
+                "Replacement or inserted code. Unchanged lines keep their endings; new lines inherit the nearby style; "
                 "before/after insertion preserves supplied leading and trailing newlines and code indentation.";
     } else if (method.name.starts_with("fs.") || method.name == "edit.edit_file" ||
                method.operation == "replace_content" || method.operation == "replace_in_files" ||
@@ -393,6 +439,7 @@ J::Object method_properties(const Method& method) {
         for (auto it = properties.begin(); it != properties.end();)
             if (!allowed.contains(it->first)) it = properties.erase(it); else ++it;
     }
+    if (method.name == "lsp.get_diagnostics_for_symbol") properties.erase("check");
     if (method.name == "fs.read_file") properties["end_line"] = J::Object{{"type", "integer"}, {"description", "Optional last 1-based line, inclusive; omit for the default 100-line window or use -1 for all remaining lines."}};
     if (method.name == "fs.find_file") {
         properties.erase("roots");
@@ -410,7 +457,7 @@ J::Object method_properties(const Method& method) {
             "New name passed to the language server. Proposed target files are synchronized and replanned before snapshot-checked writes.";
     if (method.name == "lsp.status" || method.name == "lsp.restart_language_server")
         properties["detail"] = J::Object{{"type", "string"}, {"enum", J::Array{"summary", "full"}}, {"default", "summary"},
-            {"description", "Summary reports server identity, document count, indexing state, available failure reason and uptime_seconds (null when not running). full also includes capabilities and configuration details. Direct status defaults to text; format=json returns structured data."}};
+            {"description", "Summary reports server identity, document count, indexing state, available failure reason, process_id, memory in bytes, idle_timeout_ms and uptime_seconds (null when not running). full also includes capabilities and configuration details. Direct status defaults to text; format=json returns structured data."}};
     if (semantic_method(method)) {
         const bool overview = method.operation == "overview";
         const bool compact_symbols = method.name == "lsp.find_symbol" || location_method(method);
@@ -456,7 +503,7 @@ std::string help(const std::string& topic, const SearchContext& context, bool di
             "Keep shgrep.exe, shgrep-compiler.dll and shgrep.dat from the same build together for this REPL. The REPL, including semantic navigation, requires installed MSVC C++ Build Tools with a matching major.minor toolset, a Windows 10/11 SDK and a compatible x64 VC++ Redistributable. Cells generate DLLs in a private temporary session directory, retained until worker exit.\n"
             "Language servers are downloaded separately using tools/fetch_lsp.py; project dependencies and compiler flags must be available locally.\n"
             "The direct lsp MCP tool exposes semantic navigation and symbol edits without a C++ worker; s.lsp and s.edit also expose them in cells.\n"
-            "Text search is exhaustive without intent; a nonblank intent returns hunks ranked by built-in BM25 (an optional local reranker, when running, reorders the top ones).\n"
+            "Text search that can reach code files needs intent (hunks ranked by built-in BM25, plus meaning in the GPU build; best 10, at most 3 per file) or exhaustive=true (every match in scan order); non-code scopes and output=count need neither.\n"
             "Returned structured values may use shgrep-rowpack v1. The same response includes $format layouts/tables and data; no earlier call is needed to decode it.\n"
             "Inside the cell, Values retain ordinary fields and arrays. Captured output is separate from a returned structured value.";
     }
@@ -708,9 +755,9 @@ struct Session {
 } // namespace
 
 struct ReplState {
-    std::mutex mutex;
-    std::map<std::string, std::shared_ptr<Session>> sessions;
-};
+    sync::Mutex mutex;
+    std::map<std::string, std::shared_ptr<Session>> sessions SHGREP_GUARDED_BY(mutex);
+};;
 std::shared_ptr<ReplState> make_repl_state() { return std::make_shared<ReplState>(); }
 
 namespace {
@@ -769,7 +816,7 @@ std::string render_status_text(const J& value, const Control& control) {
         }
         return out;
     };
-    std::string out = "language | root | state | open docs | last error | uptime\n";
+    std::string out = "language | root | state | open docs | last error | uptime | pid | private bytes | working set bytes\n";
     for (const auto& status : statuses) {
         control.check();
         const auto field = [&](const char* key, const std::string& fallback = "-") {
@@ -778,11 +825,17 @@ std::string render_status_text(const J& value, const Control& control) {
         };
         const J* documents = status.get("open_documents");
         const J* uptime = status.get("uptime_seconds");
+        const J* pid = status.get("process_id");
+        const J* memory = status.get("memory");
+        const J* private_bytes = memory ? memory->get("private_bytes") : nullptr;
+        const J* working_set = memory ? memory->get("working_set_bytes") : nullptr;
         std::string error = field("failure_reason", "");
         if (error.empty()) error = field("stuck_reason", "-");
         out += field("language_id") + " | " + field("root") + " | " + field("indexing_state") + " | " +
             (documents ? documents->dump() : "-") + " | " + error + " | " +
-            (uptime && !std::holds_alternative<std::nullptr_t>(uptime->value) ? uptime->dump() + "s" : "-") + "\n";
+            (uptime && !std::holds_alternative<std::nullptr_t>(uptime->value) ? uptime->dump() + "s" : "-") + " | " +
+            (pid ? pid->dump() : "-") + " | " + (private_bytes ? private_bytes->dump() : "-") + " | " +
+            (working_set ? working_set->dump() : "-") + "\n";
     }
     if (statuses.empty()) out += "(no language servers)\n";
     for (const auto& status : statuses) {
@@ -886,12 +939,16 @@ public:
             if ((method.tool == "read_file" || method.tool == "list_dir") && method.operation != "text")
                 arguments["format"] = "json";
         }
+        if (method.operation == "meaning")
+            arguments["output"] = presentation_format == "json" ? "json" : "lines";
         const auto finish = [&](J value) -> J {
             value_bytes(value);
+            if (method.operation == "meaning") return value;
             if (presentation_format != "json") {
                 J rendered = method.name == "lsp.status"
                     ? render_status_text(value, control_)
                     : method.name == "lsp.availability" ? J(value.dump() + "\n")
+                    : method.name == "lsp.hover" ? J(render_hover(value))
                     : location_method(method) && !(arguments.contains("include_body") && arguments.at("include_body").boolean())
                         ? J(render_locations(value))
                     : render_semantic_text(value, method.operation == "overview" || presentation_format == "compact", control_.cancelled, symbol_line_numbers,
@@ -904,8 +961,10 @@ public:
         SearchContext call_context = context_;
         call_context.require_intent = false;
         control_.check();
+        // Text search in cells follows the plain search tool's rule: code scopes need intent or exhaustive=true.
+        J call_arguments = method.tool == "search" ? gate_plain_text_search(J(arguments), context_) : J(arguments);
         ++calls;
-        J result = run_backend_tool(method.tool, J(arguments), call_context, control_.cancelled);
+        J result = run_backend_tool(method.tool, call_arguments, call_context, control_.cancelled);
         if (method.writes && (!arguments.contains("dry_run") || !arguments.at("dry_run").boolean())) ++writes;
         for (const char* key : {"access_note", "warning"}) if (const J* warning = result.get(key)) {
             if (!warning->string().empty()) warnings.push_back(warning->string());
@@ -938,7 +997,8 @@ void apply_direct_format(const Method& method, const std::vector<J>& positional,
         if (method.positional[i] == "format") return;
         if (method.positional[i] == "include_body") with_body = positional[i].boolean();
     }
-    if (method.writes || method.name == "lsp.read_symbol" || method.name == "lsp.status" || with_body)
+    if (method.writes || method.name == "lsp.read_symbol" || method.name == "lsp.status" || method.name == "lsp.hover" ||
+        with_body)
         keywords["format"] = "text";
     else if (method.name == "lsp.find_symbol" || method.operation == "overview" || location_method(method))
         keywords["format"] = "compact";
@@ -1033,7 +1093,7 @@ std::string tool_manual(const SearchContext& context, bool brief) {
             ".shignore overrides .gitignore/.ignore; index and warm-up progress goes to .shgrep/index.log. ";
     if (brief) {
         if (!context.read_only)
-            text += "Read targets before editing; expected_sha256 pins a snapshot, and on_new_errors=rollback restores a single-file edit on new diagnostic errors. "
+            text += "Read targets before editing (a literal old_text/needle replacement needs no prior read: the exact match guards it); expected_sha256 pins a snapshot, and on_new_errors=rollback restores a single-file edit on new diagnostic errors. "
                     "Text fallback requires allow_text_fallback=true and an unavailable or failing LSP. ";
         text += "Report the cause and impact of 'tell the user' banners; a notice alone does not make a successful call fail. ";
         return text;
@@ -1094,13 +1154,7 @@ std::string tool_manual(const SearchContext& context, bool brief) {
 J lsp_tool_definition() {
     J::Array names{"help"};
     J::Array branches;
-    const J help_schema = J::Object{{"type", "object"}, {"additionalProperties", false},
-        {"properties", J::Object{{"timeout_ms", J::Object{{"type", "integer"}, {"minimum", 1}, {"maximum", 300000},
-            {"description", "Whole request deadline; may instead be top-level."}}},
-            {"topic", J::Object{{"type", "string"},
-            {"description", "Use manual for the tool-routing guide, or a direct semantic method name such as edit.replace_in_symbol for its schema."}}},
-            {"format", J::Object{{"type", "string"}, {"enum", J::Array{"text", "json"}}, {"default", "text"},
-                {"description", "Default readable text; json returns method schemas/defaults, the method list, or a structured manual."}}}}}};
+    const J help_schema = contracts::record_schema<contracts::LspHelpArgs>();
     branches.emplace_back(J::Object{{"properties", J::Object{
         {"method", J::Object{{"const", "help"}}}, {"arguments", help_schema}}}});
     for (const auto& method : methods()) {
@@ -1110,25 +1164,12 @@ J lsp_tool_definition() {
             {"method", J::Object{{"const", method.name}}},
             {"arguments", semantic_arguments_schema(method)}}}});
     }
-    return J::Object{{"name", "lsp"},
-        {"description", "Direct semantic navigation and symbol edits through shgrep's own language-server backend. "
-            "Works independently of the C++ REPL and compiler DLL. Call method=help for operations, arguments.topic=manual for the tool guide, or a method name as topic for its schema. "
-            "Method names match the existing facades, including lsp.find_symbol, lsp.rename_symbol and edit.replace_symbol_body. "
-            "Example: {\"method\":\"lsp.find_symbol\",\"arguments\":{\"name_path_pattern\":\"Foo\",\"relative_path\":\"src\"}}. "
-            "Pass named fields in arguments; timeout_ms may be top-level or inside arguments and both values must agree. Defaults are 180000 ms for a ready target server and 300000 ms for cold or undetermined targets. Positions are 1-based with UTF-16 columns. "
-            "Language servers and project dependencies must be installed separately. Missing or failing servers are reported; "
-            "text fallback requires explicit permission where supported. Root restrictions, snapshot guards and native edit validation apply. "
-            "dry_run previews edits. safe_delete blocks references and possible method/property contracts, or incomplete checks; dry_run reports blockers and the proposed diff. Same-name ancestor members may be conservatively treated as contracts, and results depend on language-server coverage. Direct symbol searches and overviews default to compact rows: named kind, short name under a shared parent, line range, and for searches the symbol line_text; format=json returns structured results with numeric kind and kind_name. Text bodies omit line numbers unless requested; diffs retain unified-diff hunk coordinates; format=json preserves structured/rowpack results. Use format=outline for overviews, read_symbol offset/limit for slices, edit.replace_in_symbol or edit.insert_in_symbol for symbol edits, and edit.replace_outside_symbols or edit.insert_outside_symbols for headers and imports. Outside-symbol edits use the ranges supplied by the language server; incomplete ranges can leave declarations unprotected. Status is observational and never starts servers. It lists eligible configured root/language servers as not_started until first use; indexing_state can also be ready, indexing, starting, stuck or failed. stuck_reason appears after 180 seconds without tracked activity; failure_reason reports startup errors. The root-local bundled:false setting in .shgrep/lsp.json disables bundled defaults while explicit servers remain configured. Semantic requests start the selected server on first use, wait for readiness and may return index_warming with startup failure or index progress details. Direct lsp.status defaults to summary rows; detail=full includes configuration details; multi-server responses use response-local capability_sets referenced by each row capability_set. Use format=json for structured output; compiled REPL cells default to structured values, while a cell holding one literal shgrep call returns the direct text. Diagnostics report coverage and do not certify external compiler-check completion. Unavailable with --read-only."},
-        {"inputSchema", J::Object{{"type", "object"}, {"additionalProperties", false}, {"required", J::Array{"method"}},
-            {"properties", J::Object{
-                {"method", J::Object{{"type", "string"}, {"enum", std::move(names)}}},
-                {"arguments", J::Object{{"type", "object"}, {"description", "Named method arguments; omit for help."}}},
-                {"max_output_bytes", J::Object{{"type", "integer"}, {"minimum", 512}, {"maximum", 1048576},
-                    {"description", "Optional final response byte limit. Text output uses lossless continuation; structured JSON must fit. The smaller of this and a method limit applies."}}},
-
-                {"timeout_ms", J::Object{{"type", "integer"}, {"minimum", 1}, {"maximum", 300000},
-                    {"description", "Whole request deadline including response encoding. May also be inside arguments; both values must agree. Default: 180000 ms for a ready target server, otherwise 300000 ms."}}}}},
-            {"oneOf", std::move(branches)}}}};
+    J definition = contracts::tool_definition("lsp");
+    auto& schema = std::get<J::Object>(std::get<J::Object>(definition.value).at("inputSchema").value);
+    auto& properties = std::get<J::Object>(schema.at("properties").value);
+    std::get<J::Object>(properties.at("method").value)["enum"] = std::move(names);
+    schema["oneOf"] = std::move(branches);
+    return definition;
 }
 
 J run_lsp_tool(const J& arguments, const SearchContext& context,
@@ -1148,7 +1189,7 @@ J run_lsp_tool(const J& arguments, const SearchContext& context,
     (void)options.object();
     std::get<J::Object>(options.value).erase("timeout_ms");
     if (name == "help") {
-        J reference = semantic_help(options, context);
+        J reference = semantic_help(contracts::to_json(contracts::from_json<contracts::LspHelpArgs>(options)), context);
         if (std::holds_alternative<std::string>(reference.value)) return J::Object{{"text", std::move(reference)}};
         return J::Object{{"structured_result", std::move(reference)}};
     }
@@ -1189,39 +1230,7 @@ J run_lsp_tool(const J& arguments, const SearchContext& context,
 }
 
 J repl_tool_definition() {
-    const J properties = J::Object{
-        {"max_output_bytes", J::Object{{"type", "integer"}, {"minimum", 512}, {"maximum", 1048576},
-            {"description", "Optional final response byte limit. Text output uses lossless continuation; structured JSON must fit. Facade Values inside the cell remain complete; the smallest requested limit applies."}}},
-        {"code", J::Object{{"type", "string"}, {"maxLength", static_cast<uint64_t>(max_code)},
-            {"description", "C++26 cell, at most 256 KiB. Use s.info() for facades. Facade calls may use shgrep syntax: s::<3::fs~>read_file(\"file.cs\") equals s.fs.read_file(\"file.cs\"). Omit the final expression's semicolon to return it."}}},
-        {"session_id", J::Object{{"type", "string"}, {"minLength", 1}, {"maxLength", 64},
-            {"pattern", "^[A-Za-z0-9_-]+$"}, {"default", "default"},
-            {"description", "Process-local C++ session key, 1-64 ASCII letters/digits/_/-. Default 'default'; at most 8 sessions."}}},
-        {"timeout_ms", J::Object{{"type", "integer"}, {"minimum", 1}, {"maximum", 300000}, {"default", 180000},
-            {"description", "Whole request deadline including response encoding, 1-300000 ms, default 180000. Expiry/cancellation during cell execution terminates and resets this session's worker."}}},
-        {"idle_reset_ms", J::Object{{"type", "integer"}, {"minimum", 0}, {"maximum", 86400000},
-            {"description", "Opt in to resetting this session's worker after this many idle milliseconds; 0 disables it. The setting persists for this session when omitted. Reset clears saved declarations and is reported on the next call."}}}
-    };
-    return J::Object{
-        {"name", "repl"},
-        {"description",
-            "Execute persistent C++26 cells through LLVM Clang-Repl for shgrep's own LSP navigation and semantic edits. "
-            "Start with s.info(\"manual\") for tool routing; s.info(\"lsp\"), s.info(\"edit\"), s.info(\"fs\") or a method name gives the current reference. "
-            "Pass one named argument object per facade call. Example: auto hits = s.lsp.find_symbol({{\"name_path_pattern\", \"Foo\"}, {\"relative_path\", \"src\"}}); hits[\"results\"].size() "
-            "shgrep call syntax works too: s::<3::fs~>read_file(\"file.cs\") means s.fs.read_file(\"file.cs\"); <3 is a fixed decoration, the group (fs, lsp, edit) comes before ~> and the operation after it; s::<3::info(), s::<3::vars() and s::<3::clear() reach the helpers. A cell that is just one such call with literal arguments (strings, numbers, true/false, or one {{\"key\", value}} list) runs without the C++ compiler, as fast as a direct tool call. "
-            "Values support [\"field\"], [size_t{index}], array(), string(), integer(), boolean() and dump(). "
-            "Omit the final expression's semicolon to return its value. Structured values may use shgrep-rowpack v1: decode data using the same response's $format layouts and tables. "
-            "Facade Values inside the cell are unpacked. Captured stdout/stderr are returned separately from structured values. "
-            "Positions are 1-based with UTF-16 columns. Rename synchronizes proposed target files and rejects stale snapshots before writing. "
-            "Completed edits remain applied if a later operation fails. Text search of source needs no LSP; fs.read_file of a code file returns its LSP outline. Unrestricted source text writes still require explicit fallback after LSP failure. Use partial symbol edits for small code changes. "
-            "Language servers are installed separately with tools/fetch_lsp.py; no Serena runtime is required. "
-            "Keep shgrep.exe, shgrep-compiler.dll and shgrep.dat from the same build together for this REPL. This REPL requires installed MSVC C++ Build Tools with a matching major.minor toolset, a Windows 10/11 SDK and a compatible x64 VC++ Redistributable; headers and libraries are discovered locally. Generated DLLs stay in a private temporary session directory until worker exit. Project dependencies must be available locally. "
-            "s.vars() lists declarations; s.clear() resets after this cell. At most 8 sessions, each with a 1 GiB worker memory limit and 128 MiB captured output limit. "
-            "Compiler errors, timeout, cancellation, DLL link/load or initialization failure lose that session's declarations. Compiler errors retire the worker; corrected code can reuse the same session_id with required headers/declarations. Earlier cells are not replayed. Normal reset attempts cooperative cleanup; forced termination cannot guarantee destructors. Native C++ has OS access; --read-only disables execution. "
-            "Semantic facade calls wait for language-server readiness and can report index_warming with progress details. The direct lsp tool provides semantic navigation and symbol edits independently of this REPL."},
-        {"inputSchema", J::Object{{"type", "object"}, {"additionalProperties", false},
-                                  {"required", J::Array{"code"}}, {"properties", properties}}}
-    };
+    return contracts::tool_definition("repl");
 }
 
 J fallback_tool_definitions(const SearchContext& context) {
@@ -1237,7 +1246,9 @@ J fallback_arguments(const std::string& name, const J& arguments, const SearchCo
     const auto& properties = definition.get("inputSchema")->get("properties")->object();
     for (const auto& [key, value] : arguments.object()) {
         (void)value;
-        if (!properties.contains(key)) fail(key + " is not a plain " + name + " option; use repl for semantic operations");
+        // CONTRACT: profile is the hidden benchmark switch (phase timings) that search accepts without listing it.
+        if (!properties.contains(key) && !(key == "profile" && name == "search"))
+            fail(key + " is not a plain " + name + " option; use repl for semantic operations");
     }
     J::Object args = arguments.object();
     if (const auto operation = properties.find("operation"); operation != properties.end()) {
@@ -1380,6 +1391,9 @@ std::optional<DirectLoveCall> direct_love_call(const std::string& code) {
         while (at < text.size() && std::isdigit(static_cast<unsigned char>(text[at]))) ++at;
         if (at == start || (at == start + 1 && text[start] == '-') || at - start > 18) { at = start; return std::nullopt; }
         if (at < text.size() && (ident(text[at]) || text[at] == '.')) { at = start; return std::nullopt; }
+        // C++ reads a leading zero as octal (010 is 8, 08 is an error): leave those to the compiler, never base 10.
+        const size_t digits = start + (text[start] == '-' ? 1 : 0);
+        if (text[digits] == '0' && at - digits > 1) { at = start; return std::nullopt; }
         return J(static_cast<int64_t>(std::stoll(std::string(text.substr(start, at - start)))));
     };
     skip();
@@ -1456,7 +1470,7 @@ J run_repl(const J& arguments, const SearchContext& context, const std::shared_p
     if (!context.repl_state) fail("REPL session storage is unavailable");
     std::shared_ptr<Session> session;
     {
-        std::lock_guard lock(context.repl_state->mutex);
+        sync::LockGuard lock(context.repl_state->mutex);
         auto found = context.repl_state->sessions.find(id);
         if (found == context.repl_state->sessions.end()) {
             if (context.repl_state->sessions.size() >= max_sessions) fail("REPL session limit is 8; reuse an existing session_id");

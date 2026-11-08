@@ -24,6 +24,7 @@ namespace shgrep {
 #if !SHGREP_EMBED
 bool embed_built() { return false; }
 void start_embedder() {}
+void embed_finish_loading(std::chrono::milliseconds) {}
 std::string embedder_state() { return "off (portable build: no embedding model)"; }
 size_t embed_dimensions() { return 0; }
 std::string embed_model_identity() { return {}; }
@@ -35,6 +36,8 @@ std::vector<std::vector<float>> embed_documents(const std::vector<EmbedDocument>
     throw EmbedFailure("this shgrep build has no meaning search (portable build); use the GPU build for it");
 }
 #else
+std::string file_sha256(const std::filesystem::path& path);  // files.hpp; declared here to keep this file self-contained
+
 namespace {
 namespace fs = std::filesystem;
 
@@ -155,7 +158,9 @@ struct Engine {
     bool model_missing = false;  // guarded by mutex: the last failure was a missing GGUF
 };
 Engine& engine() {
-    static Engine instance;
+    // SAFETY (F5): never destroyed. The loader thread cannot be interrupted inside llama.cpp and may still run while
+    // static destructors run at exit; it touches only this engine and the loaded DLLs.
+    static Engine& instance = *new Engine;
     return instance;
 }
 
@@ -313,6 +318,16 @@ void load(Engine& e) {
                            std::to_string(needed >> 20) + " MB, free " + std::to_string(free_memory >> 20) + " MB of " +
                            std::to_string(total_memory >> 20) + " MB. Fix: close programs that use the GPU, then restart shgrep");
 
+    // SAFETY (#87, F6): saved meaning vectors are keyed by the model's identity; description, size and dimensions alone
+    // let different weights of the same shape reuse vectors from another embedding space. The weights' SHA-256 is part
+    // of the identity, so any other model file invalidates the saved index.
+    set_step("fingerprinting " + narrow(model_path.filename().wstring()));
+    std::string weights_sha256;
+    try {
+        weights_sha256 = file_sha256(model_path);
+    } catch (const std::exception& failure) {
+        throw EmbedFailure(std::string("cannot fingerprint the model file: ") + failure.what());
+    }
     set_step("loading " + narrow(model_path.filename().wstring()) + " on " + device_text);
     static ggml_backend_dev_t devices[2];  // must outlive the model
     devices[0] = gpu;
@@ -348,7 +363,8 @@ void load(Engine& e) {
     a.model_desc(e.model, description, sizeof(description));
     std::lock_guard lock(e.mutex);
     e.ready_text = device_text + ", " + description + ", " + std::to_string(e.dimensions) + " dimensions";
-    e.identity = std::string(description) + "|" + std::to_string(model_bytes) + "|" + std::to_string(e.dimensions);
+    e.identity = std::string(description) + "|" + std::to_string(model_bytes) + "|" + std::to_string(e.dimensions) +
+                 "|sha256=" + weights_sha256;
 }
 
 std::vector<int32_t> tokens_of(Engine& e, const std::string& text) {
@@ -482,6 +498,12 @@ void start_embedder() {
         }
         e.changed.notify_all();
     }).detach();
+}
+
+void embed_finish_loading(std::chrono::milliseconds timeout) {
+    auto& e = engine();
+    std::unique_lock lock(e.mutex);
+    e.changed.wait_for(lock, timeout, [&] { return e.state != State::loading; });
 }
 
 std::string embedder_state() {

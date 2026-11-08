@@ -1,4 +1,6 @@
 #include "search.hpp"
+#include "tool_contracts.generated.hpp"
+#include "thread_safety.hpp"
 #include "backend.hpp"
 #include "dfa.hpp"
 #include "files.hpp"
@@ -1769,6 +1771,9 @@ struct Outcome {
     std::atomic<uint64_t> files{0}, bytes{0}, found{0}, errors{0}, skipped_size{0}, skipped_binary{0};
     std::atomic<uint64_t> regular_seen{0}, files_filtered{0}, files_ignored{0}, files_hidden{0};
     std::atomic<uint64_t> directories_pruned{0}, reparse_skipped{0};
+    // Folders the walk could not list completely or open, other than ones denied to this user or gone meanwhile. Also
+    // counted in errors; an index build must not publish a tree with such gaps as complete.
+    std::atomic<uint64_t> tree_gaps{0};
     std::atomic<uint64_t> engine_fallbacks{0};  // files an engine failed on and Hyperscan rescanned
     std::atomic<uint64_t> skipped_lsp{0}, text_fallbacks{0};
     std::string fallback_reason;  // guarded by mutex
@@ -3636,7 +3641,7 @@ ScopeMatch scope_match(const Request& r, std::string_view relative, bool directo
 void visit_directory(const Request& r, const DirectoryTask& task, WalkBuffers& b, std::vector<DirectoryTask>& children,
                      std::vector<DirEntry>& files, Control& control, Outcome& out, WorkerProfile* p) {
     PhaseTimer list_timer(phase(p, &WorkerProfile::list));
-    if (!list_directory(task.handle->h, b.listing, b.entries)) ++out.errors;
+    if (!list_directory(task.handle->h, b.listing, b.entries)) { ++out.errors; ++out.tree_gaps; }
 
     std::shared_ptr<const IgnoreScope> scope = task.ignore;
     if (!r.no_ignore) {
@@ -3704,12 +3709,20 @@ void visit_directory(const Request& r, const DirectoryTask& task, WalkBuffers& b
         if (is_directory) {
             if (!passes) { ++out.directories_pruned; continue; }
             bool denied = false;
+            NTSTATUS status = 0;
             PhaseTimer open_timer(phase(p, &WorkerProfile::dir_open));
-            HANDLE child = open_relative(task.handle->h, entry.name, true, denied);
+            HANDLE child = open_relative(task.handle->h, entry.name, true, denied, &status);
             open_timer.stop();
             if (child == INVALID_HANDLE_VALUE) {
                 // CONTRACT: access-denied subdirectories are skipped without an error, matching skip_permission_denied.
-                if (!denied) ++out.errors;
+                if (!denied) {
+                    ++out.errors;
+                    // A folder removed, being deleted, or replaced by a file since the listing is not a gap (as
+                    // LiveIndex::reconcile and LiveIndex::directory treat it); the watcher reports that change.
+                    if (status != static_cast<NTSTATUS>(0xC0000034L) && status != static_cast<NTSTATUS>(0xC000003AL) &&
+                        status != static_cast<NTSTATUS>(0xC0000056L) && status != static_cast<NTSTATUS>(0xC0000103L))
+                        ++out.tree_gaps;
+                }
                 continue;
             }
             children.push_back({join_path(task.path, entry.name), b.relative, scope, std::make_shared<Handle>(child)});
@@ -3858,7 +3871,7 @@ void walk(const Request& r, const std::vector<WalkRoot>& roots, unsigned worker_
     size_t active = 0;        // workers listing a directory, which may add work
     for (const auto& root : roots) {
         auto handle = root.handle ? root.handle : std::make_shared<Handle>(open_root_directory(root.path));
-        if (!*handle) { ++out.errors; continue; }
+        if (!*handle) { ++out.errors; ++out.tree_gaps; continue; }
         pending.push_back({root.path, {}, nullptr, std::move(handle)});
     }
     auto scan_batch = [&](unsigned index, const FileBatch& batch, WorkerProfile* p) {
@@ -4622,6 +4635,11 @@ TreeIndex index_tree(const SearchContext& context, const WalkRoot& root, Posting
         throw IndexTooLarge("more than " + std::to_string(max_files) + " files (set SHGREP_INDEX_MAX_FILES to raise the limit, 0 for none)");
     if (out.failure) std::rethrow_exception(out.failure);
     if (const char* why = control.interrupted()) throw std::runtime_error(std::string("index build ") + why);
+    // SAFETY: a fresh index skips reconciliation, so a folder the walk could not list would stay missing from it while
+    // indexed searches report complete results. Fail the build instead; searches walk until a retry succeeds.
+    if (const uint64_t gaps = out.tree_gaps.load())
+        throw std::runtime_error(std::to_string(gaps) + " folder" + (gaps == 1 ? "" : "s") +
+                                 " could not be listed or opened, so the index would miss files");
     TreeIndex tree;
     tree.files.resize(next_id.load());
     for (auto& w : workers)
@@ -5281,6 +5299,9 @@ struct IndexUse {
     std::wstring root;  // walk root path, as file paths start
     std::vector<IndexCandidate> candidates;  // sorted by path, so consecutive candidates share directories
     uint64_t indexed_files = 0;
+    // SAFETY: the request's validated root handle. scan_index reads candidates through it and never reopens the root
+    // by path, which a junction swapped in after validation could redirect outside the configured roots.
+    std::shared_ptr<Handle> handle;
 };
 
 // The candidate's directories and name pass the request's filters, as visit_directory would have applied them.
@@ -5341,13 +5362,33 @@ struct DirCursor {
         }
         return handles.empty() ? root : handles.back().h;
     }
+    // Drops the cached handles for `relative` and every folder below it, so the next open reaches the folder now at
+    // that path. A folder renamed away keeps its handle valid, so a replacement there would otherwise go unseen.
+    void forget(std::string_view relative) {
+        if (relative.empty()) {
+            parts.clear();
+            handles.clear();
+            return;
+        }
+        size_t depth = 0, start = 0;
+        for (;;) {
+            size_t slash = relative.find('/', start);
+            if (slash == std::string_view::npos) slash = relative.size();
+            if (depth >= parts.size() || parts[depth] != relative.substr(start, slash - start)) return;  // not cached
+            ++depth;
+            if (slash == relative.size()) break;
+            start = slash + 1;
+        }
+        parts.resize(depth - 1);
+        handles.resize(depth - 1);
+    }
 };
 
 // Scans one indexed root's candidates instead of walking it.
 void scan_index(const Request& r, const IndexUse& use, unsigned worker_count, Control& control, Outcome& out,
                 const FileVisitor& on_file) {
-    Handle root(open_root_directory(use.root));
-    if (!root) { ++out.errors; return; }
+    if (!use.handle || !*use.handle) throw std::runtime_error("indexed search has no validated root handle");
+    const HANDLE root = use.handle->h;
     std::atomic<size_t> next{0};
     constexpr size_t chunk = 16;  // consecutive candidates share directories, so a worker takes them in runs
     auto run = [&](unsigned worker) {
@@ -5366,7 +5407,7 @@ void scan_index(const Request& r, const IndexUse& use, unsigned worker_count, Co
                 const std::string_view name = slash == std::string_view::npos ? path : path.substr(slash + 1);
                 ++out.regular_seen;
                 if (!index_path_passes(r, path, name)) { ++out.files_filtered; continue; }
-                const HANDLE dir = cursor.open(root.h, directory);
+                const HANDLE dir = cursor.open(root, directory);
                 if (dir == INVALID_HANDLE_VALUE) { ++out.index_missing; continue; }
                 if (!index_widen(path, relative)) { ++out.errors; continue; }
                 std::replace(relative.begin(), relative.end(), L'/', L'\\');
@@ -5442,6 +5483,7 @@ public:
     void start() {
         cookie_directory(root_.path);  // created before the watch starts
         root_handle_ = Handle(open_root_directory(root_.path));
+        note_root_id();
         watch_ = Handle(CreateFileW(long_path(root_.path).c_str(), FILE_LIST_DIRECTORY,
                                     FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
                                     FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OVERLAPPED, nullptr));
@@ -5482,7 +5524,7 @@ public:
             return scope.empty() || (path.size() > scope.size() && path[scope.size()] == '/' &&
                                      equals_folded(path.substr(0, scope.size()), scope));
         };
-        std::shared_lock lock(data_);
+        sync::SharedLockGuard lock(data_);
         if (!scope.empty()) {
             bool held = false;
             for (uint32_t id = 0; id < base_->files() && !held; ++id) held = !dead_[id] && below(base_->path(id));
@@ -5511,6 +5553,15 @@ public:
         std::sort(use.candidates.begin(), use.candidates.end(),
                   [](const IndexCandidate& a, const IndexCandidate& b) { return a.path < b.path; });
         return use;
+    }
+
+    // True when `root` (a request's validated root handle) is the folder this index reads. A root replaced by another
+    // folder or a junction since the index opened it is not; that request walks its own handle instead.
+    bool serves_root(HANDLE root) {
+        FILE_ID_INFO id{};
+        if (!root || root == INVALID_HANDLE_VALUE || !file_object_id(root, id)) return false;
+        std::lock_guard lock(watch_mutex_);
+        return root_id_known_ && same_file_id(id, root_id_);
     }
 
 private:
@@ -5745,6 +5796,9 @@ private:
             }
             const auto started = Clock::now();
             try {
+                // SAFETY: a folder can be replaced between batches without an event this batch names; handles
+                // cached by the previous batch are not trusted, so each batch reopens its folders by path.
+                cursor_.forget({});
                 if (rescan) reconcile("");
                 else for (const auto& path : batch) apply_path(path);
             } catch (const std::exception& e) {
@@ -5799,10 +5853,20 @@ private:
         watch_cv_.notify_all();
     }
 
+    // Records which folder root_handle_ opened. CONTRACT: applier thread, or start() before the threads run.
+    void note_root_id() {
+        FILE_ID_INFO id{};
+        const bool known = root_handle_ && file_object_id(root_handle_.h, id);
+        std::lock_guard lock(watch_mutex_);
+        root_id_ = id;
+        root_id_known_ = known;
+    }
+
     // Reopens the root and, when the watcher stopped, the watch itself. The old watch thread has returned before
     // watch_ and overlapped_ are reused. CONTRACT: applier thread only.
     bool restart_watch() {
         root_handle_ = Handle(open_root_directory(root_.path));
+        note_root_id();
         cursor_ = DirCursor{};
         scopes_.clear();
         bool watching = false;
@@ -5854,13 +5918,13 @@ private:
             index_log(false, "index loaded: " + std::to_string(base->files()) + " files, built " + utc_text(base->built()) +
                                  "; checking it against the tree");
         }
-        std::unique_lock lock(data_);
+        sync::LockGuard lock(data_);
         install(std::move(base));
         return build;
     }
 
     // CONTRACT: data_ held exclusively.
-    void install(std::shared_ptr<IndexView> base) {
+    void install(std::shared_ptr<IndexView> base) SHGREP_REQUIRES(data_) {
         base_ = std::move(base);
         ids_.clear();
         ids_.reserve(base_->files());
@@ -5920,6 +5984,7 @@ private:
     // entries reflect attributes and rule files as they were, so a changed folder (hidden, unhidden, recreated) or a
     // changed ignore file must be evaluated afresh. CONTRACT: applier thread only.
     void forget_scopes(const std::string& relative) {
+        cursor_.forget(relative);  // the folder at this path may be a different one now
         if (relative.empty()) { scopes_.clear(); return; }
         scopes_.erase(relative);
         const std::string below = relative + "/";
@@ -6007,7 +6072,7 @@ private:
     }
 
     void put(const std::string& relative, OverlayFile file) {
-        std::unique_lock lock(data_);
+        sync::LockGuard lock(data_);
         file.seq = ++seq_;
         if (const auto id = ids_.find(relative); id != ids_.end()) dead_[id->second] = true;
         overlay_[relative] = std::move(file);
@@ -6016,7 +6081,7 @@ private:
     // Marks `relative` and everything below it removed. CONTRACT: applier thread only (it also drops cached scopes).
     void remove_tree(const std::string& relative) {
         forget_scopes(relative);
-        std::unique_lock lock(data_);
+        sync::LockGuard lock(data_);
         const std::string below = relative + "/";
         const auto mark = [&](const std::string& path) {
             OverlayFile& file = overlay_[path];
@@ -6061,7 +6126,7 @@ private:
         std::unordered_set<std::string> seen_overlay;
         std::vector<std::string> changed;
         {
-            std::shared_lock lock(data_);
+            sync::SharedLockGuard lock(data_);
             seen_base.assign(base_->files(), false);
         }
         struct Item {
@@ -6118,7 +6183,7 @@ private:
                     continue;
                 }
                 if (binary_extension(name)) continue;
-                std::shared_lock lock(data_);
+                sync::SharedLockGuard lock(data_);
                 if (const auto it = overlay_.find(relative); it != overlay_.end()) {
                     seen_overlay.insert(relative);
                     if (!it->second.removed && it->second.size == entry.size && it->second.write_time == entry.write_time) continue;
@@ -6136,7 +6201,7 @@ private:
         // Known files below `start` that the tree no longer has.
         std::vector<std::string> gone;
         {
-            std::shared_lock lock(data_);
+            sync::SharedLockGuard lock(data_);
             const std::string below = start.empty() ? std::string() : start + "/";
             const auto under = [&](std::string_view path) { return below.empty() || path.compare(0, below.size(), below) == 0; };
             for (const auto& [path, id] : ids_)
@@ -6152,7 +6217,7 @@ private:
     void maybe_merge() {
         size_t changed = 0, base_files = 0;
         {
-            std::shared_lock lock(data_);
+            sync::SharedLockGuard lock(data_);
             changed = overlay_.size();
             base_files = base_->files();
         }
@@ -6175,7 +6240,7 @@ private:
         std::map<std::string, OverlayFile> overlay;
         uint64_t snapshot = 0;
         {
-            std::shared_lock lock(data_);
+            sync::SharedLockGuard lock(data_);
             base = base_;
             dead = dead_;
             overlay = overlay_;
@@ -6211,7 +6276,7 @@ private:
         write_index_file(file_, root_final_, files, sorter, dense);
         auto next = std::make_shared<IndexView>(file_, root_.final);
         if (!*next) throw std::runtime_error("the merged index cannot be read back");
-        std::unique_lock lock(data_);
+        sync::LockGuard lock(data_);
         install(std::move(next));
         for (auto it = overlay_.begin(); it != overlay_.end();) {
             if (it->second.seq <= snapshot) {
@@ -6234,12 +6299,12 @@ private:
     const std::string root_final_;
 
     // Index data. data_ guards base_, ids_, dead_, overlay_ and seq_.
-    std::shared_mutex data_;
-    std::shared_ptr<IndexView> base_;
-    std::unordered_map<std::string_view, uint32_t> ids_;  // base path -> id; views into base_'s mapping
-    std::vector<bool> dead_;                               // base ids superseded by overlay_
-    std::map<std::string, OverlayFile> overlay_;          // sorted, so a directory's entries are one range
-    uint64_t seq_ = 0;
+    sync::SharedMutex data_;
+    std::shared_ptr<IndexView> base_ SHGREP_GUARDED_BY(data_);
+    std::unordered_map<std::string_view, uint32_t> ids_ SHGREP_GUARDED_BY(data_);  // base path -> id; views into base_'s mapping
+    std::vector<bool> dead_ SHGREP_GUARDED_BY(data_);                               // base ids superseded by overlay_
+    std::map<std::string, OverlayFile> overlay_ SHGREP_GUARDED_BY(data_);          // sorted, so a directory's entries are one range
+    uint64_t seq_ SHGREP_GUARDED_BY(data_) = 0;
     std::atomic_bool merging_{false};
 
     // Watcher state. watch_mutex_ guards everything here except notify_ while a read is pending.
@@ -6256,6 +6321,9 @@ private:
     std::map<std::string, bool> cookies_;  // sync cookies being waited for -> reported yet
     std::string state_ = "the index is being built";
     std::string reason_;     // the last failure, kept for the recovery's state text
+    // The folder root_handle_ opened, so a request can check that its validated root is the one indexed here.
+    FILE_ID_INFO root_id_{};
+    bool root_id_known_ = false;
 
     // Applier thread state.
     Handle root_handle_;
@@ -6388,7 +6456,17 @@ std::string prepare_index(const Request& r, const SearchContext& context, const 
         if (LiveIndex* live = find_live_index(root.final)) {
             std::string why;
             bool trouble = false;
-            auto use = live->serve(r, control, why, trouble);
+            std::optional<IndexUse> use;
+            // SAFETY: candidates are read through the request's validated handle, and only when it is the folder the
+            // live index reads; a root replaced since then (say by a junction) is walked through that handle.
+            if (!root.handle || !*root.handle || !live->serves_root(root.handle->h)) {
+                why = "the live index cannot confirm it reads this root folder (replaced since it started, or the "
+                      "index is recovering)";
+                trouble = true;
+            } else {
+                use = live->serve(r, control, why, trouble);
+                if (use) use->handle = root.handle;
+            }
             if (!use) {
                 if (tell) note += "[index not used for " + display + ": " + why + "; searched by walking]\n";
                 if (trouble) {
@@ -6679,14 +6757,93 @@ std::optional<Json> text_fallback(const std::string& operation, const Json& argu
     return word_search(names, arguments, scope, extension, "lines",
                        lsp_failure_banner(reason, "Fallback below: " + matches + ", not semantic results"), context, cancelled);
 }
+// True when a plain text search can open code files: its include/extensions/types filters name a code format, or,
+// without filters, its path/roots are folders or code files. Unknown or wildcard extensions count as code.
+bool text_search_reaches_code(const Json::Object& arguments) {
+    static const std::set<std::string> plain_types{"json", "md", "toml", "txt", "xml", "yaml", "msbuild"};
+    const auto strings = [&](const char* key) {
+        std::vector<std::string> out;
+        const auto it = arguments.find(key);
+        if (it == arguments.end()) return out;
+        if (std::holds_alternative<std::string>(it->second.value)) out.push_back(it->second.string());
+        else if (std::holds_alternative<Json::Array>(it->second.value))
+            for (const auto& item : it->second.array())
+                if (std::holds_alternative<std::string>(item.value)) out.push_back(item.string());
+        return out;
+    };
+    const auto lower = [](std::string value) {
+        for (char& c : value) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        return value;
+    };
+    const auto code_extension = [&](std::string extension) {
+        while (!extension.empty() && extension.front() == '.') extension.erase(extension.begin());
+        if (extension.empty() || extension.find_first_of("*?[{") != std::string::npos) return true;
+        return lsp_read_required(native_path("x." + lower(extension)), {});
+    };
+    bool filtered = false, code = false;
+    for (const auto& extension : strings("extensions")) { filtered = true; code = code || code_extension(extension); }
+    for (const auto& type : strings("types")) { filtered = true; code = code || !plain_types.contains(lower(type)); }
+    for (const auto& glob : strings("include")) {
+        filtered = true;
+        const size_t slash = glob.find_last_of("/\\");
+        const std::string name = glob.substr(slash == std::string::npos ? 0 : slash + 1);
+        const size_t dot = name.rfind('.');
+        code = code || dot == std::string::npos || code_extension(name.substr(dot + 1));
+    }
+    if (filtered) return code;
+    std::vector<std::string> scopes = strings("path");
+    for (auto& root : strings("roots")) scopes.push_back(std::move(root));
+    if (scopes.empty()) return true;
+    for (const auto& scope : scopes) {
+        const std::filesystem::path target = native_path(scope);
+        if (!target.has_extension() || lsp_read_required(target, {})) return true;
+    }
+    return false;
+}
+
 } // namespace
+
+// CONTRACT (plain search tool and REPL text search): a text search that can reach code files needs intent (ranked:
+//   the exact pattern matches, best 10 hunks, at most 3 per file, with a count of the rest) or exhaustive=true (every
+//   match in scan order; MCP output over offload_text_bytes is saved to a file with an inline preview). Non-code
+//   scopes and output=count need neither. Unranked greps and whole-window reads are most of a coding agent's tokens
+//   (SWE-Pruner, arXiv 2601.16746). SHGREP_REQUIRE_INTENT=0 (test suites) turns the rule off. exhaustive is removed
+//   from the arguments: the backend reads it only for its own intent rule (the lsp tool path).
+Json gate_plain_text_search(Json arguments, const SearchContext& context) {
+    if (!std::holds_alternative<Json::Object>(arguments.value)) return arguments;
+    auto& object = std::get<Json::Object>(arguments.value);
+    bool exhaustive = false;
+    if (const auto it = object.find("exhaustive"); it != object.end()) {
+        if (!std::holds_alternative<bool>(it->second.value)) throw std::runtime_error("exhaustive must be true or false");
+        exhaustive = it->second.boolean();
+        object.erase(it);
+    }
+    const auto text_value = [&](const char* key) {
+        const auto it = object.find(key);
+        return it != object.end() && std::holds_alternative<std::string>(it->second.value) ? it->second.string() : std::string();
+    };
+    const bool has_intent = text_value("intent").find_first_not_of(" \t\r\n") != std::string::npos;
+    if (exhaustive && has_intent)
+        throw std::runtime_error("exhaustive=true returns every match in scan order; drop intent, or drop exhaustive for "
+                                 "the ranked best 10");
+    if (!context.require_intent || exhaustive || has_intent) return arguments;
+    if (text_value("operation") != "text" || text_value("output") == "count") return arguments;
+    if (!text_search_reaches_code(object)) return arguments;
+    throw std::runtime_error(
+        "search over code files needs intent: the task in words, for example intent=\"where the swapchain is rebuilt "
+        "after a resize\". Ranked search keeps exact pattern matching and returns the best 10 hunks (at most 3 per "
+        "file) with a count of the rest. For every match (renames, impact checks) pass exhaustive=true; large results "
+        "are saved to a file with an inline preview. output=count, and scopes limited to non-code files by path, "
+        "include, extensions or types (md, json, yaml, txt, xml), need neither");
+}
 
 Json run_tool(const std::string& name, const Json& arguments,
               const SearchContext& context, const std::shared_ptr<std::atomic_bool>& cancelled,
               std::shared_ptr<TextStream>* stream, uint64_t text_limit) {
-    if (name == "repl") return run_repl(arguments, context, cancelled);
-    if (name == "lsp") return run_lsp_tool(arguments, context, cancelled);
-    const Json plain_arguments = fallback_arguments(name, arguments, context);
+    if (name == "repl") return run_repl(contracts::normalize_arguments(name, arguments), context, cancelled);
+    if (name == "lsp") return run_lsp_tool(contracts::normalize_arguments(name, arguments), context, cancelled);
+    Json plain_arguments = fallback_arguments(name, arguments, context);
+    if (name == "search") plain_arguments = gate_plain_text_search(std::move(plain_arguments), context);
     SearchContext plain = context;
     plain.require_intent = false;
     return run_backend_tool(name, plain_arguments, plain, cancelled, stream, text_limit);
@@ -6764,7 +6921,7 @@ int64_t default_request_timeout_ms(const std::string& name, const Json& argument
         // Text reads of code files are served by LSP (lsp_read_required), so they get the semantic deadline.
         const auto code = [](const Json* value) {
             const auto* text = value ? std::get_if<std::string>(&value->value) : nullptr;
-            return text && !text->empty() && lsp_read_required(native_path(*text));
+            return text && !text->empty() && lsp_read_required(native_path(*text), {});  // no root yet: built-in lists only
         };
         if (code(arguments.get("path"))) return 180000;
         if (const Json* paths = arguments.get("paths"); paths && std::holds_alternative<Json::Array>(paths->value))
@@ -6803,7 +6960,12 @@ Json run_backend_tool(const std::string& name, const Json& arguments,
     const RequestDeadline request(deadline);
     SearchContext request_context = context;
     request_context.record_user_reads = !is_write_tool(name);
-    try { return run_unlocked(name, arguments, request_context, cancelled, stream, text_limit); }
+    try {
+        // "index" is CLI-only and never advertised, so it has no contract entry; MCP calls cannot reach it because
+        // tools/call checks tool_available first. It reads no arguments, only the context's roots.
+        const Json parsed = name == "index" ? Json(Json::Object{}) : contracts::normalize_arguments(name, arguments);
+        return run_unlocked(name, parsed, request_context, cancelled, stream, text_limit);
+    }
     catch (const IndexWarmingFailure& e) {
         throw IndexWarmingFailure(lsp_failure_banner(e.what(), "No semantic result was returned; retry with a larger timeout_ms"),
                                   e.details);
@@ -6852,16 +7014,10 @@ std::string shignore_notice(const SearchContext& context) {
 } // namespace
 
 std::string health_notice(const SearchContext& context) {
-    // Index status is not reported here: it goes to the index log (index_log), never into tool results.
-    std::string notice = shignore_notice(context);
-    std::vector<std::string> problems;
-    // Optional ranking services are checked only by ranked searches.
-    for (auto& problem : lsp_health()) problems.push_back(std::move(problem));
-    if (problems.empty()) return notice;
-    std::string detail = "shgrep is not fully working: ";
-    for (size_t i = 0; i < problems.size(); ++i) detail += (i ? "; " : "") + problems[i];
-    return notice + failure_banner("SHGREP HEALTH", detail, "Everything else works; a request that needs a broken part fails "
-                                   "or uses explicitly requested text fallback under its own banner");
+    // Index status is not reported here: it goes to the index log (index_log), never into tool results. Optional
+    // ranking services are checked only by ranked searches. Missing language servers are not reported at session
+    // start: lsp_language_notice names one after a tool result shows the model files it would handle (#101).
+    return shignore_notice(context);
 }
 
 namespace {
@@ -6910,14 +7066,22 @@ Json run_unlocked(const std::string& name, const Json& arguments, const SearchCo
         if (operation == "text") {
             for (const char* key : {"name_path", "include_body", "full_lines", "include_info", "include_kinds", "exclude_kinds", "depth", "substring_matching", "line", "column", "include_declaration"})
                 if (arguments.get(key)) throw std::runtime_error(std::string(key) + " is only supported by LSP navigation");
-            if (context.require_intent && text(arguments, "intent").find_first_not_of(" \t\r\n") == std::string::npos)
+            const bool exhaustive_text = boolean(arguments, "exhaustive", false);
+            if (exhaustive_text && text(arguments, "intent").find_first_not_of(" \t\r\n") != std::string::npos)
+                throw std::runtime_error("exhaustive=true returns every match in scan order; drop intent, or drop exhaustive "
+                                         "for the ranked best 10");
+            if (context.require_intent && !exhaustive_text &&
+                text(arguments, "intent").find_first_not_of(" \t\r\n") == std::string::npos)
                 throw std::runtime_error("operation=text requires intent: the user's task in words. Built-in BM25 always ranks "
                                          "the findings (an optional reranker, when running, reorders the top ones) and the "
-                                         "best 10 hunks return; for symbols use the LSP operations");
+                                         "best 10 hunks return; for every match pass exhaustive=true; for symbols use the LSP "
+                                         "operations");
         }
         // GPU build (#87): LSP symbols ranked by meaning for a question in words.
         if (operation == "meaning") {
-            static const std::set<std::string> meaning_args{"operation", "intent", "path", "max_results", "timeout_ms", "output"};
+            // CONTRACT: profile is a hidden benchmark switch (phase timings), absent from tool_definitions like text search's.
+            static const std::set<std::string> meaning_args{"operation", "intent", "path", "max_results", "timeout_ms", "output",
+                                                            "profile"};
             for (const auto& [key, value] : arguments.object()) {
                 (void)value;
                 if (!meaning_args.contains(key))
@@ -7270,6 +7434,11 @@ Json run_unlocked(const std::string& name, const Json& arguments, const SearchCo
         for (size_t i : order) sorted.push_back(std::move(results[i]));
         results = std::move(sorted);
     }
+    // The files this result shows the model; a missing language server for them is named afterwards (#101).
+    for (const auto& block : blocks) lsp_note_listed_file(block.path);
+    for (const auto& item : results)
+        if (const Json* path = item.get("path"); path && std::holds_alternative<std::string>(path->value))
+            lsp_note_listed_file(path->string());
     Json rank_report;
     std::string rank_note;  // told to the reader when ranking returned fewer hunks than it found or ran without the reranker
     if (ranker) {
@@ -7444,9 +7613,13 @@ Json run_unlocked(const std::string& name, const Json& arguments, const SearchCo
                              std::to_string(matching_files) + " matching files, ordered by each file's best hunk for the "
                              "intent; narrow path, include or the patterns to see the rest";
         } else if (ranked.size() < pieces.size()) {
+            std::set<std::string_view> hunk_files;
+            for (const auto& piece : pieces) hunk_files.insert(piece.path);
             rank_note += std::string(rank_note.empty() ? "" : ". ") + "showing " + std::to_string(ranked.size()) + " of " +
-                         std::to_string(pieces.size()) + " matching hunks, best first for the intent; narrow path, include or "
-                         "the patterns, or use LSP references, to see the rest";
+                         std::to_string(pieces.size()) + " matching hunks in " + std::to_string(hunk_files.size()) +
+                         (hunk_files.size() == 1 ? " file" : " files") + ", best first for the intent; for every match search "
+                         "again with exhaustive=true and no intent, or narrow path, include or the patterns, or use LSP "
+                         "references, to see the rest";
         }
         if (state == "limit")
             rank_note += std::string(rank_note.empty() ? "" : ". ") +
@@ -7698,128 +7871,7 @@ Json run_unlocked(const std::string& name, const Json& arguments, const SearchCo
 // CONTRACT: these descriptions are the model's only documentation of the tools; every statement must match the
 // implementation. Update them with any behavior change.
 Json tool_definitions() {
-    // PERF: these schemas are sent to the model with every session; every word costs tokens. Keep contracts an
-    // agent needs to call correctly, nothing else.
-    auto schema = [](Json::Object properties) -> Json {
-        return Json::Object{{"type", "object"}, {"properties", std::move(properties)}, {"additionalProperties", false}};
-    };
-    auto field = [](const char* type, const char* description) -> Json {
-        return Json::Object{{"type", type}, {"description", description}};
-    };
-    auto list = [](const char* description) -> Json {
-        return Json::Object{{"type", "array"}, {"items", Json::Object{{"type", "string"}}}, {"description", description}};
-    };
-    auto choice = [](Json::Array values, const char* description) -> Json {
-        return Json::Object{{"type", "string"}, {"enum", std::move(values)}, {"description", description}};
-    };
-    Json::Object common{
-        {"roots", list("Absolute dirs inside the configured roots. Default: the workspace (first root) only.")},
-        {"types", list("File types: asm bat c cmake cpp cs css go h html java js json lua make md msbuild proto ps py "
-                       "rust sh sql toml ts txt xml yaml.")},
-        {"include", list("File globs (* ?, case-insensitive). Without '/' a glob matches the whole filename, with '/' "
-                         "the whole relative path: \"*.cpp\", \"*parser*\", \"src/*\".")},
-        {"exclude", list("Globs of files or dirs to skip; a matching dir is not entered: \"third_party\".")},
-        {"extensions", list("Extensions to keep: [\"cpp\", \"h\"].")},
-        {"path_filter", field("string", "Substring of the relative path.")},
-        {"no_ignore", field("boolean", "Include .gitignore/.ignore/.shignore'd files.")},
-        {"hidden", field("boolean", "Include hidden files.")},
-        {"max_results", field("integer", "Optional result limit, 1-10000; default or 0 is unlimited. Set 50 for a short result list.")},
-        {"paths", choice(Json::Array{"absolute", "relative"}, "Default: relative to the configured root when there is one, absolute with multiple configured roots. Explicit relative uses one configured root when all selected targets share it; otherwise paths remain absolute.")},
-        {"max_output_bytes", field("integer", "Optional byte cap, 512-1048576; default unlimited.")},
-        {"timeout_ms", field("integer", "Request deadline, 1-300000 ms; semantic search defaults to 180000, text search to 30000, and find_files to 300000. Partial timed-out text searches get up to 1000 ms extra for response encoding.")}};
-
-    auto content_props = common;
-    content_props.emplace("allow_text_fallback", field("boolean", "For semantic search, permit labeled whole-word text matches when LSP fails and a name can be determined; these are not semantic results. Has no effect on ordinary text or byte searches. Default false."));
-    content_props.emplace("pattern", field("string", "One pattern; search LSP mode accepts symbol name paths and #kind hints such as ClassName#ctor. Plain generic type names match generic symbols."));
-    content_props.emplace("patterns", list("Text: up to 1000 in one pass. LSP: symbol name paths with optional #kind hints; plain generic type names match generic symbols."));
-    content_props.emplace("max_matches_per_file", field("integer", "Optional per-file match limit; default unlimited."));
-    content_props.emplace("context_bytes", field("integer", "json: context bytes per side, default 80."));
-    content_props.emplace("context_before_bytes", field("integer", "json: context bytes before."));
-    content_props.emplace("context_after_bytes", field("integer", "json: context bytes after."));
-
-    auto search_props = content_props;
-    search_props["roots"] = list("Text search accepts absolute files and directories inside configured roots, including mixtures. Explicit files are searched directly; duplicates are skipped. Default: the workspace (first root) only; name other roots to search them.");
-    search_props.emplace("intent", field("string",
-        "Required for operation=text: the task in words, to locate where something is. Built-in BM25 always ranks the hunks "
-        "(at most 3 per file) and the best 10 return; an optional reranker (off unless SHGREP_RERANK_PORT is set), when "
-        "running, only reorders the top ones. A note says how many were left out."));
-    search_props.emplace("operation", choice(Json::Array{"symbols", "definition", "declaration", "type_definition", "implementation", "references", "hover", "text"},
-        "Default symbols via LSP. text uses live grep; its text filters and budgets apply only there."));
-    search_props.emplace("path", field("string", "File or folder to limit text search or symbols to; other navigation needs a file. Omit for all workspaces."));
-    search_props.emplace("name_path", field("string", "Symbol name or slash-separated parent/name. /prefix anchors at the root; otherwise suffix match. Append #kind (e.g. ClassName#ctor). Plain generic names match generic symbols; unique lookups require one generic match and report candidates if ambiguous. Other ambiguities return candidates; overloads take an index such as Name[0]. No parent is selected."));
-    search_props.emplace("include_body", field("boolean", "Include complete symbol bodies; default false."));
-    search_props.emplace("full_lines", field("boolean", "With include_body, return complete touched source lines and body_range; inline lines may contain neighboring code. Default false."));
-    search_props.emplace("substring_matching", field("boolean", "Substring match on the last name-path component only; default false."));
-    search_props.emplace("include_info", field("boolean", "Include hover/signature information for symbol hits; default false."));
-    search_props.emplace("depth", field("integer", "Child depth from each symbol hit, default 0; -1 all."));
-    search_props.emplace("include_kinds", Json::Object{{"type", "array"}, {"items", Json::Object{{"type", "integer"}}}, {"description", "LSP kinds 1-26 to include."}});
-    search_props.emplace("exclude_kinds", Json::Object{{"type", "array"}, {"items", Json::Object{{"type", "integer"}}}, {"description", "LSP kinds to exclude."}});
-    search_props.emplace("line", field("integer", "1-based usage line for definition/references, instead of name_path."));
-    search_props.emplace("column", field("integer", "1-based UTF-16 column; use with line."));
-    search_props.emplace("include_declaration", field("boolean", "Include declaration in references; default false."));
-    search_props.emplace("mode", choice(Json::Array{"regex", "literal"},
-        "Default regex (PCRE, per line). Backreferences, lookaround or \\b make the whole call slow; use word."));
-    search_props.emplace("case_insensitive", field("boolean", "Unicode-aware."));
-    search_props.emplace("output", choice(Json::Array{"lines", "files", "files_without_match", "count", "json"},
-        "lines (default, grouped by file; omit path for a single file; over 50 matches start with a summary line naming the busiest files), files (cheapest), files_without_match, count, json (byte offsets)."));
-    search_props.emplace("context_lines", field("integer", "Lines around matches, 0-100."));
-    search_props.emplace("before_lines", field("integer", "Lines before matches."));
-    search_props.emplace("after_lines", field("integer", "Lines after matches."));
-    search_props.emplace("max_line_bytes", field("integer", "Optional line window; default 0 shows whole lines."));
-    search_props.emplace("block", field("boolean", "Show each match inside its whole enclosing function (else class); "
-                                                   "lines output. Brace languages and Python."));
-    search_props.emplace("max_block_lines", field("integer", "Optional block line limit; default unlimited. Longer blocks show the header and match context (3 lines each side unless context is explicitly set, including zero)."));
-    search_props.emplace("invert", field("boolean", "Lines matching no pattern (not json)."));
-    search_props.emplace("multiline", field("boolean", "Matches may span lines."));
-    search_props.emplace("word", field("boolean", "Whole words; fast, unlike \\b."));
-    search_props.emplace("line_numbers", field("boolean", "Default true."));
-    search_props.emplace("sniff_all", field("boolean", "Also open binary-extension files."));
-    search_props.emplace("index", field("boolean", "Use the trigram index: opens only candidates. Default true unless "
-                                                   "the server runs --no-live-index. Results equal a plain search: "
-                                                   "the live index syncs with the watcher first, a snapshot is "
-                                                   "checked against the tree."));
-    search_props.emplace("max_file_bytes", field("integer", "Skip larger text files; default 256 MiB, max 512 MiB. Over 64 MiB, files are scanned in line chunks; multiline, invert and block skip them."));
-
-    auto bytes_props = content_props;
-    bytes_props.erase("allow_text_fallback");  // byte searches never consult LSP, so the flag has no meaning here
-    bytes_props.emplace("mode", choice(Json::Array{"literal", "regex"},
-        "literal (default): hex such as \"4d5a\". regex: byte regex such as \"\\\\x4d\\\\x5a\" or plain ASCII."));
-    bytes_props.emplace("case_insensitive", field("boolean", "ASCII only."));
-    bytes_props.emplace("output", choice(Json::Array{"json", "files", "count"}, "Default json (offsets, hex context)."));
-    bytes_props.emplace("line_numbers", field("boolean", "Add lines to json."));
-
-    auto files_props = common;
-    files_props.emplace("allow_text_fallback", field("boolean", "Symbol searches only: explicitly permit text fallback after LSP failure. Default false."));
-    files_props.emplace("operation", choice(Json::Array{"filesystem", "symbols", "lsp"}, "Default filesystem. symbols finds files containing symbol hits; lsp lists configured source files without starting servers."));
-    files_props.emplace("path", field("string", "LSP file/directory scope; omit for all configured roots."));
-    files_props.emplace("pattern", field("string", "symbols: name-path pattern; accepts #kind hints and plain generic type names."));
-    files_props.emplace("name_path", field("string", "symbols: alternative to pattern; accepts #kind hints and plain generic type names."));
-    files_props.emplace("substring_matching", field("boolean", "symbols: substring match on final component."));
-    files_props.emplace("include_kinds", Json::Object{{"type", "array"}, {"items", Json::Object{{"type", "integer"}}}});
-    files_props.emplace("exclude_kinds", Json::Object{{"type", "array"}, {"items", Json::Object{{"type", "integer"}}}});
-    files_props.emplace("exact_name", field("string", "Whole filename, case-insensitive."));
-    files_props.emplace("substring", field("string", "Text in the name or relative path."));
-    files_props.emplace("glob", field("string", "Glob on the name or relative path."));
-    files_props.emplace("output", choice(Json::Array{"lines", "json"}, "Default lines."));
-
-    return Json::Array{
-        Json::Object{{"name", "search"}, {"description",
-            "Navigate live code through LSP: symbols, definition/declaration/type_definition, implementation, references, or hover. "
-            "Bodies are opt-in; no LSP output cap. Lua, XML, C/C++, Rust, Python and C# (with the .NET 10+ SDK) work out of the box; .shgrep/lsp.json adds or overrides servers. "
-            "Semantic operations require LSP. Text/byte searches can read all file types without a server. Semantic fallback remains explicit. "
-            "operation=text requires intent (the task in words): built-in BM25 always ranks the hunks (at most 3 per file) "
-            "and the best 10 return, with a note on how many were left out. An optional reranker (off unless "
-            "SHGREP_RERANK_PORT is set), when running, only reorders the top ones; without it BM25 order is final. For every reference to a symbol "
-            "use operation=references. "
-            "Text searches skip programming/XML files before reading; explicit fallback cannot bypass a working server."},
-            {"inputSchema", schema(search_props)}},
-        Json::Object{{"name", "search_bytes"}, {"description",
-            "Search raw bytes in any file, including programming/XML files, by hex or byte regex; exact offsets. No language server is required."},
-            {"inputSchema", schema(bytes_props)}},
-        Json::Object{{"name", "find_files"}, {"description",
-            "Find live files by name/path, configured LSP source files, or files containing symbol hits. Use list_dir for folder or symbol overviews."},
-            {"inputSchema", schema(files_props)}}
-    };
+    return contracts::tool_definitions(0);
 }
 
 bool tool_available(const std::string& name, const SearchContext& context) {

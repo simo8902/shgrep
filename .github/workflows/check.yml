@@ -1,0 +1,12 @@
+name: Check repository
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  check:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+      - run: Get-ChildItem

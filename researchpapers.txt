@@ -1,0 +1,86 @@
+https://doi.org/ + paper doi
+
+index:
+  cs.SE  doi:10.48550/arXiv.2403.03751  [06.03.2024]
+  cs.DB  doi:10.48550/arXiv.2504.12251  [16.04.2025]
+  cs.DB  doi:10.48550/arXiv.2510.10348  [11.10.2025]
+  cs.DB  doi:10.48550/arXiv.1108.1228   [04.08.2011]
+
+index-merge:
+  cs.DB  doi:10.48550/arXiv.1812.07527  [18.12.2018]
+  cs.IR  doi:10.48550/arXiv.1305.0699   [03.05.2013]
+  cs.DS  doi:10.48550/arXiv.0801.2378   [15.01.2008]
+  cs.IR  doi:10.48550/arXiv.2211.06030  [11.11.2022]
+
+index-freshness:
+  cs.DB  doi:10.48550/arXiv.2605.01260  [02.05.2026]
+
+agent-index:
+  cs.AI  doi:10.48550/arXiv.2606.22417  [21.06.2026]
+
+agent-search:
+  cs.CL  doi:10.48550/arXiv.2605.15184  [14.05.2026]
+  cs.IR  doi:10.48550/arXiv.2607.24882  [27.07.2026]
+  cs.SE  doi:10.48550/arXiv.2608.01507  [02.08.2026]
+
+navigation:
+  cs.PL  doi:10.48550/arXiv.2211.01224  [02.11.2022]
+
+lsp:
+  cs.CL  doi:10.48550/arXiv.2510.22907  [27.10.2025]
+  cs.SE  doi:10.48550/arXiv.2510.00532  [01.10.2025]
+  cs.SE  doi:10.48550/arXiv.2605.16664  [15.05.2026]
+  cs.SE  doi:10.48550/arXiv.2604.18413  [20.04.2026]
+  cs.CL  doi:10.48550/arXiv.2608.13568  [29.06.2026]
+
+atomic-write:
+  cs.OS  doi:10.48550/arXiv.1810.02904  [05.10.2018]
+  cs.OS  doi:10.48550/arXiv.2503.01390  [03.03.2025]
+
+tool-output:
+  cs.AI  doi:10.48550/arXiv.2511.22729  [27.11.2025]
+  cs.AI  doi:10.48550/arXiv.2609.26121  [06.08.2026]
+  cs.CL  doi:10.48550/arXiv.2608.26130  [23.06.2026]
+  cs.SE  doi:10.48550/arXiv.2405.15793  [06.05.2024]
+  cs.LG  doi:10.48550/arXiv.2609.32961  [26.09.2026]
+  cs.SE  doi:10.48550/arXiv.2604.04979  [04.04.2026]
+  cs.AI  doi:10.48550/arXiv.2605.29676  [28.05.2026]
+  cs.CL  doi:10.48550/arXiv.2606.17016  [15.06.2026]
+  cs.OS  doi:10.48550/arXiv.2603.09023  [09.03.2026]
+  cs.AI  doi:10.48550/arXiv.2606.10209  [08.06.2026]
+  cs.SE  doi:10.48550/arXiv.2604.11045  [13.04.2026]
+  cs.DC  doi:10.48550/arXiv.2607.00151  [30.06.2026]
+  cs.AI  doi:10.48550/arXiv.2603.05344  [05.03.2026]
+  cs.AI  doi:10.48550/arXiv.2609.26779  [22.09.2026]
+  cs.SE  doi:10.48550/arXiv.2508.21433  [29.08.2025]
+  cs.SE  doi:10.48550/arXiv.2601.16746  [23.01.2026]
+  cs.SE  doi:10.48550/arXiv.2604.26102  [28.04.2026]
+
+agent-workarounds:
+  cs.AI  doi:10.48550/arXiv.2608.29460  [29.08.2026]
+
+symbol-index:
+  cs.SE  doi:10.48550/arXiv.2603.27277  [28.03.2026]
+  cs.SE  doi:10.48550/arXiv.2604.03515  [03.04.2026]
+  cs.SE  doi:10.48550/arXiv.2607.25431  [28.07.2026]
+
+change-detection:
+  cs.PL  doi:10.48550/arXiv.2108.12469  [27.08.2021]
+  cs.SE  doi:10.48550/arXiv.2606.20989  [18.06.2026]
+  cs.SE  doi:10.48550/arXiv.1203.2704   [13.03.2012]
+
+workspace-profile:
+  cs.SE  doi:10.48550/arXiv.2101.08508  [21.01.2021]
+  cs.PL  doi:10.48550/arXiv.1704.00135  [01.04.2017]
+  cs.SE  doi:10.48550/arXiv.1806.04556  [12.06.2018]
+  cs.SE  doi:10.48550/arXiv.2605.08435  [08.05.2026]
+  cs.SE  doi:10.48550/arXiv.2506.17948  [22.06.2025]
+  cs.SE  doi:10.48550/arXiv.2601.10112  [15.01.2026]
+  cs.SE  doi:10.48550/arXiv.2605.15815  [15.05.2026]
+
+cs.AR = Hardware Architecture; cs.CE = Computational Engineering, Finance, and Science; cs.CL = Computation and Language; cs.CR = Cryptography and Security; cs.CV = Computer Vision and Pattern Recognition; cs.DC = Distributed, Parallel, and Cluster Computing; cs.DL = Digital Libraries; cs.DS = Data Structures and Algorithms; cs.ET = Emerging Technologies; cs.GL = General Literature; cs.GR = Graphics; cs.HC = Human-Computer Interaction; cs.IR = Information Retrieval; cs.MA = Multiagent Systems; cs.NE = Neural and Evolutionary Computing; cs.PF = Performance; cs.SD = Sound; cs.SI = Social and Information Networks; cs.SY = Systems and Control
+
+cs.CC = Computational Complexity; cs.CG = Computational Geometry; cs.DM = Discrete Mathematics; cs.FL = Formal Languages and Automata Theory; cs.NA = Numerical Analysis; cs.SC = Symbolic Computation
+math.CO = Combinatorics; math.NA = Numerical Analysis; math.OC = Optimization and Control; math.PR = Probability; math.ST = Statistics Theory
+
+Made by the stupid Simeon
