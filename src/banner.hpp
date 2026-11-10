@@ -1,4 +1,5 @@
 #pragma once
+#include <stdexcept>
 #include <string>
 
 namespace shgrep {
@@ -9,4 +10,11 @@ namespace shgrep {
 inline std::string failure_banner(const std::string& kind, const std::string& detail, const std::string& fallback) {
     return "[" + kind + " - tell the user about this in your next message, before continuing: " + detail + ". " + fallback + "]\n";
 }
+// A refused call that the agent fixes with its next call: search over code without intent, an unknown or semantic
+// field on a plain tool, a text edit of a code file. Its message names that next call. MCP errors of this type get no
+// failure banner: nothing failed that the user must hear about, and the banner costs tokens and reads as a broken tool
+// (#22, #103).
+struct UsageError : std::runtime_error {
+    using std::runtime_error::runtime_error;
+};
 }

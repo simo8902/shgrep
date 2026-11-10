@@ -473,13 +473,23 @@ const fs::path& bundled_directory() {
         std::wstring configured(32768, L'\0');
         const DWORD n = GetEnvironmentVariableW(L"SHGREP_LSP_ROOT", configured.data(),
                                                 static_cast<DWORD>(configured.size()));
+        const fs::path executable = executable_directory();
+        const fs::path own = executable.empty() ? fs::path{} : executable / L"lsp";
         if (n > 0 && n < configured.size()) {
             fs::path root(std::wstring(configured.data(), n));
-            if (!root.is_absolute()) root = executable_directory() / root;
-            return root.lexically_normal() / L"lsp";
+            if (!root.is_absolute()) root = executable / root;
+            const fs::path chosen = root.lexically_normal() / L"lsp";
+            // A stale SHGREP_LSP_ROOT (a removed build folder) switched every bundled server off without a word:
+            // no clangd, no symbol search, an empty meaning index. Use the servers beside shgrep.exe instead.
+            std::error_code error;
+            if (!fs::is_directory(chosen, error) && !own.empty() && fs::is_directory(own, error)) {
+                index_log(true, "SHGREP_LSP_ROOT " + utf8(root.wstring()) + " has no lsp folder; using the language "
+                                "servers in " + utf8(own.wstring()) + ". Fix the setting in the MCP configuration.");
+                return own;
+            }
+            return chosen;
         }
-        const fs::path executable = executable_directory();
-        return executable.empty() ? fs::path{} : executable / L"lsp";
+        return own;
     }();
     return directory;
 }
@@ -2915,8 +2925,10 @@ struct Symbol {
 //   repositories (arXiv 2604.18413); Serena keeps a content-hash symbol cache the same way. Folder symbol searches
 //   answer from it without opening the file in the server; a miss asks the server and fills it. Empty outlines are
 //   kept only after the server's index was ready once; C# (syntax-only until its project loads) is never kept. Full outlines stay in memory up to kMaxSymbols
-//   symbols (least recently used dropped first); each file's distinct names (up to kMaxNames) with their stamps are
-//   also saved to %LOCALAPPDATA%\shgrep\symbol-names.bin, so restarts keep skipping unchanged files.
+//   symbols (least recently used dropped first); each file's distinct names (up to kMaxNames) with their stamps, and
+//   its full outline while it is kept, are saved to %LOCALAPPDATA%\shgrep\symbol-names.bin, so a restarted server
+//   neither re-reads unchanged files nor asks the language server for their outlines again (clangd needs 2-6 s per
+//   file on Nebula; a benchmark starting one server per mode paid that again in every mode).
 class SymbolIndex {
 public:
     // Full outlines (every symbol with ranges) are large; names are small. The name layer decides which files a
@@ -3030,17 +3042,32 @@ public:
             if (!raw) return std::nullopt;
             return std::string(*raw);
         };
+        const auto signed_number = [&]() -> std::optional<int64_t> {
+            const auto value = number();
+            if (!value) return std::nullopt;
+            return static_cast<int64_t>(static_cast<int32_t>(*value));
+        };
+        const auto saved_range = [&]() -> std::optional<Range> {
+            Range r;
+            for (int64_t* field : {&r.start.line, &r.start.column, &r.end.line, &r.end.column}) {
+                const auto value = signed_number();
+                if (!value) return std::nullopt;
+                *field = *value;
+            }
+            return r;
+        };
         std::unordered_map<std::string, Names> loaded;
-        size_t loaded_names = 0;
+        std::vector<std::pair<std::string, Outline>> loaded_outlines;
+        size_t loaded_names = 0, loaded_symbols = 0;
         const auto magic = take(kSavedMagic.size());
         auto entries = magic && *magic == kSavedMagic ? number() : std::nullopt;
-        // Every entry holds at least four length fields, so a count larger than that allows is a damaged file.
-        if (!entries || *entries > (bytes.size() - at) / 16) return;
+        // Every entry holds at least five length fields, so a count larger than that allows is a damaged file.
+        if (!entries || *entries > (bytes.size() - at) / 20) return;
         for (uint32_t i = 0; i < *entries; ++i) {
             auto key = text(), sha256 = text(), stamp = text();
             const auto count = number();
             if (!key || !sha256 || !stamp || !count || *count > (bytes.size() - at) / 4) return;
-            Names entry{std::move(*sha256), std::move(*stamp), {}, false};
+            Names entry{*sha256, std::move(*stamp), {}, false};
             entry.names.reserve(*count);
             for (uint32_t n = 0; n < *count; ++n) {
                 auto name = text();
@@ -3049,11 +3076,40 @@ public:
             }
             loaded_names += entry.names.size();
             if (loaded_names > kMaxNames) return;
+            // The full outline of the same bytes, or kNoOutline when it was not kept.
+            const auto symbols = number();
+            if (!symbols) return;
+            if (*symbols != kNoOutline) {
+                // A saved symbol is at least two text lengths and eleven numbers.
+                if (*symbols > (bytes.size() - at) / 52) return;
+                Outline outline{std::move(*sha256), {}, {}};
+                outline.symbols.reserve(*symbols);
+                for (uint32_t n = 0; n < *symbols; ++n) {
+                    auto name = text(), name_path = text();
+                    const auto kind = signed_number();
+                    const auto extent = saved_range(), selection = saved_range();
+                    const auto depth = signed_number();
+                    const auto has_body = number();
+                    if (!name || !name_path || !kind || !extent || !selection || !depth || !has_body) return;
+                    outline.symbols.push_back(Symbol{std::move(*name), std::move(*name_path), *kind, *extent, *selection,
+                                                     static_cast<int>(*depth), *has_body != 0});
+                }
+                if (loaded_symbols + outline.symbols.size() <= kMaxSymbols) {
+                    loaded_symbols += outline.symbols.size();
+                    loaded_outlines.emplace_back(*key, std::move(outline));
+                }
+            }
             loaded.emplace(std::move(*key), std::move(entry));
         }
         if (at != bytes.size()) return;
         names_ = std::move(loaded);
         name_total_ = loaded_names;
+        for (auto& [key, outline] : loaded_outlines) {
+            order_.push_back(key);
+            outline.position = std::prev(order_.end());
+            outlines_.emplace(key, std::move(outline));
+        }
+        total_ = loaded_symbols;
     }
     // Writes the name layer when it changed, at most every 30 seconds; atomic (temporary file, then replace).
     void save_if_due() {
@@ -3072,6 +3128,12 @@ public:
             for (const auto& [key, entry] : names_) count += !entry.stamp.empty() && (!used_only || entry.used);
             bytes.append(kSavedMagic);
             put_number(count);
+            const auto put_signed = [&](int64_t value) { put_number(static_cast<uint32_t>(static_cast<int32_t>(value))); };
+            const auto put_range = [&](const Range& r) {
+                put_signed(r.start.line); put_signed(r.start.column); put_signed(r.end.line); put_signed(r.end.column);
+            };
+            // Full outlines go into at most half the file; past that, entries keep their names only.
+            size_t outline_bytes = 0;
             for (const auto& [key, entry] : names_) {
                 if (entry.stamp.empty() || (used_only && !entry.used)) continue;
                 put_text(key);
@@ -3079,6 +3141,24 @@ public:
                 put_text(entry.stamp);
                 put_number(entry.names.size());
                 for (const auto& name : entry.names) put_text(name);
+                const auto outline = outlines_.find(key);
+                const size_t before = bytes.size();
+                if (outline == outlines_.end() || outline->second.sha256 != entry.sha256 ||
+                    outline_bytes > static_cast<size_t>(kMaxSavedBytes / 2)) {
+                    put_number(kNoOutline);
+                    continue;
+                }
+                put_number(outline->second.symbols.size());
+                for (const auto& symbol : outline->second.symbols) {
+                    put_text(symbol.name);
+                    put_text(symbol.name_path);
+                    put_signed(symbol.kind);
+                    put_range(symbol.extent);
+                    put_range(symbol.selection);
+                    put_signed(symbol.depth);
+                    put_number(symbol.has_body ? 1 : 0);
+                }
+                outline_bytes += bytes.size() - before;
             }
             if (bytes.size() > kMaxSavedBytes) return;
             dirty_ = false;
@@ -3109,7 +3189,9 @@ public:
         }
     }
 private:
-    static constexpr std::string_view kSavedMagic = "SHGSYMN1";
+    // Version 2 adds each entry's full outline; a version 1 file is ignored and rewritten on the next save.
+    static constexpr std::string_view kSavedMagic = "SHGSYMN2";
+    static constexpr uint32_t kNoOutline = 0xFFFFFFFFu;
     static constexpr int64_t kMaxSavedBytes = 256LL << 20;
     struct Outline {
         std::string sha256;
@@ -4443,11 +4525,17 @@ std::string require_text_access(const SourceText& source, const Json& arguments,
     const bool allow_fallback = flag(arguments, "allow_text_fallback");
     if (!lsp_required(source.path, source.root)) return {};
     const std::string path = utf8(source.path.wstring());
+    // The refusal names the edit calls to make instead, with this file filled in (arXiv 2609.35381).
+    std::string json_path = path;
+    std::replace(json_path.begin(), json_path.end(), '\\', '/');
+    const std::string next = " Edit it with the lsp tool: method=edit.replace_in_symbol, arguments={\"relative_path\":\"" +
+        json_path + "\",\"name_path\":\"<Class/Method>\",\"needle\":\"<old text>\",\"repl\":\"<new text>\"}; imports and "
+        "other lines outside symbols: method=edit.replace_outside_symbols with relative_path, needle and repl.";
     if (!allow_fallback)
-        fail(path + ": Text edits require the direct lsp tool for programming files and XML. "
-             "Text fallback requires allow_text_fallback=true and an unavailable or failing language server");
+        throw UsageError(path + ": Text edits require the direct lsp tool for programming files and XML." + next +
+                         " Text fallback requires allow_text_fallback=true and an unavailable or failing language server");
     const std::string reason = lsp_fallback_reason(source, arguments, context, cancelled);
-    if (reason.empty()) fail(path + ": LSP is working; unrestricted text edits are forbidden. Use the direct lsp tool for symbol edits");
+    if (reason.empty()) throw UsageError(path + ": LSP is working; unrestricted text edits are forbidden." + next);
     return lsp_failure_banner(reason, "Explicit text fallback for " + path);
 }
 

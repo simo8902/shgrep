@@ -6604,6 +6604,14 @@ bool workspace_too_broad(const SearchContext& context) {
     return !final.empty() && broad_index_root(final);
 }
 
+// Without a live index (--no-live-index, --read-only) the log still gets a file: language-server warm-up, folder
+// queries and meaning-index progress went only to stderr, which MCP clients and benchmark scripts discard.
+// Read-only mode never writes into the workspace, so its log goes to %LOCALAPPDATA%\shgrep\index.log.
+void open_workspace_log(const SearchContext& context) {
+    if (context.allowed_roots.empty()) return;
+    open_index_log(context, context.read_only || workspace_too_broad(context));
+}
+
 void start_live_indexes(const SearchContext& context) {
     if (context.read_only) return;  // the live index writes its files and cookies into the workspace
     if (context.allowed_roots.empty()) return;
@@ -6824,17 +6832,26 @@ Json gate_plain_text_search(Json arguments, const SearchContext& context) {
     };
     const bool has_intent = text_value("intent").find_first_not_of(" \t\r\n") != std::string::npos;
     if (exhaustive && has_intent)
-        throw std::runtime_error("exhaustive=true returns every match in scan order; drop intent, or drop exhaustive for "
+        throw UsageError("exhaustive=true returns every match in scan order; drop intent, or drop exhaustive for "
                                  "the ranked best 10");
     if (!context.require_intent || exhaustive || has_intent) return arguments;
     if (text_value("operation") != "text" || text_value("output") == "count") return arguments;
     if (!text_search_reaches_code(object)) return arguments;
-    throw std::runtime_error(
-        "search over code files needs intent: the task in words, for example intent=\"where the swapchain is rebuilt "
-        "after a resize\". Ranked search keeps exact pattern matching and returns the best 10 hunks (at most 3 per "
-        "file) with a count of the rest. For every match (renames, impact checks) pass exhaustive=true; large results "
-        "are saved to a file with an inline preview. output=count, and scopes limited to non-code files by path, "
-        "include, extensions or types (md, json, yaml, txt, xml), need neither");
+    // The refusal names the exact calls to make next: errors that name the next call recover far more often than
+    // errors that only state the cause (arXiv 2609.35381). An identifier pattern is offered to lsp by name.
+    const std::string pattern = text_value("pattern");
+    const bool identifier = !pattern.empty() && pattern.size() <= 128 &&
+        (std::isalpha(static_cast<unsigned char>(pattern.front())) || pattern.front() == '_') &&
+        std::all_of(pattern.begin(), pattern.end(), [](char c) { return std::isalnum(static_cast<unsigned char>(c)) || c == '_'; });
+    const std::string symbol = identifier ? pattern : "<symbol name>";
+    throw UsageError(
+        "search over code files needs intent. Repeat this call with intent=\"<the task in words>\" added, for example "
+        "intent=\"where the swapchain is rebuilt after a resize\": exact pattern matching stays, and the best 10 hunks "
+        "(at most 3 per file) return with a count of the rest. Every text match (comments, strings, impact checks): "
+        "repeat it with exhaustive=true instead; large results are saved to a file with an inline preview. A symbol's "
+        "definition and every use: call lsp with method=lsp.find_symbol, arguments={\"name_path_pattern\":\"" + symbol +
+        "\"}, then method=lsp.find_referencing_symbols with the name_path and relative_path it returns. output=count, and "
+        "scopes limited to non-code files by path, include, extensions or types (md, json, yaml, txt, xml), need neither");
 }
 
 Json run_tool(const std::string& name, const Json& arguments,

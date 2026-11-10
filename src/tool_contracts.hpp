@@ -236,7 +236,7 @@ struct SHGREP_CONTRACT(Record{}) SHGREP_CONTRACT(Tool{"search", "Navigate live c
     std::optional<bool> full_lines;
     SHGREP_CONTRACT(Field{"{\"description\":\"Include hidden files.\"}", false})
     std::optional<bool> hidden;
-    SHGREP_CONTRACT(Field{"{\"description\":\"File globs (* ?, case-insensitive). Without '/' a glob matches the whole filename, with '/' the whole relative path: \\\"*.cpp\\\", \\\"*parser*\\\", \\\"src/*\\\".\"}", false})
+    SHGREP_CONTRACT(Field{"{\"description\":\"Case-insensitive globs (* ?): without '/' the filename, with '/' the relative path: \\\"*.cpp\\\", \\\"src/*\\\".\"}", false})
     std::optional<std::vector<std::string>> include;
     SHGREP_CONTRACT(Field{"{\"description\":\"Include complete symbol bodies; default false.\"}", false})
     std::optional<bool> include_body;
@@ -246,7 +246,7 @@ struct SHGREP_CONTRACT(Record{}) SHGREP_CONTRACT(Tool{"search", "Navigate live c
     std::optional<bool> include_info;
     SHGREP_CONTRACT(Field{"{\"description\":\"LSP kinds 1-26 to include.\"}", false})
     std::optional<std::vector<int64_t>> include_kinds;
-    SHGREP_CONTRACT(Field{"{\"description\":\"Use the trigram index: opens only candidates. Default true unless the server runs --no-live-index. Results equal a plain search: the live index syncs with the watcher first, a snapshot is checked against the tree.\"}", false})
+    SHGREP_CONTRACT(Field{"{\"description\":\"Trigram index opens only candidate files; results equal a plain scan. Default true unless --no-live-index.\"}", false})
     std::optional<bool> index;
     SHGREP_CONTRACT(Field{"{\"description\":\"Required for operation=text: the task in words, to locate where something is. Built-in BM25 always ranks the hunks (at most 3 per file) and the best 10 return; an optional reranker (off unless SHGREP_RERANK_PORT is set), when running, only reorders the top ones. A note says how many were left out.\"}", false})
     std::optional<std::string> intent;
@@ -256,7 +256,7 @@ struct SHGREP_CONTRACT(Record{}) SHGREP_CONTRACT(Tool{"search", "Navigate live c
     std::optional<int64_t> line;
     SHGREP_CONTRACT(Field{"{\"description\":\"Default true.\"}", false})
     std::optional<bool> line_numbers;
-    SHGREP_CONTRACT(Field{"{\"description\":\"Optional block line limit; default unlimited. Longer blocks show the header and match context (3 lines each side unless context is explicitly set, including zero).\"}", false})
+    SHGREP_CONTRACT(Field{"{\"description\":\"Block line limit, default none. Longer blocks show the header and 3 lines around each match (or the set context).\"}", false})
     std::optional<int64_t> max_block_lines;
     SHGREP_CONTRACT(Field{"{\"description\":\"Skip larger text files; default 256 MiB, max 512 MiB. Over 64 MiB, files are scanned in line chunks; multiline, invert and block skip them.\"}", false})
     std::optional<int64_t> max_file_bytes;
@@ -278,25 +278,25 @@ struct SHGREP_CONTRACT(Record{}) SHGREP_CONTRACT(Tool{"search", "Navigate live c
     std::optional<bool> no_ignore;
     SHGREP_CONTRACT(Field{"{\"description\":\"Default symbols via LSP. text uses live grep; its text filters and budgets apply only there.\"}", false})
     std::optional<EnumText<SearchArgsOperationChoice>> operation;
-    SHGREP_CONTRACT(Field{"{\"description\":\"lines (default, grouped by file; omit path for a single file; over 50 matches start with a summary line naming the busiest files), files (cheapest), files_without_match, count, json (byte offsets).\"}", false})
+    SHGREP_CONTRACT(Field{"{\"description\":\"lines (default, grouped by file; over 50 matches start with the busiest files), files (cheapest), files_without_match, count, json (byte offsets).\"}", false})
     std::optional<EnumText<SearchArgsOutputChoice>> output;
     SHGREP_CONTRACT(Field{"{\"description\":\"File or folder to limit text search or symbols to; other navigation needs a file. Omit for all workspaces.\"}", false})
     std::optional<std::string> path;
     SHGREP_CONTRACT(Field{"{\"description\":\"Substring of the relative path.\"}", false})
     std::optional<std::string> path_filter;
-    SHGREP_CONTRACT(Field{"{\"description\":\"Default: relative to the configured root when there is one, absolute with multiple configured roots. Explicit relative uses one configured root when all selected targets share it; otherwise paths remain absolute.\"}", false})
+    SHGREP_CONTRACT(Field{"{\"description\":\"Default: relative with one configured root, absolute with several. relative needs all selected targets in one root.\"}", false})
     std::optional<EnumText<SearchArgsPathsChoice>> paths;
     SHGREP_CONTRACT(Field{"{\"description\":\"One pattern; search LSP mode accepts symbol name paths and #kind hints such as ClassName#ctor. Plain generic type names match generic symbols.\"}", false})
     std::optional<std::string> pattern;
     SHGREP_CONTRACT(Field{"{\"description\":\"Text: up to 1000 in one pass. LSP: symbol name paths with optional #kind hints; plain generic type names match generic symbols.\"}", false})
     std::optional<std::vector<std::string>> patterns;
-    SHGREP_CONTRACT(Field{"{\"description\":\"Text search accepts absolute files and directories inside configured roots, including mixtures. Explicit files are searched directly; duplicates are skipped. Default: the workspace (first root) only; name other roots to search them.\"}", false})
+    SHGREP_CONTRACT(Field{"{\"description\":\"Absolute files or folders inside configured roots. Default: the workspace (first root) only.\"}", false})
     std::optional<std::vector<std::string>> roots;
     SHGREP_CONTRACT(Field{"{\"description\":\"Also open binary-extension files.\"}", false})
     std::optional<bool> sniff_all;
     SHGREP_CONTRACT(Field{"{\"description\":\"Substring match on the last name-path component only; default false.\"}", false})
     std::optional<bool> substring_matching;
-    SHGREP_CONTRACT(Field{"{\"description\":\"Request deadline, 1-300000 ms; semantic search defaults to 180000, text search to 30000, and find_files to 300000. Partial timed-out text searches get up to 1000 ms extra for response encoding.\"}", false})
+    SHGREP_CONTRACT(Field{"{\"description\":\"1-300000 ms. Defaults: semantic 180000, text 30000, find_files 300000.\"}", false})
     std::optional<int64_t> timeout_ms;
     SHGREP_CONTRACT(Field{"{\"description\":\"File types: asm bat c cmake cpp cs css go h html java js json lua make md msbuild proto ps py rust sh sql toml ts txt xml yaml.\"}", false})
     std::optional<std::vector<std::string>> types;
@@ -319,7 +319,7 @@ struct SHGREP_CONTRACT(Record{}) SHGREP_CONTRACT(Tool{"search_bytes", "Search ra
     std::optional<std::vector<std::string>> extensions;
     SHGREP_CONTRACT(Field{"{\"description\":\"Include hidden files.\"}", false})
     std::optional<bool> hidden;
-    SHGREP_CONTRACT(Field{"{\"description\":\"File globs (* ?, case-insensitive). Without '/' a glob matches the whole filename, with '/' the whole relative path: \\\"*.cpp\\\", \\\"*parser*\\\", \\\"src/*\\\".\"}", false})
+    SHGREP_CONTRACT(Field{"{\"description\":\"Case-insensitive globs (* ?): without '/' the filename, with '/' the relative path: \\\"*.cpp\\\", \\\"src/*\\\".\"}", false})
     std::optional<std::vector<std::string>> include;
     SHGREP_CONTRACT(Field{"{\"description\":\"Add lines to json.\"}", false})
     std::optional<bool> line_numbers;
@@ -337,7 +337,7 @@ struct SHGREP_CONTRACT(Record{}) SHGREP_CONTRACT(Tool{"search_bytes", "Search ra
     std::optional<EnumText<SearchBytesArgsOutputChoice>> output;
     SHGREP_CONTRACT(Field{"{\"description\":\"Substring of the relative path.\"}", false})
     std::optional<std::string> path_filter;
-    SHGREP_CONTRACT(Field{"{\"description\":\"Default: relative to the configured root when there is one, absolute with multiple configured roots. Explicit relative uses one configured root when all selected targets share it; otherwise paths remain absolute.\"}", false})
+    SHGREP_CONTRACT(Field{"{\"description\":\"Default: relative with one configured root, absolute with several. relative needs all selected targets in one root.\"}", false})
     std::optional<EnumText<SearchArgsPathsChoice>> paths;
     SHGREP_CONTRACT(Field{"{\"description\":\"One pattern; search LSP mode accepts symbol name paths and #kind hints such as ClassName#ctor. Plain generic type names match generic symbols.\"}", false})
     std::optional<std::string> pattern;
@@ -345,7 +345,7 @@ struct SHGREP_CONTRACT(Record{}) SHGREP_CONTRACT(Tool{"search_bytes", "Search ra
     std::optional<std::vector<std::string>> patterns;
     SHGREP_CONTRACT(Field{"{\"description\":\"Absolute dirs inside the configured roots. Default: the workspace (first root) only.\"}", false})
     std::optional<std::vector<std::string>> roots;
-    SHGREP_CONTRACT(Field{"{\"description\":\"Request deadline, 1-300000 ms; semantic search defaults to 180000, text search to 30000, and find_files to 300000. Partial timed-out text searches get up to 1000 ms extra for response encoding.\"}", false})
+    SHGREP_CONTRACT(Field{"{\"description\":\"1-300000 ms. Defaults: semantic 180000, text 30000, find_files 300000.\"}", false})
     std::optional<int64_t> timeout_ms;
     SHGREP_CONTRACT(Field{"{\"description\":\"File types: asm bat c cmake cpp cs css go h html java js json lua make md msbuild proto ps py rust sh sql toml ts txt xml yaml.\"}", false})
     std::optional<std::vector<std::string>> types;
@@ -366,7 +366,7 @@ struct SHGREP_CONTRACT(Record{}) SHGREP_CONTRACT(Tool{"find_files", "Find live f
     std::optional<std::string> glob;
     SHGREP_CONTRACT(Field{"{\"description\":\"Include hidden files.\"}", false})
     std::optional<bool> hidden;
-    SHGREP_CONTRACT(Field{"{\"description\":\"File globs (* ?, case-insensitive). Without '/' a glob matches the whole filename, with '/' the whole relative path: \\\"*.cpp\\\", \\\"*parser*\\\", \\\"src/*\\\".\"}", false})
+    SHGREP_CONTRACT(Field{"{\"description\":\"Case-insensitive globs (* ?): without '/' the filename, with '/' the relative path: \\\"*.cpp\\\", \\\"src/*\\\".\"}", false})
     std::optional<std::vector<std::string>> include;
     SHGREP_CONTRACT(Field{"{}", false})
     std::optional<std::vector<int64_t>> include_kinds;
@@ -386,7 +386,7 @@ struct SHGREP_CONTRACT(Record{}) SHGREP_CONTRACT(Tool{"find_files", "Find live f
     std::optional<std::string> path;
     SHGREP_CONTRACT(Field{"{\"description\":\"Substring of the relative path.\"}", false})
     std::optional<std::string> path_filter;
-    SHGREP_CONTRACT(Field{"{\"description\":\"Default: relative to the configured root when there is one, absolute with multiple configured roots. Explicit relative uses one configured root when all selected targets share it; otherwise paths remain absolute.\"}", false})
+    SHGREP_CONTRACT(Field{"{\"description\":\"Default: relative with one configured root, absolute with several. relative needs all selected targets in one root.\"}", false})
     std::optional<EnumText<SearchArgsPathsChoice>> paths;
     SHGREP_CONTRACT(Field{"{\"description\":\"symbols: name-path pattern; accepts #kind hints and plain generic type names.\"}", false})
     std::optional<std::string> pattern;
@@ -396,7 +396,7 @@ struct SHGREP_CONTRACT(Record{}) SHGREP_CONTRACT(Tool{"find_files", "Find live f
     std::optional<std::string> substring;
     SHGREP_CONTRACT(Field{"{\"description\":\"symbols: substring match on final component.\"}", false})
     std::optional<bool> substring_matching;
-    SHGREP_CONTRACT(Field{"{\"description\":\"Request deadline, 1-300000 ms; semantic search defaults to 180000, text search to 30000, and find_files to 300000. Partial timed-out text searches get up to 1000 ms extra for response encoding.\"}", false})
+    SHGREP_CONTRACT(Field{"{\"description\":\"1-300000 ms. Defaults: semantic 180000, text 30000, find_files 300000.\"}", false})
     std::optional<int64_t> timeout_ms;
     SHGREP_CONTRACT(Field{"{\"description\":\"File types: asm bat c cmake cpp cs css go h html java js json lua make md msbuild proto ps py rust sh sql toml ts txt xml yaml.\"}", false})
     std::optional<std::vector<std::string>> types;
@@ -517,7 +517,7 @@ struct SHGREP_CONTRACT(Record{}) SHGREP_CONTRACT(Tool{"edit_file", "Live LSP sym
     std::optional<int64_t> expected_count;
     SHGREP_CONTRACT(Field{"{\"description\":\"Fail if the file's mtime (from read_file) changed.\"}", false})
     std::optional<std::string> expected_mtime;
-    SHGREP_CONTRACT(Field{"{\"description\":\"Expected SHA-256 from read_file or file_info. Without it, existing files must match this session's latest file/symbol read or dry-run preview, except literal old_text/needle replacements, which the exact match itself guards; other multi-file edits require a snapshot for each file. Direct tools share history with the default REPL; named sessions have separate history. Use the same path spelling for reads and edits. Text search does not establish a snapshot.\"}", false})
+    SHGREP_CONTRACT(Field{"{\"description\":\"SHA-256 from read_file metadata or file_info. Without it, a file must match this session's latest read or dry-run preview (literal old_text/needle edits: the exact match guards them; multi-file edits: each file). The default REPL session shares this history. Use the same path spelling as the read; text search is not a read.\"}", false})
     std::optional<std::string> expected_sha256;
     SHGREP_CONTRACT(Field{"{\"description\":\"insert_in_symbol only. Default verbatim keeps supplied indentation. match prefixes the target line whitespace to each nonblank line, preserving supplied relative indentation.\"}", false})
     std::optional<EnumText<EditFileArgsIndentChoice>> indent;
@@ -570,7 +570,7 @@ struct SHGREP_CONTRACT(Record{}) SHGREP_CONTRACT(Tool{"write_file", "Create file
     std::optional<EnumText<WriteFileArgsEolChoice>> eol;
     SHGREP_CONTRACT(Field{"{\"description\":\"Fail if the file's mtime (from read_file) changed.\"}", false})
     std::optional<std::string> expected_mtime;
-    SHGREP_CONTRACT(Field{"{\"description\":\"Expected SHA-256 from read_file or file_info. Without it, existing files must match this session's latest file/symbol read or dry-run preview; multi-file edits require a snapshot for each file. Direct tools share history with the default REPL; named sessions have separate history. Use the same path spelling for reads and edits. Text search does not establish a snapshot.\"}", false})
+    SHGREP_CONTRACT(Field{"{\"description\":\"SHA-256 from read_file metadata or file_info. Without it, an existing file must match this session's latest read or dry-run preview. The default REPL session shares this history. Use the same path spelling as the read; text search is not a read.\"}", false})
     std::optional<std::string> expected_sha256;
     SHGREP_CONTRACT(Field{"{\"description\":\"Default: the replaced file's, or for new files EditorConfig, Git attributes, then sibling files; otherwise as given. Alias: eol.\"}", false})
     std::optional<EnumText<WriteFileArgsEolChoice>> line_endings;
@@ -582,12 +582,12 @@ struct SHGREP_CONTRACT(Record{}) SHGREP_CONTRACT(Tool{"write_file", "Create file
     std::optional<int64_t> timeout_ms;
 };
 
-struct SHGREP_CONTRACT(Record{}) SHGREP_CONTRACT(Tool{"delete_file", "Delete one file within configured roots. No links or directories; requires a matching session read, dry-run preview, or explicit SHA-256 guard. Source-file deletion does not check references or rewrite imports. Active language servers refresh after deletion. Links are never followed.", 1, true, 8}) DeleteFileArgs {
+struct SHGREP_CONTRACT(Record{}) SHGREP_CONTRACT(Tool{"delete_file", "Delete one file within the configured roots; no folders, no links. Needs a read, a dry_run preview or expected_sha256 first. References and imports are not checked: for code use lsp method=lsp.safe_delete_symbol.", 1, true, 8}) DeleteFileArgs {
     SHGREP_CONTRACT(Field{"{\"description\":\"Relative to the first root, or absolute inside a root.\"}", true})
     std::optional<std::string> path;
     SHGREP_CONTRACT(Field{"{\"description\":\"Preview and verify the target without deleting it.\"}", false})
     std::optional<bool> dry_run;
-    SHGREP_CONTRACT(Field{"{\"description\":\"Expected SHA-256 from read_file or file_info. Without it, existing files must match this session's latest file/symbol read or dry-run preview; multi-file edits require a snapshot for each file. Direct tools share history with the default REPL; named sessions have separate history. Use the same path spelling for reads and edits. Text search does not establish a snapshot.\"}", false})
+    SHGREP_CONTRACT(Field{"{\"description\":\"SHA-256 from read_file metadata or file_info. Without it, an existing file must match this session's latest read or dry-run preview. The default REPL session shares this history. Use the same path spelling as the read; text search is not a read.\"}", false})
     std::optional<std::string> expected_sha256;
     SHGREP_CONTRACT(Field{"{\"description\":\"Whole-request deadline, 1-300000 ms; default 30000.\"}", false})
     std::optional<int64_t> timeout_ms;
@@ -624,14 +624,14 @@ struct SHGREP_CONTRACT(Record{}) LspHelpArgs {
     std::optional<EnumText<LspHelpArgsFormatChoice>> format;
     SHGREP_CONTRACT(Field{"{\"description\":\"Whole request deadline; may instead be top-level.\",\"maximum\":300000,\"minimum\":1}", false})
     std::optional<int64_t> timeout_ms;
-    SHGREP_CONTRACT(Field{"{\"description\":\"Use manual for the tool-routing guide, or a direct semantic method name such as edit.replace_in_symbol for its schema.\"}", false})
+    SHGREP_CONTRACT(Field{"{\"description\":\"manual for the tool guide, a method name such as edit.replace_in_symbol for its fields, or a tool name such as search for every field that tool accepts.\"}", false})
     std::optional<std::string> topic;
 };
 
-struct SHGREP_CONTRACT(Record{}) SHGREP_CONTRACT(Tool{"lsp", "Direct semantic navigation and symbol edits through shgrep's own language-server backend. Works independently of the C++ REPL and compiler DLL. Call method=help for operations, arguments.topic=manual for the tool guide, or a method name as topic for its schema. Method names match the existing facades, including lsp.find_symbol, lsp.rename_symbol and edit.replace_symbol_body. Example: {\"method\":\"lsp.find_symbol\",\"arguments\":{\"name_path_pattern\":\"Foo\",\"relative_path\":\"src\"}}. Pass named fields in arguments; timeout_ms may be top-level or inside arguments and both values must agree. Defaults are 180000 ms for a ready target server and 300000 ms for cold or undetermined targets. Positions are 1-based with UTF-16 columns. Language servers and project dependencies must be installed separately. Missing or failing servers are reported; text fallback requires explicit permission where supported. Root restrictions, snapshot guards and native edit validation apply. dry_run previews edits. safe_delete blocks references and possible method/property contracts, or incomplete checks; dry_run reports blockers and the proposed diff. Same-name ancestor members may be conservatively treated as contracts, and results depend on language-server coverage. Direct symbol searches and overviews default to compact rows: named kind, short name under a shared parent, line range, and for searches the symbol line_text; format=json returns structured results with numeric kind and kind_name. Text bodies omit line numbers unless requested; diffs retain unified-diff hunk coordinates; format=json preserves structured/rowpack results. Use format=outline for overviews, read_symbol offset/limit for slices, edit.replace_in_symbol or edit.insert_in_symbol for symbol edits, and edit.replace_outside_symbols or edit.insert_outside_symbols for headers and imports. Outside-symbol edits use the ranges supplied by the language server; incomplete ranges can leave declarations unprotected. Status is observational and never starts servers. It lists eligible configured root/language servers as not_started until first use; indexing_state can also be ready, indexing, starting, stuck or failed. stuck_reason appears after 180 seconds without tracked activity; failure_reason reports startup errors. The root-local bundled:false setting in .shgrep/lsp.json disables bundled defaults while explicit servers remain configured. Semantic requests start the selected server on first use, wait for readiness and may return index_warming with startup failure or index progress details. Direct lsp.status defaults to summary rows; detail=full includes configuration details; multi-server responses use response-local capability_sets referenced by each row capability_set. Use format=json for structured output; compiled REPL cells default to structured values, while a cell holding one literal shgrep call returns the direct text. Diagnostics default to LSP reports. For file diagnostics, check=compiler|build|all explicitly runs workspace-configured commands and returns actual output and exit codes; default LSP reports do not certify external compiler-check completion. Unavailable with --read-only.", 2, true, 11}) LspArgs {
+struct SHGREP_CONTRACT(Record{}) SHGREP_CONTRACT(Tool{"lsp", "Code navigation and symbol edits through language servers. Use it for a symbol's definition and every use, names that text search would also match in comments or other symbols, one symbol's code, renames, reference-checked deletes and symbol edits. Not for finding where something happens or a distinctive name (search with intent), or comments, strings, docs and config (search, edit_file). Main methods, fields in arguments: lsp.find_symbol {name_path_pattern, relative_path, include_body}; lsp.read_symbol {name_path, relative_path}; lsp.find_referencing_symbols {name_path, relative_path}; lsp.rename_symbol {name_path, relative_path, new_name}; edit.replace_in_symbol {name_path, relative_path, needle, repl}; edit.replace_symbol_body {name_path, relative_path, body}; edit.replace_outside_symbols {relative_path, needle, repl} for imports. Example: {\"method\":\"lsp.find_symbol\",\"arguments\":{\"name_path_pattern\":\"Foo\",\"relative_path\":\"src\"}}. name_path is parent/name (Class/Method), Name[0] for an overload, Foo#ctor for a kind. method=help lists every method; arguments.topic=<method> gives its fields, topic=manual the guide. Results that start with a partial note are incomplete: repeat the call. dry_run previews edits; edits check the session's latest read. Positions are 1-based with UTF-16 columns. Unavailable with --read-only.", 2, true, 11}) LspArgs {
     SHGREP_CONTRACT(Field{"{}", true})
     std::optional<std::string> method;
-    SHGREP_CONTRACT(Field{"{\"description\":\"Named method arguments; omit for help.\",\"type\":\"object\"}", false})
+    SHGREP_CONTRACT(Field{"{\"description\":\"Named fields of the method; omit for help. A method's fields: method=help, arguments={\\\"topic\\\":\\\"<method>\\\"}. Unknown fields are refused with the accepted list.\",\"type\":\"object\"}", false})
     std::optional<Json> arguments;
     SHGREP_CONTRACT(Field{"{\"description\":\"Optional final response byte limit. Text output uses lossless continuation; structured JSON must fit. The smaller of this and a method limit applies.\",\"maximum\":1048576,\"minimum\":512}", false})
     std::optional<int64_t> max_output_bytes;
@@ -639,7 +639,7 @@ struct SHGREP_CONTRACT(Record{}) SHGREP_CONTRACT(Tool{"lsp", "Direct semantic na
     std::optional<int64_t> timeout_ms;
 };
 
-struct SHGREP_CONTRACT(Record{}) SHGREP_CONTRACT(Tool{"repl", "Execute persistent C++26 cells through LLVM Clang-Repl for shgrep's own LSP navigation and semantic edits. Start with s.info(\"manual\") for tool routing; s.info(\"lsp\"), s.info(\"edit\"), s.info(\"fs\") or a method name gives the current reference. Pass one named argument object per facade call. Example: auto hits = s.lsp.find_symbol({{\"name_path_pattern\", \"Foo\"}, {\"relative_path\", \"src\"}}); hits[\"results\"].size() shgrep call syntax works too: s::<3::fs~>read_file(\"file.cs\") means s.fs.read_file(\"file.cs\"); <3 is a fixed decoration, the group (fs, lsp, edit) comes before ~> and the operation after it; s::<3::info(), s::<3::vars() and s::<3::clear() reach the helpers. A cell that is just one such call with literal arguments (strings, numbers, true/false, or one {{\"key\", value}} list) runs without the C++ compiler, as fast as a direct tool call. Values support [\"field\"], [size_t{index}], array(), string(), integer(), boolean() and dump(). Omit the final expression's semicolon to return its value. Structured values may use shgrep-rowpack v1: decode data using the same response's $format layouts and tables. Facade Values inside the cell are unpacked. Captured stdout/stderr are returned separately from structured values. Positions are 1-based with UTF-16 columns. Rename synchronizes proposed target files and rejects stale snapshots before writing. Completed edits remain applied if a later operation fails. Text search of source needs no LSP; fs.read_file of a code file returns its LSP outline. Unrestricted source text writes still require explicit fallback after LSP failure. Use partial symbol edits for small code changes. Language servers are installed separately with tools/fetch_lsp.py; no Serena runtime is required. Keep shgrep.exe, shgrep-compiler.dll and shgrep.dat from the same build together for this REPL. This REPL requires installed MSVC C++ Build Tools with a matching major.minor toolset, a Windows 10/11 SDK and a compatible x64 VC++ Redistributable; headers and libraries are discovered locally. Generated DLLs stay in a private temporary session directory until worker exit. Project dependencies must be available locally. s.vars() lists declarations; s.clear() resets after this cell. At most 8 sessions, each with a 1 GiB worker memory limit and 128 MiB captured output limit. Compiler errors, timeout, cancellation, DLL link/load or initialization failure lose that session's declarations. Compiler errors retire the worker; corrected code can reuse the same session_id with required headers/declarations. Earlier cells are not replayed. Normal reset attempts cooperative cleanup; forced termination cannot guarantee destructors. Native C++ has OS access; --read-only disables execution. Semantic facade calls wait for language-server readiness and can report index_warming with progress details. The direct lsp tool provides semantic navigation and symbol edits independently of this REPL.", 2, true, 12}) ReplArgs {
+struct SHGREP_CONTRACT(Record{}) SHGREP_CONTRACT(Tool{"repl", "Run persistent C++26 cells (Clang-Repl) that call shgrep's facades s.lsp, s.edit and s.fs. Use it for batches and computation across many tool results. Not for a single read, search or edit: call lsp, read_file or search directly. s.info(\"manual\") and s.info(\"<method>\") give the reference. Example: auto hits = s.lsp.find_symbol({{\"name_path_pattern\", \"Foo\"}}); hits[\"results\"].size() Omit the final semicolon to return a value. A cell that is one call in shgrep syntax with literal arguments, s::<3::fs~>read_file(\"a.cs\") for s.fs.read_file(\"a.cs\"), runs without the compiler. Other cells need the MSVC C++ Build Tools and a Windows SDK. session_id keeps declarations, at most 8 sessions; a compiler error, timeout or cancellation resets that session. Native code has OS access; --read-only disables execution.", 2, true, 12}) ReplArgs {
     SHGREP_CONTRACT(Field{"{\"description\":\"C++26 cell, at most 256 KiB. Use s.info() for facades. Facade calls may use shgrep syntax: s::<3::fs~>read_file(\\\"file.cs\\\") equals s.fs.read_file(\\\"file.cs\\\"). Omit the final expression's semicolon to return it.\",\"maxLength\":262144}", true})
     std::optional<std::string> code;
     SHGREP_CONTRACT(Field{"{\"description\":\"Opt in to resetting this session's worker after this many idle milliseconds; 0 disables it. The setting persists for this session when omitted. Reset clears saved declarations and is reported on the next call.\",\"maximum\":86400000,\"minimum\":0}", false})

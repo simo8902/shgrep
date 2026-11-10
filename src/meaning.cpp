@@ -918,13 +918,21 @@ Json meaning_search(const Json& arguments, const SearchContext& context,
     std::unique_lock<std::timed_mutex> held(index.mutex, std::defer_lock);
     bool partial = false;
     if (index.background_refresh.load()) {
-        while (!held.try_lock_for(std::chrono::milliseconds(50))) {
-            if (cancelled && cancelled->load()) throw std::runtime_error("meaning search cancelled");
-            if (Clock::now() >= deadline)
-                throw std::runtime_error("meaning search timed out waiting for the index (" + progress() + ")");
+        // An empty partial answer reads as "nothing found" and makes agents rephrase the query many times.
+        // Keep the first search waiting (bounded) until the index has files, so it returns something useful.
+        const auto useful_by = std::min(deadline, Clock::now() + std::chrono::milliseconds(20000));
+        for (;;) {
+            while (!held.try_lock_for(std::chrono::milliseconds(50))) {
+                if (cancelled && cancelled->load()) throw std::runtime_error("meaning search cancelled");
+                if (Clock::now() >= deadline)
+                    throw std::runtime_error("meaning search timed out waiting for the index (" + progress() + ")");
+            }
+            partial = index.background_refresh.load();
+            if (!partial) { held.unlock(); break; }
+            if (!index.files.empty() || Clock::now() >= useful_by) break;
+            held.unlock();
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
         }
-        partial = index.background_refresh.load();
-        if (!partial) held.unlock();
     }
     mark = lap(slot(profile, &MeaningProfile::lock_wait_us), mark);
     if (!partial) refresh(context, deadline, cancelled, false, held, profile);
@@ -947,10 +955,11 @@ Json meaning_search(const Json& arguments, const SearchContext& context,
         for (const auto& chunk : entry.chunks) refs.push_back({&entry, &chunk});
     }
     documents.reserve(refs.size());
-    for (const auto& ref : refs) documents.push_back(ref.chunk->name_path + "\n" + ref.chunk->text);
+    for (const auto& ref : refs) documents.push_back(ref.chunk->text);
     candidates.reserve(refs.size());
     for (size_t i = 0; i < refs.size(); ++i)
-        candidates.push_back({refs[i].file->shown, refs[i].chunk->first, refs[i].chunk->last, documents[i]});
+        candidates.push_back({refs[i].file->shown, refs[i].chunk->first, refs[i].chunk->last, documents[i],
+                              refs[i].chunk->name_path});
     if (profile) profile->chunks = refs.size();
     mark = lap(slot(profile, &MeaningProfile::collect_us), mark);
     std::vector<double> dense(refs.size());
@@ -969,14 +978,49 @@ Json meaning_search(const Json& arguments, const SearchContext& context,
     std::stable_sort(order.begin(), order.end(), [&](size_t x, size_t y) { return score[x] > score[y]; });
     mark = lap(slot(profile, &MeaningProfile::rank_us), mark);
 
+    // Adaptive-k (Taguchi et al., EMNLP 2025): a clear drop after the top results means the rest is noise.
+    // Stay at the requested limit when the score distribution is flat.
+    int64_t shown_limit = limit;
+    if (order.size() > 3) {
+        const size_t cap = std::min<size_t>(order.size() - 1, static_cast<size_t>(limit));
+        size_t cut = 0;
+        double best_gap = 0.0;
+        for (size_t k = 3; k < cap; ++k) {
+            const double gap = score[order[k - 1]] - score[order[k]];
+            if (gap > best_gap) { best_gap = gap; cut = k; }
+        }
+        if (cut > 0 && best_gap >= 0.01) shown_limit = static_cast<int64_t>(cut);
+    }
+
     std::string text = "[meaning " + std::to_string(static_cast<int>(weight * 100 + 0.5)) + "% + bm25 " +
                        std::to_string(100 - static_cast<int>(weight * 100 + 0.5)) + "%; index " + progress() +
                        "; model " + embedder_state() + "]\n";
     if (partial) text += "[partial results: the index is building; results may be incomplete or stale]\n";
+    if (shown_limit < limit)
+        text += "[showing " + std::to_string(shown_limit) + " of up to " + std::to_string(limit) +
+                " results: largest score gap]\n";
     Json::Array results;
     std::set<std::string> seen;
+    const auto snippet_of = [](const std::string& body, size_t max_lines, size_t max_bytes) {
+        std::string out;
+        size_t at = 0, lines = 0;
+        while (at < body.size() && lines < max_lines && out.size() < max_bytes) {
+            size_t end = body.find('\n', at);
+            if (end == std::string::npos) end = body.size();
+            std::string line = body.substr(at, end - at);
+            if (!line.empty() && line.back() == '\r') line.pop_back();
+            size_t cut = std::min(line.size(), max_bytes - out.size());
+            while (cut > 0 && cut < line.size() && (static_cast<unsigned char>(line[cut]) & 0xc0) == 0x80) --cut;
+            out.append(line, 0, cut);
+            if (cut < line.size()) { out += "..."; break; }
+            out += '\n';
+            ++lines;
+            at = end + 1;
+        }
+        return out;
+    };
     for (size_t i : order) {
-        if (static_cast<int64_t>(results.size()) >= limit) break;
+        if (static_cast<int64_t>(results.size()) >= shown_limit) break;
         const Ref& ref = refs[i];
         const std::string key = ref.file->shown + "\n" + ref.chunk->name_path + "\n" + std::to_string(ref.chunk->start);
         if (!seen.insert(key).second) continue;
@@ -993,11 +1037,23 @@ Json meaning_search(const Json& arguments, const SearchContext& context,
         if (ref.chunk->kind == "text") {
             row["body"] = ref.chunk->text;
             text += ref.chunk->text + "\n";
+        } else {
+            // A short head lets the agent judge a hit without a second read_symbol call.
+            const bool top = results.empty();
+            const std::string snippet = snippet_of(ref.chunk->text, top ? 10u : 4u, top ? 1200u : 400u);
+            row["snippet"] = snippet;
+            std::string marked;
+            for (char c : snippet) {
+                marked += c;
+                if (c == '\n') marked += "  | ";
+            }
+            if (!snippet.empty() && snippet.back() != '\n') marked += '\n';
+            text += "  | " + marked;
         }
         results.push_back(std::move(row));
     }
     if (results.empty()) text += "No indexed symbols" + std::string(scope.empty() ? "" : " under that path") + ".\n";
-    else text += "[read symbols with lsp.read_symbol; text chunks include their body; follow callers with lsp.find_referencing_symbols]\n";
+    else text += "[snippets show the start of each symbol; lsp.read_symbol returns the rest; text chunks include their body; follow callers with lsp.find_referencing_symbols]\n";
     if (profile) {
         lap(slot(profile, &MeaningProfile::format_us), mark);
         lap(slot(profile, &MeaningProfile::total_us), search_started);

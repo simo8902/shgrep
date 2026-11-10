@@ -25,6 +25,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <string>
 #include <vector>
 #include <version>
@@ -370,7 +371,7 @@ std::string tool_from_love_name(const std::string& name) {
     }
     return name;
 }
-// Adds `continue` to every tool that takes max_output_bytes, and says that larger output continues rather than is cut.
+// Adds `continue` to every tool whose output can be split, and says that larger output continues rather than is cut.
 // love_names (--love-tool-names) also sends the call syntax as the tool name. Codex shows the raw name in its
 // "Called server.tool" line and gives the model a cleaned name (other characters become _), so this is opt-in:
 // clients and hooks that match plain names such as mcp__shgrep__read_file keep the default.
@@ -394,8 +395,13 @@ Json with_continuations(Json tools, bool love_names) {
         const auto properties = fields.find("properties");
         if (properties == fields.end() || !std::holds_alternative<Json::Object>(properties->second.value)) continue;
         auto& props = std::get<Json::Object>(properties->second.value);
-        props["offload_output"] = Json::Object{{"type", "boolean"},
-            {"description", "Default true: save text over 8000 bytes as UTF-8 under the first root's .shgrep-output folder, returning a 500-character preview and path. Files persist until deleted. Structured values remain inline; read-only mode keeps all output inline. Set false to read a saved output inline."}};
+        // offload_output and max_output_bytes are accepted by every tool but not listed (lsp help, topic=<tool>, names
+        // them): the tool list is resent on every agent step (#103). continue is listed where output can be split.
+        const std::string tool_name = tool.get("name") ? tool.get("name")->string() : std::string();
+        static const std::set<std::string> short_output{"write_file", "delete_file", "move_file", "create_directory"};
+        if (!short_output.contains(tool_name))
+            props["continue"] = Json::Object{{"type", "string"},
+                {"description", "Next part of a split response: the <id>:<offset> it names."}};
         const auto limit = props.find("max_output_bytes");
         if (limit == props.end()) continue;
         if (std::holds_alternative<Json::Object>(limit->second.value)) {
@@ -407,10 +413,6 @@ Json with_continuations(Json tools, bool love_names) {
                 ? "Split text output ends with continue: \"<id>:<offset>\" for the rest; structured responses must fit the limit."
                 : "Larger output is never cut: the response ends with continue: \"<id>:<offset>\" for the rest.");
         }
-        props["continue"] = Json::Object{{"type", "string"},
-            {"description", "Reads the next part of an earlier response that max_output_bytes split: pass the "
-                            "\"<id>:<offset>\" its status line or summary names. The tool is not run again; other "
-                            "arguments except max_output_bytes are ignored."}};
     }
     // Renamed last: the loop above still reads the plain names.
     if (love_names)
@@ -436,8 +438,9 @@ std::string valid_utf8(const std::string& text) {
 }
 
 Json tool_error_response(const Json& id, std::string message, uint32_t max_bytes, bool uncapped,
-                          const std::string& notice, const Json* structured_content = nullptr) {
-    if (message.find(" - tell the user about this in your next message, before continuing:") == std::string::npos)
+                          const std::string& notice, const Json* structured_content = nullptr, bool usage = false) {
+    // A usage refusal (shgrep::UsageError) names the agent's next call; it is not a failure to report.
+    if (!usage && message.find(" - tell the user about this in your next message, before continuing:") == std::string::npos)
         message = shgrep::failure_banner("SHGREP ERROR", "The request failed", "Details follow") + message;
     const auto build = [&](const std::string& text, const std::string& health, const Json* details) {
         Json::Object result{{"isError", true}, {"content", content(valid_utf8(text), health)}};
@@ -612,6 +615,7 @@ int wmain(int argc, wchar_t** argv) {
     } index_log_listener_guard;
     // The build and the watchers run in the background; searches walk until the workspace's index is ready.
     if (context.live_index) shgrep::start_live_indexes(context);
+    else shgrep::open_workspace_log(context);
     shgrep::start_language_servers(context);
     // GPU build: the DLLs and the embedding model load in the background; ranked searches wait for them (#87).
     shgrep::start_embedder();
@@ -691,10 +695,11 @@ int wmain(int argc, wchar_t** argv) {
                         protocol = wanted->string();
                 }
                 const std::string love_names_note = love_tool_names
-                    ? " Tool names use the shgrep call syntax: s::<3::fs~>read_file is the read_file tool, s::<3::lsp~>call is lsp "
-                      "and s::<3::repl~>cell is repl; plain names are accepted too."
+                    ? "Tool names use the shgrep call syntax: s::<3::fs~>read_file is the read_file tool, s::<3::lsp~>call is lsp "
+                      "and s::<3::repl~>cell is repl; plain names are accepted too. "
                     : "";
-                const std::string instructions = shgrep::tool_manual(context, true) + love_names_note;
+                // The manual ends with the routing checklist; it stays last (arXiv 2602.20048).
+                const std::string instructions = love_names_note + shgrep::tool_manual(context, true);
                 send(success(id, Json::Object{{"protocolVersion", protocol},
                                               {"capabilities", Json::Object{{"tools", Json::Object{}}}},
                                               {"serverInfo", Json::Object{{"name", "shgrep"}, {"version", "0.3.0"}}},
@@ -729,7 +734,9 @@ int wmain(int argc, wchar_t** argv) {
                     };
                     logs.write(LogLevel::info, "Tool call started", tool_name, key);
                     bool partial_timeout = false;
-                    const std::string call_line = love_call_line(tool_name, arguments);
+                    // The call echo is for Codex's compact view with --love-tool-names; without it, it only repeats the
+                    // agent's own call back to it on every response (#103).
+                    const std::string call_line = love_tool_names ? love_call_line(tool_name, arguments) : std::string();
                     bool uncapped = !arguments.get("max_output_bytes");
                     std::string notice;
                     const uint32_t ceiling = 1048576;
@@ -833,7 +840,10 @@ int wmain(int argc, wchar_t** argv) {
                                 encoding_deadline = std::max(deadline, ResponseClock::now() + std::chrono::seconds(2));
                             }
                             const Json* output = result.get("text");
-                            if (offload_output && (stream || (output && output->string().size() > shgrep::offload_text_bytes))) {
+                            // An lsp-only client may have no read_file to open the saved copy, so symbol bodies stay
+                            // inline up to the normal response budget; searches keep the smaller offload threshold.
+                            const size_t offload_limit = tool_name == "lsp" ? size_t{65536} : shgrep::offload_text_bytes;
+                            if (offload_output && (stream || (output && output->string().size() > offload_limit))) {
                                 try {
                                     if (stream) stream->retain_for_replay();
                                     size_t at = 0;
@@ -893,7 +903,8 @@ int wmain(int argc, wchar_t** argv) {
                         // Encoding can fail after the success path already appended it.
                         if (!call_line.empty() && !notice.ends_with(call_line))
                             notice += std::string(notice.empty() || notice.ends_with('\n') ? "" : "\n") + call_line;
-                        send(tool_error_response(id, message, max_bytes, uncapped, notice, structured_content));
+                        const bool usage = dynamic_cast<const shgrep::UsageError*>(&e) != nullptr;
+                        send(tool_error_response(id, message, max_bytes, uncapped, notice, structured_content, usage));
                         logs.write(cancelled || timed_out ? LogLevel::warning : LogLevel::error,
                                    message, tool_name, key);
                     }

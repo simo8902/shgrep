@@ -216,7 +216,7 @@ def main():
             })
         client = Client(executable, root)
         try:
-            assert len(client.call("tools/list", {})["tools"]) == 11
+            assert len(client.call("tools/list", {})["tools"]) == 13
             check_lua_xml(client, root)
             check_cpp(client, root)
             check_python(client, root)

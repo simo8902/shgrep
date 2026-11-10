@@ -998,14 +998,14 @@ Json semantic_file_result(const Json& result, const Json& file) {
     return value;
 }
 
+// Status before content: partial results, index progress, skipped and unanswered files and per-file errors lead the
+// response, so an agent sees an incomplete answer is incomplete before it acts on the results (arXiv 2606.14476).
 std::string semantic_read_notes(const Json& result) {
     std::string out;
     if (const Json* partial = result.get("partial"); partial && partial->boolean()) {
         // A folder walk cut short names how far it got; otherwise partial means a server still indexing.
         const Json* note = result.get("coverage_note");
-        out += note && std::holds_alternative<std::string>(note->value)
-            ? "[partial results: " + note->string() + "]\n"
-            : std::string("[partial results: the language server is still indexing]\n");
+        out += partial_results_note(note && std::holds_alternative<std::string>(note->value) ? note->string() : "");
     }
     if (const Json* warming = result.get("index_warming")) {
         const auto show = [&](const Json& details) {
@@ -1033,8 +1033,13 @@ std::string semantic_read_notes(const Json& result) {
     if (const Json* errors = result.get("errors"))
         for (const auto& error : errors->array())
             out += "[error " + error.get("path")->string() + ": " + error.get("error")->string() + "]\n";
-    if (const Json* fallback = result.get("fallback_text")) out += fallback->string();
     return out;
+}
+
+// Labeled text matches after an LSP failure: content, so it follows the semantic results.
+std::string semantic_fallback_text(const Json& result) {
+    const Json* fallback = result.get("fallback_text");
+    return fallback ? fallback->string() : std::string();
 }
 
 std::string compact_outline(const Json& result, bool symbol_text = false) {
@@ -1045,7 +1050,7 @@ std::string compact_outline(const Json& result, bool symbol_text = false) {
                 out += "[scope " + file.get("requested_path")->string() + "]\n";
             out += compact_outline(semantic_file_result(result, file), symbol_text);
         }
-        return out + semantic_read_notes(result);
+        return semantic_read_notes(result) + out + semantic_fallback_text(result);
     }
     static constexpr const char* kinds[] = {"unknown", "file", "module", "namespace", "package", "class", "method", "property",
         "field", "constructor", "enum", "interface", "function", "variable", "constant", "string", "number", "boolean",
@@ -1103,7 +1108,7 @@ std::string compact_outline(const Json& result, bool symbol_text = false) {
         out += "\n";
     }
     if (!count) out += "(no symbols)\n";
-    return out + semantic_read_notes(result);
+    return semantic_read_notes(result) + out + semantic_fallback_text(result);
 }
 
 void slice_symbol_bodies(Json& result, uint64_t first, uint64_t limit,
@@ -1256,7 +1261,8 @@ Json read_file(const Json& args, const SearchContext& context, const std::shared
             if (!intent.empty()) {
                 if (directory) fail(path + " is a folder; intent reads one file");
                 const Target target = resolve(context, path);
-                std::string header_path = target.display();
+                // First-root files show relative, as search output does (SourceText::first_root); other roots stay absolute.
+                std::string header_path = target.first_root ? target.relative(target.parts.size()) : target.display();
                 std::string basename;
                 if (!common_folder.empty() && !target.parts.empty() && try_utf8(target.name(), basename)) {
                     if (!folder_shown) { out += "[folder " + common_folder + "]\n"; folder_shown = true; }
@@ -1265,12 +1271,14 @@ Json read_file(const Json& args, const SearchContext& context, const std::shared
                 render_intent_lines(out, target, intent, header_path, options.metadata, context, cancelled);
                 return;
             }
-            // CONTRACT: a code file without offset/limit (auto or operation=text) returns its LSP outline. offset/limit
-            //   select a window of its raw lines, at most code_window_lines per call: 100-line windows beat whole
-            //   files for agents (SWE-agent, arXiv 2405.15793), and a sanctioned window removes the reason to dump
-            //   code through search ".*". The whole text still needs allow_text_fallback=true and a failing server.
+            // CONTRACT: a code file without offset/limit (auto or operation=text) returns its LSP outline. A raw
+            //   offset/limit window is refused while a language server is available, because the agent must read
+            //   the symbol instead; the whole text still needs allow_text_fallback=true and a failing server.
             const bool code = !symbol_read && !directory && lsp_read_required(descriptor.path, descriptor.root);
             const bool window = code && (args.get("offset") || args.get("limit"));
+            if (window)
+                fail("code-file text windows are off: use lsp method=lsp.find_symbol then lsp.read_symbol, "
+                     "or read_file with intent (the task in words)");
             const bool redirected = text_mode && code && !window;
             const bool semantic = redirected || (!text_mode && (directory || operation != "auto" ||
                                                   args.get("name_path") || lsp_required(descriptor.path, descriptor.root)));
@@ -1327,7 +1335,8 @@ Json read_file(const Json& args, const SearchContext& context, const std::shared
             if (context.text_page_bytes)
                 text_options.max_out = context.text_page_bytes > status_reserve ? context.text_page_bytes - status_reserve : 0;
             const Target target = resolve(context, path);
-            std::string header_path = target.display();
+            // First-root files show relative, as search output does (SourceText::first_root); other roots stay absolute.
+            std::string header_path = target.first_root ? target.relative(target.parts.size()) : target.display();
             std::string basename;
             if (!common_folder.empty() && !target.parts.empty() && try_utf8(target.name(), basename)) {
                 if (!folder_shown) { out += "[folder " + common_folder + "]\n"; folder_shown = true; }
@@ -3136,6 +3145,13 @@ RequestDeadline::~RequestDeadline() {
     current_request_deadline = previous_;
 }
 
+std::string partial_results_note(const std::string& cause) {
+    return "[partial results, the answer is incomplete: " + (cause.empty()
+        ? std::string("the language server is still indexing; repeat this call later (lsp method=lsp.status shows "
+                      "its progress)")
+        : cause) + "]\n";
+}
+
 std::string render_semantic_text(const Json& result, bool outline,
                                  const std::shared_ptr<std::atomic_bool>& cancelled, bool line_numbers,
                                  bool symbol_text) {
@@ -3155,7 +3171,7 @@ std::string render_semantic_text(const Json& result, bool outline,
             check();
             out += render_semantic_text(semantic_file_result(result, file), false, cancelled, line_numbers);
         }
-        return out + semantic_read_notes(result);
+        return semantic_read_notes(result) + out + semantic_fallback_text(result);
     }
     const Json* items = result.get("results");
     if (!items || !std::holds_alternative<Json::Array>(items->value)) return result.dump(check);
@@ -3222,7 +3238,7 @@ std::string render_semantic_text(const Json& result, bool outline,
         if (const Json* count = result.get(key); count && count->integer())
             omitted += std::string(omitted.empty() ? "" : ", ") + key + "=" + std::to_string(count->integer());
     if (!omitted.empty()) out += "[lsp result notes: " + omitted + "]\n";
-    return out + semantic_read_notes(result);
+    return semantic_read_notes(result) + out + semantic_fallback_text(result);
 }
 
 Json apply_source_changes(const std::vector<SourceChange>& changes, const Json& arguments,

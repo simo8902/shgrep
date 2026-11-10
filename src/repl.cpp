@@ -1,5 +1,6 @@
 // Serena-style facade/session/result behavior adapted to native C++; see third_party/solidlsp-LICENSE.txt.
 #include "repl.hpp"
+#include "banner.hpp"
 #include "tool_contracts.generated.hpp"
 #include "thread_safety.hpp"
 #include "files.hpp"
@@ -102,9 +103,9 @@ J fallback_definition(const std::string& name) {
         erase_properties(definition, {"name_path", "include_body", "full_lines", "include_info", "depth", "include_kinds", "exclude_kinds",
             "substring_matching", "line", "column", "include_declaration", "allow_text_fallback"});
         if (embed_built())
-            operations(definition, {"text", "meaning"}, "Search any file, including source code, by literal or regex patterns without requiring LSP. Searches that can reach code files need intent (the task in words): ranked hunks keep exact pattern matching, 90% meaning from the GPU embedding model plus 10% BM25, best 10 with at most 3 per file and a count of the rest. For every match (renames, impact checks) pass exhaustive=true instead; large results are saved to a file with an inline preview. Non-code scopes (md, json, yaml, txt, xml by path, include, extensions or types) and output=count need neither. operation=meaning with intent (a question in words, no pattern) returns the best-matching LSP symbols (path, line range, name_path) for lsp.read_symbol; optional path scope and max_results. Use the lsp tool for semantic navigation and symbol edits.");
+            operations(definition, {"text", "meaning"}, "Text search in any file, code included, by literal or regex pattern. Over code files it needs intent (the task in words): exact matches ranked by meaning (90% GPU model, 10% BM25), best 10 hunks, at most 3 per file, with a count of the rest. exhaustive=true returns every match unranked; use it only when every match matters. Non-code scopes (md, json, yaml, txt, xml) and output=count need neither. operation=meaning with intent and no pattern returns the best-matching symbols for lsp.read_symbol. Not for a symbol's definition, every use or a rename: lsp.");
         else
-            operations(definition, {"text"}, "Search any file, including source code, by literal or regex patterns without requiring LSP. Searches that can reach code files need intent (the task in words): ranked hunks keep exact pattern matching, built-in BM25 and an optional local reranker, best 10 with at most 3 per file and a count of the rest. For every match (renames, impact checks) pass exhaustive=true instead; large results are saved to a file with an inline preview. Non-code scopes (md, json, yaml, txt, xml by path, include, extensions or types) and output=count need neither. Use the lsp tool for semantic navigation and symbol edits.");
+            operations(definition, {"text"}, "Text search in any file, code included, by literal or regex pattern. Over code files it needs intent (the task in words): exact matches ranked by BM25 (and a local reranker when one runs), best 10 hunks, at most 3 per file, with a count of the rest. exhaustive=true returns every match unranked; use it only when every match matters. Non-code scopes (md, json, yaml, txt, xml) and output=count need neither. Not for a symbol's definition, every use or a rename: lsp.");
         auto& props = std::get<J::Object>(std::get<J::Object>(std::get<J::Object>(definition.value).at("inputSchema").value).at("properties").value);
         props["pattern"] = J::Object{{"type", "string"}, {"description", "One literal or regex pattern."}};
         props["patterns"] = J::Object{{"type", "array"}, {"items", J::Object{{"type", "string"}}},
@@ -112,39 +113,37 @@ J fallback_definition(const std::string& name) {
         props["intent"] = J::Object{{"type", "string"}, {"description", "The task in words; required when the search can reach code files, unless exhaustive=true. Ranks the exact matches and returns the best 10 hunks."}};
     } else if (name == "search_bytes") {
         std::get<J::Object>(definition.value)["description"] =
-            "Search raw file bytes using hex literals or byte regex, with exact byte offsets and optional hex context. "
-            "Default mode=literal and output=json; files and count outputs are also available. "
-            "Programming/XML files are searchable without a language server.";
+            "Search raw bytes in any file by hex literal or byte regex, with exact offsets. Not for text: use search.";
     } else if (name == "find_files") {
         erase_properties(definition, {"allow_text_fallback", "path", "name_path", "pattern", "substring_matching", "include_kinds", "exclude_kinds"});
-        operations(definition, {"filesystem"}, "Find files by filename, path substring, glob, type or extension without reading contents. Default operation=filesystem; output=lines or json. Visibility and ignore filters apply. Use the lsp tool or repl s.lsp for symbol-based discovery.");
+        operations(definition, {"filesystem"}, "Find files by name, glob, path substring, type or extension without reading them. Not for symbols: lsp method=lsp.find_symbol.");
     } else if (name == "read_file") {
         erase_properties(definition, {"name_path", "full_lines", "include_kinds", "exclude_kinds", "depth", "format"});
-        operations(definition, {"text"}, "Read text, docs, config, data and logs with optional 1-based offset and line limit. Code files (Python, C/C++, C#, Rust, JS/TS, Lua, shell, PowerShell and more) return their LSP symbol outline when read without offset/limit; offset/limit return a window of raw lines, at most 100 per call. intent (the task in words, no offset/limit) returns only the best-matching lines of any file, at most 72, with skipped stretches marked. Read one symbol's code with lsp method=lsp.read_symbol. Plain text of a code file needs allow_text_fallback=true and works only when its language server fails or is missing. XML/SVG stay text. Text pages end at the last whole line under 8000 bytes, naming the next offset, unless offload_output=false. Text headers name the line count and line endings; metadata=true adds size, mtime and sha256 (file_info shows them too). Links are not followed.");
+        operations(definition, {"text"}, "Read files with optional 1-based offset and limit. raw offset/limit windows on a code file are refused while a language server is available: use lsp method=lsp.find_symbol then lsp.read_symbol, or read_file with intent (the task in words). intent (the task in words, no offset/limit) returns only the best-matching lines, at most 72. Pages end under 8000 bytes and name the next offset. Not for one symbol's code: lsp method=lsp.read_symbol.");
     } else if (name == "list_dir") {
         erase_properties(definition, {"format"});
-        operations(definition, {"filesystem"}, "List filesystem entries with optional depth, visibility filters and explicit limits. Default operation=filesystem and depth=1. Entries distinguish files, directories and links; links are not followed. Use lsp method=lsp.list_symbols or repl s.lsp.list_symbols for code overviews.");
+        operations(definition, {"filesystem"}, "List a folder's files and subfolders, depth 1 by default; links are not followed. Not for a code outline: lsp method=lsp.list_symbols.");
     } else if (name == "file_info") {
         erase_properties(definition, {"name_path", "severity", "start_line", "end_line", "group_by_symbol", "detail", "check"});
-        operations(definition, {"metadata", "availability"}, "Inspect filesystem metadata, or use availability with one file path to probe the current LSP text-fallback decision. The probe may start a server; it reports available, unavailable, warming or not_applicable and whether fallback is eligible. Default operation=metadata. Links are not followed.");
+        operations(definition, {"metadata", "availability"}, "File metadata (size, mtime, sha256), or operation=availability with one code file to check whether its language server works (may start it). Links are not followed.");
     } else if (name == "edit_file") {
         erase_properties(definition, {"name_path", "new_name", "rename_text_occurrences", "column", "diagnostics", "on_new_errors", "indent"});
         operations(definition, {"text", "replace_content", "replace_in_files", "insert_at_line", "replace_lines", "delete_lines"},
-            "Edit nonprogramming text using exact replacements, regex replacements or 1-based line edits. replace_in_files supports bulk previews and selected occurrences; dry_run previews without writing. Programming/XML text edits require explicit fallback after unavailable or failing LSP; working LSP files remain excluded. Snapshot guards, encoding preservation and atomic per-file writes apply. Use the lsp tool or repl for semantic edits and rename.");
+            "Edit non-code text: exact replacements (edits), literal or regex replace_content/replace_in_files (needle, repl), or 1-based line edits. dry_run previews a diff. Code files are refused while their language server works. Not for code: lsp method=edit.replace_in_symbol, or edit.replace_outside_symbols for imports.");
         auto& props = std::get<J::Object>(std::get<J::Object>(std::get<J::Object>(definition.value).at("inputSchema").value).at("properties").value);
         props["new_text"] = J::Object{{"type", "string"}, {"description", "Line insertion/replacement content."}};
         props["line"] = J::Object{{"type", "integer"}, {"description", "insert_at_line: 1-based insertion line; EOF allowed."}};
     } else if (name == "move_file") {
-        operations(definition, {"filesystem"}, "Move a file or directory within configured roots. Default operation=filesystem; imports and references are not rewritten. dry_run previews the move; overwrite explicitly permits replacing an existing file. Links are not followed. Use lsp method=lsp.move_file or repl s.lsp.move_file for semantic import planning.");
+        operations(definition, {"filesystem"}, "Move a file or folder within the configured roots; imports are not rewritten. dry_run previews. Moves that update imports: lsp method=lsp.move_file.");
     }
     if (name == "write_file")
         std::get<J::Object>(definition.value)["description"] =
-            "Create a file atomically, creating missing parent directories. Existing files require overwrite=true. "
-            "Replacing programming/XML files with a matching expected_sha256 is allowed; without it, explicit fallback requires unavailable or failing LSP. "
-            "Encoding and line endings default to the existing file's when replacing. New files infer line endings from in-root EditorConfig, Git attributes, then sibling files, unless explicitly set. Snapshot guards are optional. Links are not followed.";
+            "Create a file atomically, with missing parent folders. Replacing a file needs overwrite=true; a code file also "
+            "needs expected_sha256, or allow_text_fallback while its language server fails. Encoding and line endings follow the replaced file, or the folder's EditorConfig, Git "
+            "attributes and sibling files. Not for changing code inside a file: lsp method=edit.replace_in_symbol.";
     else if (name == "create_directory")
         std::get<J::Object>(definition.value)["description"] =
-            "Create a directory and missing parents within configured roots. An existing directory is accepted; links are not followed.";
+            "Create a folder and its missing parents within the configured roots; an existing folder is accepted.";
     erase_properties(definition, {"diagnostics"});
     auto& props = std::get<J::Object>(std::get<J::Object>(std::get<J::Object>(definition.value).at("inputSchema").value).at("properties").value);
     auto describe = [&](const char* key, const char* description) {
@@ -166,6 +165,119 @@ J fallback_definition(const std::string& name) {
         describe("timeout_ms", "Whole request deadline, 1-300000 ms; semantic LSP operations default to 180000 ms and text/filesystem operations to 30000 ms.");
     }
     return definition;
+}
+
+// tools/list shows each tool's core fields only; every other field of its definition stays accepted (fallback_arguments
+// and run_lsp_tool validate against the full definitions) and lsp method=help, arguments.topic=<tool> lists all of them.
+// The tool list is resent on every agent step: shgrep's cost Claude agents about 15,000 tokens per step against 3,700
+// for rg (#103). Lazy schema loading keeps tool choice while cutting per-step schema tokens (arXiv 2604.21816).
+// A non-null description replaces a long contract text in the listing only; help keeps the full text.
+struct ListedField {
+    const char* name;
+    const char* description;
+};
+const std::map<std::string, std::vector<ListedField>>& listed_fields() {
+    static const std::map<std::string, std::vector<ListedField>> fields{
+        {"search", {{"operation", nullptr}, {"pattern", nullptr}, {"patterns", "Up to 1000 patterns in one pass."},
+            {"intent", "The task in words. Needed when the search reaches code files, unless exhaustive=true; ranks the "
+                       "matches and returns the best 10 hunks."},
+            {"exhaustive", "Every match in scan order, unranked. Only when every match matters (rename, impact check): "
+                           "it costs far more tokens than intent."},
+            {"path", "File or folder to search; default the workspace (first root)."},
+            {"include", "Filename or relative-path globs: \"*.cpp\", \"src/*\"."},
+            {"exclude", "Globs of files or folders to skip."}, {"types", "File types such as cpp, cs, py, md, json."},
+            {"mode", "regex (default) or literal."}, {"case_insensitive", nullptr}, {"word", "Whole words."},
+            {"context_lines", "Lines around each match, 0-100."}, {"output", "lines (default), files, files_without_match, count or json."},
+            {"max_results", "Result limit, 1-10000; default unlimited."}, {"multiline", nullptr}}},
+        {"search_bytes", {{"pattern", nullptr}, {"patterns", nullptr}, {"mode", nullptr},
+            {"roots", "Absolute folders inside configured roots; default the workspace."}, {"include", "Filename or relative-path globs."},
+            {"output", nullptr}, {"max_results", "Result limit, 1-10000; default unlimited."}}},
+        {"find_files", {{"glob", nullptr}, {"substring", nullptr}, {"exact_name", nullptr},
+            {"roots", "Absolute folders inside configured roots; default the workspace."},
+            {"types", "File types such as cpp, cs, py, md, json."}, {"exclude", "Globs of files or folders to skip."},
+            {"output", nullptr}, {"max_results", "Result limit, 1-10000; default unlimited."}}},
+        {"read_file", {{"path", nullptr}, {"paths", nullptr}, {"offset", "First line, from 1."},
+            {"limit", "Line count; text default 100, code windows at most 100."},
+            {"intent", "The task in words, without offset/limit: returns only the best-matching lines, at most 72."},
+            {"metadata", "Add size, mtime and sha256 to the header."}}},
+        {"list_dir", {{"path", nullptr}, {"depth", nullptr}, {"max_results", nullptr}}},
+        {"file_info", {{"path", nullptr}, {"paths", nullptr}, {"operation", nullptr}}},
+        {"edit_file", {{"path", nullptr}, {"operation", nullptr},
+            {"edits", "operation=text: [{old_text, new_text, replace_all?}], exact text, 1-256 edits."},
+            {"needle", "replace_content/replace_in_files: literal or PCRE2 regex."},
+            {"repl", "Replacement; regex captures are $!1, $!2."}, {"mode", "literal (default) or regex."},
+            {"allow_multiple_occurrences", "Replace every match instead of refusing a non-unique one."},
+            {"start_line", "replace_lines/delete_lines: first line, from 1."},
+            {"end_line", "replace_lines/delete_lines: last line, inclusive."}, {"line", nullptr}, {"new_text", nullptr},
+            {"dry_run", nullptr}, {"expected_sha256", "SHA-256 from read_file metadata; else the latest read is checked."}}},
+        {"write_file", {{"path", nullptr}, {"content", nullptr}, {"overwrite", nullptr},
+            {"expected_sha256", "SHA-256 from read_file metadata; else the latest read is checked."}}},
+        {"delete_file", {{"path", nullptr}, {"dry_run", nullptr},
+            {"expected_sha256", "SHA-256 from read_file metadata; else the latest read is checked."}}},
+        {"move_file", {{"source", nullptr}, {"destination", nullptr}, {"dry_run", nullptr}, {"overwrite", nullptr}}},
+        {"create_directory", {{"path", nullptr}}},
+        {"lsp", {{"method", nullptr}, {"arguments", nullptr}}},
+        {"repl", {{"code", nullptr}, {"session_id", "Session key; declarations persist per session (at most 8)."}}},
+    };
+    return fields;
+}
+// Reduces a tool definition to its listed fields. Required fields are always kept. additionalProperties is dropped so
+// a client does not refuse an unlisted field before shgrep validates it. The server instructions say once how to list
+// the other fields (tool_manual), instead of a sentence on every tool.
+J listed_definition(J definition) {
+    auto& object = std::get<J::Object>(definition.value);
+    const std::string name = object.at("name").string();
+    const auto table = listed_fields().find(name);
+    if (table == listed_fields().end()) return definition;
+    auto& schema = std::get<J::Object>(object.at("inputSchema").value);
+    auto& properties = std::get<J::Object>(schema.at("properties").value);
+    J::Object kept;
+    for (const auto& field : table->second) {
+        const auto it = properties.find(field.name);
+        if (it == properties.end()) continue;
+        J value = it->second;
+        if (field.description && std::holds_alternative<J::Object>(value.value))
+            std::get<J::Object>(value.value)["description"] = field.description;
+        kept.emplace(field.name, std::move(value));
+    }
+    if (const auto required = schema.find("required"); required != schema.end())
+        for (const auto& field : required->second.array())
+            if (!kept.contains(field.string()) && properties.contains(field.string()))
+                kept.emplace(field.string(), properties.at(field.string()));
+    properties = std::move(kept);
+    schema.erase("additionalProperties");
+    return definition;
+}
+// Help for a whole tool: every field the tool accepts, with its full description (the listing shows core fields only).
+std::string type_text(const J& schema) {
+    if (const J* values = schema.get("enum")) {
+        std::string text;
+        for (const auto& value : values->array()) text += (text.empty() ? "" : "|") + value.string();
+        return text;
+    }
+    const J* type = schema.get("type");
+    if (!type || !std::holds_alternative<std::string>(type->value)) return "any";
+    if (type->string() == "array")
+        if (const J* items = schema.get("items")) return "array of " + type_text(*items);
+    return type->string();
+}
+J tool_fields_help(const J& definition, const std::string& format) {
+    if (format == "json") return J::Object{{"tool", *definition.get("name")}, {"inputSchema", *definition.get("inputSchema")}};
+    std::string text = definition.get("name")->string() + ": " + definition.get("description")->string() + "\nFields:\n";
+    const J* schema = definition.get("inputSchema");
+    std::set<std::string> required;
+    if (const J* names = schema->get("required"))
+        for (const auto& field : names->array()) required.insert(field.string());
+    for (const auto& [field, value] : schema->get("properties")->object()) {
+        text += "  " + field + " (" + type_text(value) + (required.contains(field) ? ", required" : "") + ")";
+        if (const J* description = value.get("description"); description && std::holds_alternative<std::string>(description->value))
+            text += ": " + description->string();
+        text += "\n";
+    }
+    text += "Every tool also takes max_output_bytes (512-1048576; longer output continues with continue) and offload_output "
+            "(default true: text over 8000 bytes is saved to a file with a preview; false returns it inline; lsp saves "
+            "only above 65536 bytes).\n";
+    return text;
 }
 struct Method {
     std::string name, tool, operation;
@@ -292,8 +404,12 @@ std::string render_locations(const J& value) {
         row += "\n";
     }
     const size_t count = items->array().size();
-    std::string out = "[" + std::to_string(count) + " location" + (count == 1 ? "" : "s") + " in " +
-                      std::to_string(order.size()) + " file" + (order.size() == 1 ? "" : "s") + " | source: lsp]\n";
+    // Partial first: agents act on what they read first and rarely question a tool's answer (arXiv 2606.14476).
+    std::string out;
+    if (const J* partial = value.get("partial"); partial && std::holds_alternative<bool>(partial->value) && partial->boolean())
+        out += partial_results_note("");
+    out += "[" + std::to_string(count) + " location" + (count == 1 ? "" : "s") + " in " +
+           std::to_string(order.size()) + " file" + (order.size() == 1 ? "" : "s") + " | source: lsp]\n";
     for (const auto& path : order) out += path + "\n" + rows[path];
     if (!count) out += "(no locations)\n";
     std::string notes;
@@ -301,8 +417,6 @@ std::string render_locations(const J& value) {
         if (const J* number = value.get(key); number && std::holds_alternative<int64_t>(number->value) && number->integer())
             notes += std::string(notes.empty() ? "" : ", ") + key + "=" + std::to_string(number->integer());
     if (!notes.empty()) out += "[lsp result notes: " + notes + "]\n";
-    if (const J* partial = value.get("partial"); partial && std::holds_alternative<bool>(partial->value) && partial->boolean())
-        out += "[partial results: the language server is still indexing]\n";
     return out;
 }
 
@@ -1018,6 +1132,12 @@ std::string unshown_warnings(const std::vector<std::string>& warnings, const J& 
 }
 J semantic_arguments_schema(const Method& method) {
     auto properties = method_properties(method);
+    if (method.name == "lsp.read_symbol") {
+        // Serena's read_symbol takes comment controls; accept them so a habit carried from Serena costs no turn.
+        for (const char* key : {"include_leading_comments", "include_trailing_comments"})
+            properties[key] = J::Object{{"type", "boolean"},
+                {"description", "Accepted for compatibility; shgrep always returns the symbol body alone."}};
+    }
     properties["timeout_ms"] = J::Object{{"type", "integer"}, {"minimum", 1}, {"maximum", 300000},
         {"description", "Whole request deadline in milliseconds. May instead be top-level; both values must agree."}};
     for (const auto& [alias, canonical] : method.aliases) {
@@ -1049,8 +1169,15 @@ J semantic_help(const J& options, const SearchContext& context) {
         return J::Object{{"topic", "manual"}, {"text", std::move(manual)}};
     }
     if (!topic.empty()) {
+        // A tool name lists every field that tool accepts; tools/list shows only its core fields.
+        static const std::set<std::string> plain_tools{"search", "search_bytes", "find_files", "read_file", "list_dir",
+            "file_info", "edit_file", "write_file", "delete_file", "move_file", "create_directory"};
+        if (plain_tools.contains(topic)) return tool_fields_help(fallback_definition(topic), format);
+        if (topic == "lsp" || topic == "repl") return tool_fields_help(contracts::tool_definition(topic), format);
         const auto* method = find_method(topic);
-        if (!method || !semantic_method(*method)) fail("unknown direct semantic method: " + topic);
+        if (!method || !semantic_method(*method))
+            throw UsageError("unknown help topic: " + topic + "; use method=help without a topic for the method list, a "
+                             "method name, a tool name such as search, or manual");
         if (format == "text") return help(topic, context, true);
         return J::Object{{"method", topic}, {"inputSchema", semantic_arguments_schema(*method)},
             {"defaults", method->defaults}};
@@ -1061,7 +1188,8 @@ J semantic_help(const J& options, const SearchContext& context) {
             "Tool manual: method=help, arguments={\"topic\":\"manual\"}.\nMethods:\n";
         for (const auto& method : methods())
             if (semantic_method(method)) text += "  " + method.name + "\n";
-        text += "Read one reference: method=help, arguments={\"topic\":\"edit.replace_in_symbol\"}.\n"
+        text += "Read one reference: method=help, arguments={\"topic\":\"edit.replace_in_symbol\"}. "
+                "A tool name as topic (search, read_file, edit_file, ...) lists every field that tool accepts.\n"
                 "Use arguments.format=json for machine-readable schemas without a duplicate reference.\n";
         return text;
     }
@@ -1079,25 +1207,31 @@ std::string tool_manual(const SearchContext& context, bool brief) {
     std::string text = context.read_only
         ? "shgrep runs with --read-only: use filesystem search/read tools; semantic navigation, edits and native C++ execution are unavailable. "
           "Programming/XML files can be searched and read as text in this mode. "
-        : "Use lsp for symbol lookup, code reads, references, rename and symbol edits; no C++ worker is needed. "
-          "Start with lsp.find_symbol, then lsp.read_symbol; read_file on code returns its outline. "
-          "Use search for text in any file, find_files for paths, list_dir for folders. "
-          "Edit code with edit.replace_in_symbol or edit.replace_symbol_body; use outside-symbol edits for imports. "
-          "Use lsp.rename_symbol for renames and lsp.safe_delete_symbol for reference-checked deletion. "
-          "Use edit_file for non-code text and write_file for new files. "
-          "Use repl for batches or computation across tool results, not single reads or edits. "
-          "Read the tool manual with lsp method=help, arguments={\"topic\":\"manual\"}; use a method name as topic for its current schema. ";
-    text += "The first configured root is the workspace and default search scope; live indexing and language-server warm-up use it when enabled. "
-            "Use an explicit absolute path or roots for another configured root. "
-            "Search matches come from current disk contents; the index only chooses candidate files. "
-            ".shignore overrides .gitignore/.ignore; index and warm-up progress goes to .shgrep/index.log. ";
+        : "shgrep searches, reads and edits this workspace's code and text; lsp works through language servers, no C++ worker is needed. "
+          "find_files finds paths, list_dir lists folders. "
+          "Read the tool manual with lsp method=help, arguments={\"topic\":\"manual\"}; a method name as topic gives its fields. "
+          "Tools list their core fields only; a tool name as topic (search, read_file, ...) lists every field it accepts. ";
+    // Routing by task, placed last in the server instructions: optional advice is ignored in most runs, a checklist
+    // at the end of the prompt raised tool use to every run (arXiv 2602.20048). Forcing the language server on every
+    // lookup lowered success; agents choose it for references and lexically ambiguous names (2608.13568).
+    const std::string routing = context.read_only ? std::string() :
+        "Pick the tool by task:\n"
+        "1. Where something happens, or a distinctive name: search with intent (the task in words); read_file with intent returns the best lines of one file.\n"
+        "2. A symbol's definition and every use, or a name that also matches comments and other symbols: lsp method=lsp.find_symbol, then lsp.find_referencing_symbols.\n"
+        "3. Rename or delete a symbol: lsp.rename_symbol or lsp.safe_delete_symbol. Every text match, comments and strings included: search with exhaustive=true.\n"
+        "4. One symbol's code: lsp.read_symbol; a code file's outline: read_file without offset.\n"
+        "5. Edit code: edit.replace_in_symbol, or edit.replace_outside_symbols for imports; other text: edit_file; new files: write_file. Batches and computation across results: repl.\n"
+        "Results marked partial are incomplete: repeat the call before relying on them.\n";
+    // The instructions are resent on every agent step (#103): the brief form keeps only what changes tool choice.
+    text += "The first configured root is the default search scope; use an absolute path for another root. "
+            "Matches come from current disk contents. .shignore overrides .gitignore; index progress goes to .shgrep/index.log. ";
     if (brief) {
         if (!context.read_only)
-            text += "Read targets before editing (a literal old_text/needle replacement needs no prior read: the exact match guards it); expected_sha256 pins a snapshot, and on_new_errors=rollback restores a single-file edit on new diagnostic errors. "
-                    "Text fallback requires allow_text_fallback=true and an unavailable or failing LSP. ";
-        text += "Report the cause and impact of 'tell the user' banners; a notice alone does not make a successful call fail. ";
-        return text;
+            text += "Read a file or symbol before editing it; an exact old_text/needle match needs no read. ";
+        text += "Report the cause and impact of 'tell the user' banners; a notice alone does not make a successful call fail.\n";
+        return text + routing;
     }
+    text += "\n" + routing;
     text += "\nThis manual comes from the running binary; it stores no project memories or onboarding files.\n";
     if (!context.read_only) {
         text += "Examples (lsp tool arguments):\n"
@@ -1152,24 +1286,17 @@ std::string tool_manual(const SearchContext& context, bool brief) {
 }
 
 J lsp_tool_definition() {
+    // Only the method names are listed (#103): the per-method argument schemas (oneOf) cost about 17,600 tokens on
+    // every agent step. run_lsp_tool checks argument names against semantic_arguments_schema and lists the accepted
+    // ones on a mismatch; method=help with arguments.topic=<method> returns one method's schema on demand.
     J::Array names{"help"};
-    J::Array branches;
-    const J help_schema = contracts::record_schema<contracts::LspHelpArgs>();
-    branches.emplace_back(J::Object{{"properties", J::Object{
-        {"method", J::Object{{"const", "help"}}}, {"arguments", help_schema}}}});
-    for (const auto& method : methods()) {
-        if (!semantic_method(method)) continue;
-        names.emplace_back(method.name);
-        branches.emplace_back(J::Object{{"properties", J::Object{
-            {"method", J::Object{{"const", method.name}}},
-            {"arguments", semantic_arguments_schema(method)}}}});
-    }
+    for (const auto& method : methods())
+        if (semantic_method(method)) names.emplace_back(method.name);
     J definition = contracts::tool_definition("lsp");
     auto& schema = std::get<J::Object>(std::get<J::Object>(definition.value).at("inputSchema").value);
     auto& properties = std::get<J::Object>(schema.at("properties").value);
     std::get<J::Object>(properties.at("method").value)["enum"] = std::move(names);
-    schema["oneOf"] = std::move(branches);
-    return definition;
+    return listed_definition(std::move(definition));
 }
 
 J run_lsp_tool(const J& arguments, const SearchContext& context,
@@ -1177,7 +1304,8 @@ J run_lsp_tool(const J& arguments, const SearchContext& context,
     if (context.read_only) fail("direct semantic operations are disabled by --read-only");
     for (const auto& [key, value] : arguments.object()) {
         (void)value;
-        if (key != "method" && key != "arguments" && key != "timeout_ms") fail("unknown lsp argument: " + key + "; accepted arguments: method, arguments, timeout_ms");
+        if (key != "method" && key != "arguments" && key != "timeout_ms")
+            throw UsageError("unknown lsp argument: " + key + "; accepted arguments: method, arguments, timeout_ms");
     }
     const auto name = string_arg(arguments, "method");
     if (name.empty()) fail("lsp requires method; use method=help to list methods");
@@ -1194,14 +1322,20 @@ J run_lsp_tool(const J& arguments, const SearchContext& context,
         return J::Object{{"structured_result", std::move(reference)}};
     }
     const Method* method = find_method(name);
-    if (!method || !semantic_method(*method)) fail("unknown direct semantic method: " + name);
+    if (!method || !semantic_method(*method))
+        throw UsageError("unknown lsp method: " + name + "; method=help lists the methods");
     const J argument_schema = semantic_arguments_schema(*method);
     const auto& properties = argument_schema.get("properties")->object();
     for (const auto& [key, value] : options.object()) {
         (void)value;
-        if (!properties.contains(key)) fail("unknown argument " + key + " for direct semantic method " + name + accepted_arguments(*method, properties));
+        if (!properties.contains(key))
+            throw UsageError("unknown argument " + key + " for direct semantic method " + name + accepted_arguments(*method, properties));
     }
     auto keywords = options.object();
+    if (name == "lsp.read_symbol") {
+        keywords.erase("include_leading_comments");
+        keywords.erase("include_trailing_comments");
+    }
     apply_direct_format(*method, {}, keywords);  // format=json keeps structured results
     keywords["timeout_ms"] = timeout;
     Dispatcher dispatcher(context, control);
@@ -1230,32 +1364,55 @@ J run_lsp_tool(const J& arguments, const SearchContext& context,
 }
 
 J repl_tool_definition() {
-    return contracts::tool_definition("repl");
+    return listed_definition(contracts::tool_definition("repl"));
 }
 
 J fallback_tool_definitions(const SearchContext& context) {
     J::Array definitions;
     for (const char* name : {"search", "search_bytes", "find_files", "read_file", "list_dir", "file_info",
                             "edit_file", "write_file", "delete_file", "move_file", "create_directory"})
-        if (!(context.read_only && is_write_tool(name))) definitions.push_back(fallback_definition(name));
+        if (!(context.read_only && is_write_tool(name)))
+            // Read-only mode lists full schemas: its help topics live on the lsp tool, which it does not list.
+            definitions.push_back(context.read_only ? fallback_definition(name) : listed_definition(fallback_definition(name)));
     return definitions;
 }
 J fallback_arguments(const std::string& name, const J& arguments, const SearchContext& context) {
     if (context.read_only && is_write_tool(name)) fail(name + " is disabled by --read-only");
     const J definition = fallback_definition(name);
     const auto& properties = definition.get("inputSchema")->get("properties")->object();
+    // Refusals name the next call: the lsp method for a semantic field or operation, else the accepted fields
+    // (arXiv 2609.35381: errors naming the next call recover far more often than errors stating only the cause).
+    const auto& semantic_fields = backend_definitions().at(name).get("inputSchema")->get("properties")->object();
     for (const auto& [key, value] : arguments.object()) {
         (void)value;
         // CONTRACT: profile is the hidden benchmark switch (phase timings) that search accepts without listing it.
-        if (!properties.contains(key) && !(key == "profile" && name == "search"))
-            fail(key + " is not a plain " + name + " option; use repl for semantic operations");
+        if (properties.contains(key) || (key == "profile" && name == "search")) continue;
+        std::string message = key + " is not a plain " + name + " option";
+        if (semantic_fields.contains(key)) {
+            message += "; symbol work goes through the lsp tool: call it with method=help for its methods, then "
+                       "arguments.topic=<method> for that method's fields";
+        } else {
+            message += "; accepted:";
+            for (const auto& [accepted, schema] : properties) { (void)schema; message += " " + accepted; }
+        }
+        throw UsageError(message);
     }
     J::Object args = arguments.object();
     if (const auto operation = properties.find("operation"); operation != properties.end()) {
         const auto& allowed = operation->second.get("enum")->array();
         const J chosen = args.contains("operation") ? args.at("operation") : allowed.front();
-        if (std::none_of(allowed.begin(), allowed.end(), [&](const J& value) { return value.string() == chosen.string(); }))
-            fail("semantic " + name + " operations are available through repl; this tool is a plain fallback");
+        if (std::none_of(allowed.begin(), allowed.end(), [&](const J& value) { return value.string() == chosen.string(); })) {
+            std::string method_name;
+            for (const auto& method : methods())
+                if (semantic_method(method) && method.tool == name && method.operation == chosen.string()) {
+                    method_name = method.name;
+                    break;
+                }
+            throw UsageError("operation=" + chosen.string() + " is a semantic " + name + " operation; call the lsp tool with " +
+                 (method_name.empty() ? std::string("method=help to find its method")
+                                      : "method=" + method_name + " (method=help, arguments.topic=" + method_name +
+                                            " lists its fields)"));
+        }
         args["operation"] = chosen;
     }
     return args;

@@ -15,6 +15,7 @@ struct RankCandidate {
     std::string_view path;
     uint64_t first_line = 0, last_line = 0;  // 0 when line numbers are unknown
     std::string_view code;
+    std::string_view name;  // symbol name path; scored above the body when known
 };
 
 struct Ranked {
@@ -36,7 +37,8 @@ struct RerankFailure {
 uint32_t rank_scan_limit();
 
 // Request-local ranking of findings against the task's intent. No state survives the request.
-// CONTRACT: BM25 (k1 1.2, b 0.75) over path + code, identifiers split at _ and camelCase, instruction words ignored;
+// CONTRACT: field-weighted BM25 (k1 1.2, b 0.75) over the symbol name (weight 2) and path + code, identifiers
+//   split at _ and camelCase, instruction words ignored;
 //   ties keep scan order. At most SHGREP_RANK_PER_FILE (default 3, 0 = no cap) candidates per file and at most
 //   SHGREP_RANK_RETURN (default 10, 0 = all) in total are returned, best first.
 // CONTRACT: optional reranker, off unless SHGREP_RERANK_PORT is set to a nonzero port (unset or 0 = keyword order

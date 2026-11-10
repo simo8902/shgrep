@@ -267,7 +267,9 @@ bool stop_word(const std::string& term) {
     return words.contains(term);
 }
 
-// BM25 scores of the intent over path + code, one per candidate.
+// Field-weighted BM25 scores of the intent, one per candidate. The symbol name is a separate field with a static
+// weight above the body (BM25F, Robertson et al. 2004; the source-code survey 2311.07107 weights method names above
+// method bodies). A candidate without a name scores exactly as plain BM25 over path + code.
 std::vector<double> bm25(const std::string& intent, const std::vector<RankCandidate>& candidates,
                          RankClock::time_point deadline, const std::shared_ptr<std::atomic_bool>& cancelled) {
     std::vector<double> scores(candidates.size(), 0.0);
@@ -276,34 +278,65 @@ std::vector<double> bm25(const std::string& intent, const std::vector<RankCandid
         if (query.size() < max_query_terms && !stop_word(term)) query.emplace(term, static_cast<uint32_t>(query.size()));
     }, deadline, cancelled);
     if (query.empty() || candidates.empty()) return scores;
+    constexpr double name_weight = 2.0;  // BM25F field weight for the symbol name
     // PERF: term frequencies are kept sparse (query terms only), so memory is bounded by matches, not candidates x terms.
-    std::vector<std::vector<std::pair<uint32_t, uint32_t>>> frequencies(candidates.size());
-    std::vector<uint32_t> lengths(candidates.size(), 0), document_frequency(query.size(), 0);
-    uint64_t total_length = 0;
+    std::vector<std::vector<std::pair<uint32_t, uint32_t>>> name_frequencies(candidates.size()), body_frequencies(candidates.size());
+    std::vector<uint32_t> name_lengths(candidates.size(), 0), body_lengths(candidates.size(), 0);
+    std::vector<uint32_t> document_frequency(query.size(), 0), seen(query.size(), 0);
+    uint64_t name_total = 0, body_total = 0;
     for (size_t i = 0; i < candidates.size(); ++i) {
         check_rank_request(deadline, cancelled);
-        auto& counts = frequencies[i];
-        const auto count = [&](const std::string& term) {
-            ++lengths[i];
+        auto& name = name_frequencies[i];
+        auto& body = body_frequencies[i];
+        const auto count = [&](const std::string& term, std::vector<std::pair<uint32_t, uint32_t>>& counts,
+                               uint32_t& length) {
+            ++length;
             const auto it = query.find(term);
             if (it == query.end()) return;
             for (auto& [slot, tf] : counts) if (slot == it->second) { ++tf; return; }
             counts.emplace_back(it->second, 1u);
         };
-        for_each_term(candidates[i].path, count, deadline, cancelled);
-        for_each_term(candidates[i].code, count, deadline, cancelled);
-        total_length += lengths[i];
-        for (const auto& [slot, tf] : counts) ++document_frequency[slot];
+        for_each_term(candidates[i].name, [&](const std::string& term) { count(term, name, name_lengths[i]); },
+                      deadline, cancelled);
+        for_each_term(candidates[i].path, [&](const std::string& term) { count(term, body, body_lengths[i]); },
+                      deadline, cancelled);
+        for_each_term(candidates[i].code, [&](const std::string& term) { count(term, body, body_lengths[i]); },
+                      deadline, cancelled);
+        std::sort(name.begin(), name.end(), [](const auto& x, const auto& y) { return x.first < y.first; });
+        std::sort(body.begin(), body.end(), [](const auto& x, const auto& y) { return x.first < y.first; });
+        name_total += name_lengths[i];
+        body_total += body_lengths[i];
+        const uint32_t generation = static_cast<uint32_t>(i + 1);
+        for (const auto& [slot, tf] : name)
+            if (seen[slot] != generation) { seen[slot] = generation; ++document_frequency[slot]; }
+        for (const auto& [slot, tf] : body)
+            if (seen[slot] != generation) { seen[slot] = generation; ++document_frequency[slot]; }
     }
     const double n = static_cast<double>(candidates.size());
-    const double average = std::max(1.0, static_cast<double>(total_length) / n);
+    const double name_average = std::max(1.0, static_cast<double>(name_total) / n);
+    const double body_average = std::max(1.0, static_cast<double>(body_total) / n);
     for (size_t i = 0; i < candidates.size(); ++i) {
         check_rank_request(deadline, cancelled);
-        for (const auto& [slot, tf] : frequencies[i]) {
+        // Merge the two sparse maps: one saturated field-weighted frequency per term (BM25F).
+        size_t a = 0, b = 0;
+        while (a < name_frequencies[i].size() || b < body_frequencies[i].size()) {
+            const bool take_name = a < name_frequencies[i].size() &&
+                (b == body_frequencies[i].size() || name_frequencies[i][a].first < body_frequencies[i][b].first);
+            const uint32_t slot = take_name ? name_frequencies[i][a].first : body_frequencies[i][b].first;
+            double tf = 0.0;
+            if (a < name_frequencies[i].size() && name_frequencies[i][a].first == slot) {
+                tf += name_weight * name_frequencies[i][a].second /
+                      (0.25 + 0.75 * name_lengths[i] / name_average);
+                ++a;
+            }
+            if (b < body_frequencies[i].size() && body_frequencies[i][b].first == slot) {
+                tf += body_frequencies[i][b].second /
+                      (0.25 + 0.75 * body_lengths[i] / body_average);
+                ++b;
+            }
             const double df = document_frequency[slot];
             const double idf = std::log(1.0 + (n - df + 0.5) / (df + 0.5));
-            const double f = tf;
-            scores[i] += idf * f * 2.2 / (f + 1.2 * (0.25 + 0.75 * lengths[i] / average));
+            scores[i] += idf * tf * 2.2 / (1.2 + tf);
         }
     }
     return scores;

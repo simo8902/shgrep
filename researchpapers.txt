@@ -59,6 +59,14 @@ tool-output:
 agent-workarounds:
   cs.AI  doi:10.48550/arXiv.2608.29460  [29.08.2026]
 
+tool-introduction:
+  cs.AI  doi:10.48550/arXiv.2610.14334  [09.10.2026]
+  cs.AI  doi:10.48550/arXiv.2602.20048  [23.02.2026]
+  cs.SE  doi:10.48550/arXiv.2609.35381  [28.09.2026]
+  cs.AI  doi:10.48550/arXiv.2602.20426  [23.02.2026]
+  cs.AI  doi:10.48550/arXiv.2606.14476  [12.06.2026]
+  cs.AI  doi:10.48550/arXiv.2604.21816  [23.04.2026]
+
 symbol-index:
   cs.SE  doi:10.48550/arXiv.2603.27277  [28.03.2026]
   cs.SE  doi:10.48550/arXiv.2604.03515  [03.04.2026]
@@ -77,6 +85,18 @@ workspace-profile:
   cs.SE  doi:10.48550/arXiv.2506.17948  [22.06.2025]
   cs.SE  doi:10.48550/arXiv.2601.10112  [15.01.2026]
   cs.SE  doi:10.48550/arXiv.2605.15815  [15.05.2026]
+
+retrieval-ranking:
+  cs.SE  doi:10.48550/arXiv.2311.07107  [13.11.2023]
+  cs.IR  doi:10.48550/arXiv.2410.20056  [26.10.2024]
+  cs.LG  doi:10.48550/arXiv.2505.00810  [01.05.2025]
+  cs.CL  doi:10.48550/arXiv.2506.08479  [10.06.2025]
+  cs.CL  doi:10.48550/arXiv.1808.06528  [20.08.2018]
+  cs.IR  doi:10.48550/arXiv.2609.13489  [11.09.2026]
+  cs.IR  doi:10.48550/arXiv.2511.14769  [02.10.2025]
+  cs.IR  doi:10.48550/arXiv.2608.07152  [07.08.2026]
+  cs.IR  doi:10.48550/arXiv.2609.26237  [12.08.2026]
+  cs.CL  doi:10.48550/arXiv.2606.11907  [10.06.2026]
 
 cs.AR = Hardware Architecture; cs.CE = Computational Engineering, Finance, and Science; cs.CL = Computation and Language; cs.CR = Cryptography and Security; cs.CV = Computer Vision and Pattern Recognition; cs.DC = Distributed, Parallel, and Cluster Computing; cs.DL = Digital Libraries; cs.DS = Data Structures and Algorithms; cs.ET = Emerging Technologies; cs.GL = General Literature; cs.GR = Graphics; cs.HC = Human-Computer Interaction; cs.IR = Information Retrieval; cs.MA = Multiagent Systems; cs.NE = Neural and Evolutionary Computing; cs.PF = Performance; cs.SD = Sound; cs.SI = Social and Information Networks; cs.SY = Systems and Control
 

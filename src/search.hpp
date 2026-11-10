@@ -150,6 +150,8 @@ bool tool_available(const std::string& name, const SearchContext& context);
 // Builds or loads the workspace's index (the first root) and starts watching it, unless workspace_too_broad; returns at
 // once, the work runs on background threads.
 void start_live_indexes(const SearchContext& context);
+// Opens the index log (.shgrep/index.log) when no live index does it (--no-live-index, --read-only).
+void open_workspace_log(const SearchContext& context);
 // True when the workspace (the first root) is a drive root, the user profile or another folder holding system folders:
 // too broad to index or to scan for language server warm-up.
 bool workspace_too_broad(const SearchContext& context);

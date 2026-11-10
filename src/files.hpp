@@ -92,6 +92,10 @@ std::vector<std::string> source_paths(const SearchContext& context, const std::s
 std::string render_semantic_text(const Json& result, bool outline,
                                  const std::shared_ptr<std::atomic_bool>& cancelled, bool line_numbers = true,
                                  bool symbol_text = false);
+// The first line of an incomplete semantic answer: the cause, then the call that finishes it. Agents act on what they
+// read first and rarely question a tool's answer (arXiv 2606.14476); naming the next call raises recovery (2609.35381).
+// cause: the coverage_note naming its own next step; empty means a server still indexing.
+std::string partial_results_note(const std::string& cause);
 
 // File tools. Reading: read_file, list_dir, file_info. Writing: edit_file, write_file, move_file, create_directory.
 // CONTRACT: every path is resolved below a configured root one component at a time; '..' cannot leave the root,

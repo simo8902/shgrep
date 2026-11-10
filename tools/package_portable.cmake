@@ -1,4 +1,7 @@
 cmake_minimum_required(VERSION 3.25)
+if(@SHGREP_ASAN@)
+    message(FATAL_ERROR "AddressSanitizer builds are diagnostic-only; build a normal release for portable packaging")
+endif()
 if(NOT MAIN_EXE OR NOT EXISTS "${MAIN_EXE}")
     message(FATAL_ERROR "Set MAIN_EXE to the built shgrep.exe")
 endif()
